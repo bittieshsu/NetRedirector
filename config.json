@@ -1,0 +1,39 @@
+{
+  "hubs": {
+    "30678": [
+      "VPN - VPN Client",
+      "VPN10 - VPN Client",
+      "VPN11 - VPN Client",
+      "VPN2 - VPN Client",
+      "VPN5 - VPN Client",
+      "VPN6 - VPN Client",
+      "VPN7 - VPN Client",
+      "VPN8 - VPN Client",
+      "VPN9 - VPN Client",
+      "VPN3 - VPN Client",
+      "VPN4 - VPN Client",
+      "乙太網路"
+    ]
+  },
+  "proxies": [
+    {
+      "name": "MyPhone",
+      "type": "SOCKS5",
+      "ip": "192.168.1.178",
+      "port": 1080,
+      "user": "",
+      "pass": ""
+    }
+  ],
+  "rules": [
+    {
+      "type": "Name",
+      "target": "*",
+      "hosts": "*",
+      "ports": "*",
+      "proto": "BOTH",
+      "action": "PROXY (轉發)",
+      "proxy_text": "[Custom] MyPhone"
+    }
+  ]
+}
