@@ -5,6 +5,14 @@
 // Prevent windows.h from including the old winsock.h, resolving macro redefinition errors
 #define WIN32_LEAN_AND_MEAN
 
+// Enable modern API fields (e.g. IP_ADAPTER_ADDRESSES.OperationalStatus)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x06010000
+#endif
+
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>

@@ -188,6 +188,121 @@ BOOL is_multicast_or_special6(const UINT8 *a)
     return (a[0] == 0x00 || a[0] == 0x01);
 }
 
+// --- LAN / On-link Detection ---
+// Caches the local interface addresses (IPv4 + IPv6) and their prefix lengths.
+// Used to auto-direct traffic that stays within the local network, so that
+// LAN file transfers never get routed through an external proxy (e.g. a
+// phone's SOCKS5 server going out over a 5G connection and back).
+
+#define MAX_LOCAL_ADDRS 64
+
+typedef struct LOCAL_ADDR {
+    int family;              // AF_INET or AF_INET6
+    UINT8 addr[16];          // Network byte order
+    UINT8 prefix_len;
+} LOCAL_ADDR;
+
+static LOCAL_ADDR g_local_addrs[MAX_LOCAL_ADDRS];
+static int g_local_addr_count = 0;
+
+void refresh_local_addresses(void)
+{
+    ULONG size = 0;
+    DWORD ret;
+    PIP_ADAPTER_ADDRESSES adapters = NULL, cur;
+    PIP_ADAPTER_UNICAST_ADDRESS unicast;
+
+    g_local_addr_count = 0;
+
+    // First call returns ERROR_BUFFER_OVERFLOW with the required size
+    ret = GetAdaptersAddresses(AF_UNSPEC,
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+        NULL, NULL, &size);
+    if (ret != ERROR_BUFFER_OVERFLOW || size == 0) return;
+
+    adapters = (PIP_ADAPTER_ADDRESSES)malloc(size);
+    if (adapters == NULL) return;
+
+    ret = GetAdaptersAddresses(AF_UNSPEC,
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+        NULL, adapters, &size);
+    if (ret != NO_ERROR) { free(adapters); return; }
+
+    for (cur = adapters; cur != NULL && g_local_addr_count < MAX_LOCAL_ADDRS; cur = cur->Next) {
+        if (cur->OperStatus != IfOperStatusUp) continue;
+        if (cur->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+
+        for (unicast = cur->FirstUnicastAddress; unicast != NULL; unicast = unicast->Next) {
+            int family = unicast->Address.lpSockaddr->sa_family;
+            UINT8 prefix = unicast->OnLinkPrefixLength;
+            LOCAL_ADDR *slot = &g_local_addrs[g_local_addr_count];
+
+            // Only trust realistic LAN prefixes; a /0 or /32-ish entry would
+            // otherwise make everything (or nothing) look on-link.
+            if (family == AF_INET) {
+                if (prefix < 8 || prefix > 30) continue;
+                struct sockaddr_in *sa = (struct sockaddr_in *)unicast->Address.lpSockaddr;
+                slot->family = AF_INET;
+                slot->prefix_len = prefix;
+                memcpy(slot->addr, &sa->sin_addr, 4);
+                g_local_addr_count++;
+            } else if (family == AF_INET6) {
+                if (prefix < 8 || prefix > 126) continue;
+                struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)unicast->Address.lpSockaddr;
+                slot->family = AF_INET6;
+                slot->prefix_len = prefix;
+                memcpy(slot->addr, &sa6->sin6_addr, 16);
+                g_local_addr_count++;
+            }
+            if (g_local_addr_count >= MAX_LOCAL_ADDRS) break;
+        }
+    }
+    free(adapters);
+}
+
+static void prefix_to_mask(UINT8 prefix, UINT8 *mask, int len)
+{
+    int full = prefix / 8;
+    int rem = prefix % 8;
+    memset(mask, 0, len);
+    for (int i = 0; i < full && i < len; i++) mask[i] = 0xFF;
+    if (full < len && rem > 0) mask[full] = (UINT8)(0xFF << (8 - rem));
+}
+
+BOOL is_lan_or_on_link_address(int family, const UINT8 *addr)
+{
+    if (addr == NULL) return FALSE;
+
+    if (family == AF_INET) {
+        // Private ranges (RFC 1918): 10/8, 172.16/12, 192.168/16
+        if (addr[0] == 10) return TRUE;
+        if (addr[0] == 172 && (addr[1] & 0xF0) == 16) return TRUE;
+        if (addr[0] == 192 && addr[1] == 168) return TRUE;
+    } else if (family == AF_INET6) {
+        // Unique Local Address (RFC 4193): fc00::/7
+        if ((addr[0] & 0xFE) == 0xFC) return TRUE;
+    } else {
+        return FALSE;
+    }
+
+    // On-link check: destination belongs to the same subnet as one of our
+    // local addresses (covers global-scope IPv6 like 2001:b011:...:xxxx).
+    for (int i = 0; i < g_local_addr_count; i++) {
+        LOCAL_ADDR *local = &g_local_addrs[i];
+        if (local->family != family) continue;
+
+        UINT8 mask[16];
+        prefix_to_mask(local->prefix_len, mask, (family == AF_INET) ? 4 : 16);
+        int len = (family == AF_INET) ? 4 : 16;
+        BOOL same = TRUE;
+        for (int b = 0; b < len; b++) {
+            if ((addr[b] & mask[b]) != (local->addr[b] & mask[b])) { same = FALSE; break; }
+        }
+        if (same) return TRUE;
+    }
+    return FALSE;
+}
+
 BOOL match_ip_pattern6(const char *pattern, const UINT8 *ip)
 {
     if (pattern == NULL || strcmp(pattern, "*") == 0) return TRUE;

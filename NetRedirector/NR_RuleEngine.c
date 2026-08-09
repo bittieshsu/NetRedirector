@@ -174,6 +174,14 @@ RuleAction handle_new_connection_logic(int family, const UINT8 *src_addr, const 
         }
     }
 
+    // LAN / On-link bypass: local network traffic (IPv4 private ranges,
+    // IPv6 ULA, or any destination in a subnet we are directly connected to)
+    // must never be routed through an external proxy.
+    if (is_lan_or_on_link_address(family, dest_addr)) {
+        *selected_proxy_id = 0;
+        return RULE_ACTION_DIRECT;
+    }
+
     // Process Lookup
     char process_path[MAX_PROCESS_NAME];
     DWORD pid;

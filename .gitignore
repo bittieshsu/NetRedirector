@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Packaged builds
+IntegratedApp.dist/
+NetRedirector2-v1.0.0-win64.zip

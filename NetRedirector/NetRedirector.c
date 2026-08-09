@@ -340,6 +340,9 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     if (running) return FALSE;
     running = TRUE;
 
+    // Cache local interface addresses for LAN on-link detection
+    refresh_local_addresses();
+
     // Start Cleanup Thread
     extern HANDLE cleanup_thread_handle; 
     cleanup_thread_handle = CreateThread(NULL, 0, cleanup_thread, NULL, 0, NULL);

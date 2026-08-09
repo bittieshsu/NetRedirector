@@ -22,6 +22,10 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
 void addr_to_string(int family, const UINT8 *addr, char *buf, size_t size);
 BOOL is_multicast_or_special6(const UINT8 *a);
 
+// LAN / On-link Detection
+void refresh_local_addresses(void);
+BOOL is_lan_or_on_link_address(int family, const UINT8 *addr);
+
 // Matching Logic
 BOOL match_ip_pattern(const char *pattern, UINT32 ip);
 BOOL match_port_pattern(const char *pattern, UINT16 port);
