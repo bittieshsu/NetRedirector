@@ -47,7 +47,9 @@ def check_proxy_connection(proxy_conf):
     try:
         s.connect((ip, port))
         if ptype == "SOCKS5":
-            if user and pwd:
+            # [修正] 只要有帳或密，就同時提供 no-auth + user/pass 兩種方法，
+            # 讓伺服器決定；避免「只送 no-auth、伺服器要求認證」被回 0xFF
+            if user or pwd:
                 s.sendall(b'\x05\x02\x00\x02')
             else:
                 s.sendall(b'\x05\x01\x00')
@@ -58,7 +60,7 @@ def check_proxy_connection(proxy_conf):
                 auth_payload = b'\x01' + bytes([len(user)]) + user.encode() + bytes([len(pwd)]) + pwd.encode()
                 s.sendall(auth_payload)
                 auth_resp = s.recv(2)
-                if auth_resp[1] != 0x00: raise Exception("帳號或密碼錯誤")
+                if not auth_resp or auth_resp[1] != 0x00: raise Exception("帳號或密碼錯誤")
             elif resp[1] != 0x00:
                 raise Exception("不支援的驗證方式")
 
@@ -905,10 +907,39 @@ class MainWindow(QMainWindow):
         except: return
         ptype = ProxyType.SOCKS5 if ptype_str == "SOCKS5" else ProxyType.HTTP
 
-        if self.editing_proxy_id is not None:
+        # [根因修正] 編輯代理「原地更新」：EditProxyConfig 保留相同 proxy ID，
+        # 已建立的規則仍指向同一 ID，新帳密立即對所有規則生效，不需重刷規則
+        old_proxy_id = self.editing_proxy_id
+        if old_proxy_id is not None:
+            edit_fn = getattr(self.bridge.lib, 'NetRedirector_EditProxyConfig', None)
+            if edit_fn is not None:
+                ok = edit_fn(
+                    old_proxy_id,
+                    ptype,
+                    name.encode('utf-8'),
+                    ip.encode('utf-8'),
+                    port,
+                    user.encode('utf-8'),
+                    pwd.encode('utf-8'),
+                    True  # enabled
+                )
+                if ok:
+                    for p in self.custom_proxies:
+                        if p['id'] == old_proxy_id:
+                            p.update({'name': name, 'type': ptype_str, 'ip': ip, 'port': port, 'user': user, 'pass': pwd})
+                    self.refresh_custom_proxy_table()
+                    self.refresh_proxy_combobox()
+                    self.cancel_proxy_edit()
+                    self.append_log(f"自訂代理已更新 (ID 不變，立即生效): {name}")
+                    return
+                else:
+                    QMessageBox.warning(self, "失敗", "DLL 無法更新代理配置")
+                    return
+
+            # 舊版 DLL 沒有 EditProxyConfig 的 fallback：刪除+重建（ID 會變，需重刷規則）
             if hasattr(self.bridge.lib, 'NetRedirector_DeleteProxyConfig'):
-                self.bridge.lib.NetRedirector_DeleteProxyConfig(self.editing_proxy_id)
-            self.custom_proxies = [p for p in self.custom_proxies if p['id'] != self.editing_proxy_id]
+                self.bridge.lib.NetRedirector_DeleteProxyConfig(old_proxy_id)
+            self.custom_proxies = [p for p in self.custom_proxies if p['id'] != old_proxy_id]
 
         pid = self.bridge.add_proxy(ip, port, user, pwd, ptype, name)
         if pid > 0:
@@ -925,7 +956,11 @@ class MainWindow(QMainWindow):
             self.refresh_custom_proxy_table()
             self.refresh_proxy_combobox()
             self.cancel_proxy_edit()
-            self.append_log(f"自訂代理已{'更新' if self.editing_proxy_id else '新增'}: {name}")
+            self.append_log(f"自訂代理已新增: {name}")
+            # 只有 fallback 刪除+重建路徑才需要重刷引用舊 ID 的規則
+            if old_proxy_id is not None and pid != old_proxy_id:
+                self.append_log(f"代理 ID 已變更 ({old_proxy_id} -> {pid})，重刷引用該代理的規則...")
+                self.reapply_all_rules(only_proxy_id=old_proxy_id)
         else:
             QMessageBox.warning(self, "失敗", "DLL 無法添加代理配置")
 
@@ -969,6 +1004,8 @@ class MainWindow(QMainWindow):
         self.custom_proxies = [p for p in self.custom_proxies if p['id'] != pid]
         self.refresh_custom_proxy_table()
         self.refresh_proxy_combobox()
+        # [修正] 代理被刪除後，引用它的規則若不重刷會殘留失效的 proxy ID
+        self.reapply_all_rules(only_proxy_id=pid)
 
     def on_proxy_double_click(self, row, col):
         if row < 0: return
@@ -1051,8 +1088,22 @@ class MainWindow(QMainWindow):
         else: self.rb_name.setChecked(True)
 
 # [新增] 強制重刷規則到 DLL (解決啟動後規則不生效的問題)
-    def reapply_all_rules(self):
+    def _rule_proxy_id(self, rule):
+        combo_idx = self.combo_proxy.findText(rule['proxy'])
+        if combo_idx >= 0:
+            return int(self.combo_proxy.itemData(combo_idx))
+        return 0
+
+    def reapply_all_rules(self, only_proxy_id=None):
         if not self.rules:
+            return
+
+        # 若指定 only_proxy_id，只重刷引用該代理的規則（例如編輯代理後 ID 變更時）
+        if only_proxy_id is not None:
+            target_rules = [r for r in self.rules if self._rule_proxy_id(r) == only_proxy_id]
+        else:
+            target_rules = self.rules
+        if not target_rules:
             return
 
         self.append_log("正在重新套用所有規則以確保生效...")
@@ -1061,6 +1112,10 @@ class MainWindow(QMainWindow):
         refreshed_rules = []
         
         for r in self.rules:
+            if r not in target_rules:
+                refreshed_rules.append(r)
+                continue
+            
             old_id = r['id']
             
             # 1. 先嘗試刪除舊的 (如果存在)
@@ -1092,11 +1147,8 @@ class MainWindow(QMainWindow):
             elif "BLOCK" in r['action']: action_idx = 2
             
             # 嘗試從 UI 文字找回 Proxy ID (因為 ID 可能在重啟程式後變更)
-            proxy_text = r['proxy']
-            proxy_id = 0
-            combo_idx = self.combo_proxy.findText(proxy_text)
-            if combo_idx >= 0:
-                proxy_id = self.combo_proxy.itemData(combo_idx)
+            # [修正] 若代理已被刪除/重新加入，這裡會解析到最新的 ID，讓新帳密立即生效
+            proxy_id = self._rule_proxy_id(r)
 
             # 3. 呼叫 DLL 加入規則 (這會觸發 UpdateFilter)
             new_rid = 0
