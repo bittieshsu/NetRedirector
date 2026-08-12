@@ -1,7 +1,7 @@
 # NetRedirector 🚀
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](https://www.microsoft.com/)
 [![GUI: PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)](https://doc.qt.io/qtforpython/)
 [![Core: WinDivert](https://img.shields.io/badge/Core-WinDivert-orange.svg)](https://www.reqrypt.org/windivert.html)
@@ -12,16 +12,16 @@
 
 ## 📸 介面預覽 (UI Gallery)
 
-> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下（例如 `hub.png`、`rules.png`、`proxies.png`、`monitor.png`），以完美呈現精美 UI 介面。*
+> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下，並於下方表格中引用（目前使用 `1.png`、`2-1.png`、`2-2.png`、`3-1.png`、`3-2.png`、`4.png`）。*
 
 | 1. 端口路由管理 (Hub) | 2. 進程攔截規則 (Rules) |
 | :---: | :---: |
-| ![Hub 界面預覽](docs/images/hub.png) | ![Rules 界面預覽](docs/images/rules.png) |
+| ![Hub 界面預覽](docs/images/1.png) | ![Rules 界面預覽](docs/images/2-1.png)<br>![Rules 界面預覽 2](docs/images/2-2.png) |
 | *多本地監聽端口、網卡多對一綁定與即時延遲偵測* | *支援進程名稱/PID、多條件過濾與代理綁定* |
 
 | 3. 自訂代理管理 (Proxies) | 4. 即時流量監控 (Monitor) |
 | :---: | :---: |
-| ![Proxies 界面預覽](docs/images/proxies.png) | ![Monitor 界面預覽](docs/images/monitor.png) |
+| ![Proxies 界面預覽](docs/images/3-1.png)<br>![Proxies 界面預覽 2](docs/images/3-2.png) | ![Monitor 界面預覽](docs/images/4.png) |
 | *SOCKS5 / HTTP 代理設定與一鍵可用性 Ping 測試* | *即時封包記錄、進程資訊與右鍵快速建立規則* |
 
 ---
@@ -64,7 +64,7 @@
 
 - **作業系統**：Windows 10 / 11 (x64)
 - **運行權限**：**管理員權限 (Administrator)**（WinDivert 驅動程式攔截網路封包必須）
-- **執行環境**：Python 3.7+ (推薦 Python 3.11)
+- **執行環境**：Python 3.10+ (推薦 Python 3.11)
 
 ---
 
@@ -72,8 +72,8 @@
 
 1. **取得專案程式碼**
    ```bash
-   git clone https://github.com/your-username/NetRedirector2.git
-   cd NetRedirector2
+   git clone https://github.com/tokyoxpa3/NetRedirector.git
+   cd NetRedirector
    ```
 
 2. **建立並啟動虛擬環境 (建議)**
@@ -135,7 +135,7 @@
 ## 🗂️ 專案檔案結構
 
 ```
-NetRedirector2/
+NetRedirector/
 ├── IntegratedApp.py         # 整合版主應用程式 (PySide6 GUI)
 ├── proxy_core.py            # 本地 SOCKS5 / 端口路由代理核心
 ├── network_utils.py         # 高效網路介面掃描與 Ping 診斷模組
@@ -147,16 +147,19 @@ NetRedirector2/
 ├── vcruntime140.dll         # Visual C++ 執行時期庫
 ├── docs/
 │   └── images/              # UI 截圖目錄
-│       ├── hub.png
-│       ├── rules.png
-│       ├── proxies.png
-│       └── monitor.png
+│       ├── 1.png            # Hub 分頁截圖
+│       ├── 2-1.png          # Rules 分頁截圖
+│       ├── 2-2.png          # Rules 分頁截圖
+│       ├── 3-1.png          # Proxies 分頁截圖
+│       ├── 3-2.png          # Proxies 分頁截圖
+│       └── 4.png            # Monitor 分頁截圖
 └── NetRedirector/           # C 語言底層原始碼與編譯腳本
-    ├── NetRedirector.c
+    ├── NetRedirector.c      # DLL 導出 API 與生命週期管理
     ├── NR_Core.c            # WinDivert 封包過濾與 UDP Relay
     ├── NR_Protocol.c        # SOCKS5 / HTTP 協議解析
     ├── NR_RuleEngine.c      # 規則比對引擎
     ├── NR_State.c           # 連線狀態追蹤
+    ├── NR_Utils.c           # 工具函式 (EXE 解析、LAN/on-link 偵測、比對邏輯)
     └── build_dll.bat        # MSVC x64 編譯腳本
 ```
 
