@@ -567,7 +567,11 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
                                 LeaveCriticalSection(&lock_cs);
+                            } else {
+                                log_message("UDP relay: UDP ASSOCIATE failed (proxy id %u, %s:%u)", proxy_id, cfg->proxy_ip, cfg->proxy_port);
                             }
+                        } else {
+                            log_message("UDP relay: no usable proxy config (proxy id %u)", proxy_id);
                         }
                     }
 
@@ -576,8 +580,10 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         memcpy(&send_buf[4], dest_addr, 4);
                         *(UINT16*)&send_buf[8] = htons(dest_port);
                         memcpy(&send_buf[10], recv_buf, recv_len);
-                        sendto(target_assoc->udp_socket, (char*)send_buf, 10 + recv_len, 0,
-                            (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr));
+                        if (sendto(target_assoc->udp_socket, (char*)send_buf, 10 + recv_len, 0,
+                            (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr)) == SOCKET_ERROR) {
+                            log_message("UDP relay: sendto proxy failed, error=%ld", WSAGetLastError());
+                        }
                         target_assoc->last_activity = GetTickCount();
                     }
                 }
@@ -613,7 +619,11 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
                                 LeaveCriticalSection(&lock_cs);
+                            } else {
+                                log_message("UDP relay: UDP ASSOCIATE failed (IPv6, proxy id %u, %s:%u)", proxy_id, cfg->proxy_ip, cfg->proxy_port);
                             }
+                        } else {
+                            log_message("UDP relay: no usable proxy config (IPv6, proxy id %u)", proxy_id);
                         }
                     }
 
@@ -622,8 +632,10 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         memcpy(&send_buf[4], dest_addr, 16);
                         *(UINT16*)&send_buf[20] = htons(dest_port);
                         memcpy(&send_buf[22], recv_buf, recv_len);
-                        sendto(target_assoc->udp_socket, (char*)send_buf, 22 + recv_len, 0,
-                            (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr));
+                        if (sendto(target_assoc->udp_socket, (char*)send_buf, 22 + recv_len, 0,
+                            (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr)) == SOCKET_ERROR) {
+                            log_message("UDP relay: sendto proxy failed (IPv6), error=%ld", WSAGetLastError());
+                        }
                         target_assoc->last_activity = GetTickCount();
                     }
                 }
@@ -647,11 +659,12 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
             if (!remove && FD_ISSET(curr->udp_socket, &read_fds)) {
                 from_len = sizeof(from_addr);
                 recv_len = recvfrom(curr->udp_socket, (char*)recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from_addr, &from_len);
-                if (recv_len > 10 && recv_buf[3] == SOCKS5_ATYP_IPV4) {
+                if (recv_len > 10 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV4) {
                     curr->last_activity = GetTickCount();
                     UINT32 src_ip = *(UINT32*)&recv_buf[4];
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[8]);
-                    
+                    BOOL matched = FALSE;
+
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
                         if (conn->family == AF_INET &&
@@ -664,14 +677,20 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                             target_addr.sin_port = htons(conn->src_port);
                             sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len - 10, 0,
                                 (struct sockaddr *)&target_addr, sizeof(target_addr));
+                            matched = TRUE;
                             break;
                         }
                         conn = conn->next;
                     }
+                    if (!matched) {
+                        log_message("UDP relay: response no matching connection (%u.%u.%u.%u:%u)",
+                            recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
+                    }
                 }
-                else if (recv_len > 26 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
+                else if (recv_len > 26 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
                     curr->last_activity = GetTickCount();
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[20]);
+                    BOOL matched = FALSE;
 
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
@@ -687,9 +706,13 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                                 sendto(udp_relay_socket6, (char*)&recv_buf[26], recv_len - 26, 0,
                                     (struct sockaddr *)&target_addr6, sizeof(target_addr6));
                             }
+                            matched = TRUE;
                             break;
                         }
                         conn = conn->next;
+                    }
+                    if (!matched) {
+                        log_message("UDP relay: response no matching connection (IPv6, port %u)", src_port);
                     }
                 }
             }

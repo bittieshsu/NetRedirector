@@ -1,164 +1,196 @@
-# NetRedirector
+# NetRedirector 🚀
 
-NetRedirector 是一個功能強大的網路流量轉發和代理工具，結合了本地端口路由和系統級流量攔截功能。它提供了圖形化界面，讓用戶可以輕鬆管理多個網路介面和代理規則。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue.svg)](https://www.python.org/)
+[![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](https://www.microsoft.com/)
+[![GUI: PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)](https://doc.qt.io/qtforpython/)
+[![Core: WinDivert](https://img.shields.io/badge/Core-WinDivert-orange.svg)](https://www.reqrypt.org/windivert.html)
 
-## 功能特色
+**NetRedirector** 是一個功能強大且專為進階玩家與開發者設計的Windows網路流量轉發與代理工具。它結合了高效能的本地端口路由（Hub）與系統級封包攔截（WinDivert 驅動層），支援 IPv4 / IPv6 雙棧、多網卡故障轉移、負載平衡及智慧局域網自動直連，並透過現代化的 PySide6 圖形介面提供極佳的操作體驗。
+
+---
+
+## 📸 介面預覽 (UI Gallery)
+
+> 💡 *提示：您可以將實際操作截圖放置於專案的 `docs/images/` 目錄下（例如 `hub.png`、`rules.png`、`proxies.png`、`monitor.png`），以完美呈現精美 UI 介面。*
+
+| 1. 端口路由管理 (Hub) | 2. 進程攔截規則 (Rules) |
+| :---: | :---: |
+| ![Hub 界面預覽](docs/images/hub.png) | ![Rules 界面預覽](docs/images/rules.png) |
+| *多本地監聽端口、網卡多對一綁定與即時延遲偵測* | *支援進程名稱/PID、多條件過濾與代理綁定* |
+
+| 3. 自訂代理管理 (Proxies) | 4. 即時流量監控 (Monitor) |
+| :---: | :---: |
+| ![Proxies 界面預覽](docs/images/proxies.png) | ![Monitor 界面預覽](docs/images/monitor.png) |
+| *SOCKS5 / HTTP 代理設定與一鍵可用性 Ping 測試* | *即時封包記錄、進程資訊與右鍵快速建立規則* |
+
+---
+
+## ✨ 功能特色
 
 ### 1. 端口路由管理 (Hub)
-- 支援多個本地監聽端口
-- 可將不同端口綁定到不同的網路介面
-- 自動選擇最佳延遲的網路介面進行連線
-- 每個端口可綁定多個網路介面
-- 支援介面篩選功能，快速搜尋指定介面
-- 支援全選顯示項目功能
+- **多端口監聽**：支援同時開啟多個本地監聽端口，滿足不同應用或遊戲的代理需求。
+- **網卡多對一/多對多綁定**：可將特定本地端口綁定到指定的網路介面（Wi-Fi、乙太網路、VPN等）。
+- **自動故障轉移與智慧選路**：自動選擇延遲最低的網路介面連線；當主介面失效時自動切換至備用介面。
+- **快速搜尋與全選**：內建介面名稱篩選框與「全選顯示項目」快捷按鈕，海量網卡輕鬆管理。
 
 ### 2. 進程攔截規則 (Rules)
-- 支援按進程名稱或 PID 設定規則
-- 可指定目標主機和端口
-- 支援 TCP/UDP 協議篩選
-- 三種規則動作：代理、直連、阻擋
-- 支援規則編輯功能，可修改現有規則
-- 可將規則與特定代理綁定
+- **精準進程匹配**：支援按進程名稱（如 `chrome.exe`、`game.exe`）或特定 PID 設定規則。
+- **多維度過濾條件**：可指定目標主機（Hosts）、目標端口（Ports）以及協議類型（TCP / UDP / ALL）。
+- **三大規則動作**：支援 **代理 (Proxy)**、**直連 (Direct)** 與 **阻擋 (Block)**。
+- **雙擊編輯與管理**：支援規則即時編輯修改、啟用/停用與刪除。
 
-### 3. 自訂代理管理
-- 支援 SOCKS5 和 HTTP 代理
-- 可設定帳號密碼驗證
-- 可將規則與特定代理綁定
-- 支援代理連線測試功能，驗證代理可用性
+### 3. 自訂代理管理 (Proxies)
+- **多協議支援**：完整支援 **SOCKS5** 與 **HTTP** 代理伺服器。
+- **安全認證**：支援帳號密碼（Username / Password）身份驗證。
+- **代理群組Ping測試**：一鍵測試所有代理伺服器的連線延遲與可用性。
 
-### 4. 流量監控
-- 實時顯示網路流量
-- 顯示進程名稱和 PID
-- 目標 IP 和端口資訊
-- 支援右鍵點擊流量記錄快速新增規則
+### 4. 智慧局域網自動直連 (Local Subnet Direct)
+- **私有網段自動直連**：目的地為私有網段（IPv4 `10/8`、`172.16/12`、`192.168/16`，IPv6 ULA `fc00::/7`）時自動繞過代理，確保區網內檔案傳輸、印表機、區域網路遊戲速度不受影響。
+- **On-link 動態辨識**：自動識別本機任一張作用中網卡同網段（on-link）目標（含 ISP 派發的全球 IPv6 位址），維持最佳本機連線效能。
 
-### 5. 故障轉移與負載平衡
-- 支援多網卡故障轉移機制
-- 當主要介面失效時自動切換到備用介面
-- 智能負載平衡，避免單一介面過載
+### 5. IPv6 雙棧支援
+- **核心層完整支援**：WinDivert 攔截層完整支援 IPv4 / IPv6 雙棧封包。
+- **SOCKS5 IPv6 轉發**：支援 SOCKS5 ATYP_IPV6 及 HTTP CONNECT `[IPv6]:port` 格式。
+- **萬用字元比對**：IPv6 規則比對支援完整位址或 `*` 萬用匹配。
 
-### 6. IPv6 支援
-- WinDivert 攔截層完整支援 IPv4 / IPv6 雙棧
-- IPv6 目標流量可經由 SOCKS5 代理轉發（SOCKS5 ATYP_IPV6 / HTTP CONNECT `[IPv6]:port`）
-- IPv6 規則比對支援完整位址或 `*` 萬用
-- IPv6 multicast / link-local / loopback 流量自動直連
+### 6. 高效網路診斷與流量監控
+- 內建優化的 `network_utils` 模組，取代傳統緩慢的 cmd `ping` / `ipconfig` 命令，提供毫秒級網路介面檢測與即時延遲監控。
+- 支援右鍵點擊即時流量記錄，一鍵快速新增進程攔截規則。
 
-### 7. 區域網路自動直連
-- 目的地為私有網段（IPv4 `10/8`、`172.16/12`、`192.168/16`，IPv6 ULA `fc00::/7`）時自動直連
-- 目的地與本機任一張作用中網卡位址同網段（on-link）時自動直連（含 ISP 派發的全球 IPv6，例如 `2001:b011:xxxx::/64`）
-- 確保區網內檔案傳輸不會經由外部代理（如手機 SOCKS5 5G 上網）繞路，傳檔速度不受代理影響
+---
 
-## 系統需求
+## 🛠️ 系統需求
 
-- Windows 10/11
-- 管理員權限 (用於安裝 WinDivert 驅動)
-- Python 3.7+
-- 高效網路診斷功能 (使用內建 network_utils 模組替代傳統 cmd 命令)
+- **作業系統**：Windows 10 / 11 (x64)
+- **運行權限**：**管理員權限 (Administrator)**（WinDivert 驅動程式攔截網路封包必須）
+- **執行環境**：Python 3.7+ (推薦 Python 3.11)
 
-## 安裝步驟
+---
 
-1. 確保系統安裝了 Python 3.7+
-2. 下載專案檔案
-3. 安裝相依套件：`pip install -r requirements.txt`
-4. 以管理員身份執行 `IntegratedApp.py`
+## 📦 安裝步驟
 
-## 使用說明
+1. **取得專案程式碼**
+   ```bash
+   git clone https://github.com/your-username/NetRedirector2.git
+   cd NetRedirector2
+   ```
 
-### 端口路由管理
-1. 在 "1. 端口路由管理" 分頁中新增本地監聽端口
-2. 選擇端口後，在右側表格中勾選要綁定的網路介面
-3. 可使用篩選框快速搜尋指定介面名稱
-4. 點擊 "全選顯示項目" 可快速選取所有顯示的介面
-5. 點擊 "啟動/重啟選中端口" 開始服務
-6. 其他應用程式可以透過設定的本地端口進行代理連線
+2. **建立並啟動虛擬環境 (建議)**
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\activate
+   ```
 
-### 進程攔截規則
-1. 在 "2. 進程攔截規則" 分頁中設定規則
-2. 選擇規則類型 (進程名稱或 PID)
-3. 輸入目標 (如 chrome.exe 或 PID 1234)
-4. 設定進階條件 (目標主機、端口、協議)
-5. 選擇規則動作和指定代理
-6. 點擊 "新增規則" 儲存
-7. 可雙擊規則項目進行編輯修改
+3. **安裝相依套件**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-### 自訂代理管理
-1. 在 "3. 自訂代理管理" 分頁中新增外部代理
-2. 輸入代理名稱、類型、IP、端口等資訊
-3. 如需要，設定帳號密碼驗證
-4. 點擊 "新增代理" 儲存代理設定
-5. 可點擊 "測試所有代理連線 (Ping)" 測試代理可用性
+4. **以管理員身份執行應用程式**
+   - 右鍵點擊命令提示字元 (CMD) 或 PowerShell，選擇 **「以系統管理員身分執行」**。
+   - 執行整合版主程式：
+     ```bash
+     python IntegratedApp.py
+     ```
 
-### 高效網路診斷工具
-NetRedirector 提供了比傳統 Windows `ping` 和 `ipconfig` 命令更高效的網路診斷功能：
+---
 
-- **高效網路介面檢測**：使用 `network_utils.get_system_interfaces()` 代替 `ipconfig`
-- **精確延遲測試**：使用 `network_utils.ping_address()` 代替傳統 `ping` 命令
-- **實時監控**：內建網路介面延遲監控，無需額外命令列工具
+## 📖 詳細使用說明
 
-這些內建工具提供更快的響應速度和更豐富的資訊，無需調用外部命令列程序。
+### 一、 端口路由管理 (Hub 分頁)
+1. **新增監聽端口**：於左側輸入框填入本地監聽端口（例如 `1080` 或 `8888`），點擊「新增端口」。
+2. **選擇並綁定介面**：點擊左側列表中的端口，右側將列出所有可用網路介面。
+3. **網卡篩選與勾選**：
+   - 可在上方「過濾介面」輸入關鍵字快速搜尋（例如 `Wi-Fi`）。
+   - 點擊「全選顯示項目」可快速選取當前篩選出的所有網卡。
+4. **啟動路由服務**：勾選所需介面後，點擊「啟動/重啟選中端口」，即完成本地代理服務綁定。
 
-### 流量監控
-1. 在 "4. 流量監控" 分頁中檢視即時流量
-2. 可以右鍵點擊流量記錄快速新增規則
+### 二、 進程攔截規則 (Rules 分頁)
+1. **選擇匹配方式**：勾選「進程名稱」或「PID」。
+2. **填寫目標資訊**：
+   - 範例（進程名稱）：`chrome.exe` 或 `steam.exe`
+   - 範例（PID）：`1234`
+3. **設定進階條件**：可選填目標主機（如 `*.google.com`）、端口（如 `443`）及傳輸協議（TCP/UDP/ALL）。
+4. **選擇動作與代理**：
+   - **代理**：指定透過某個已設定的自訂代理轉發。
+   - **直連**：強制不經過代理，直接連線。
+   - **阻擋**：攔截並阻斷該流量。
+5. **管理規則**：點擊「新增規則」；若需修改，直接 **雙擊** 表格中的規則項目即可載入表單進行編輯。
 
-## 檔案結構
+### 三、 自訂代理管理 (Proxies 分頁)
+1. **填寫代理參數**：
+   - **名稱**：自訂辨識名稱（例如 `US-Node-1`）
+   - **類型**：選擇 `SOCKS5` 或 `HTTP`
+   - **IP Host / Port**：填入代理伺服器位址與端口。
+   - **認證**：若代理需要密碼，填入 User 與 Pass。
+2. **新增與測試**：點擊「新增代理」儲存。隨時可點擊「測試所有代理連線 (Ping)」檢驗代理節點的延遲與可用狀態。
+
+### 四、 即時流量監控 (Monitor 分頁)
+1. 查看即時產生的網路流量記錄（包含時間、進程名稱、PID、來源/目標 IP 與端口）。
+2. 支援 **滑鼠右鍵點擊** 任意流量記錄行，彈出快捷選單，一鍵將該進程或目標加入攔截規則中。
+
+---
+
+## 🗂️ 專案檔案結構
 
 ```
-NetRedirector/
-├── IntegratedApp.py         # 整合版主應用程式 (GUI)
-├── GameProxyHub.py          # 原始端口路由管理界面
-├── proxy_core.py            # 本地 SOCKS5 代理核心 (Hub 模式)
-├── network_utils.py         # 網路介面掃描工具
-├── NetRedirector.py         # NetRedirector DLL 包裝器
-├── NR_simple.py             # 簡易測試版本
-├── config.json              # 本地設定檔 (由程式自動產生/讀取)
-├── requirements.txt         # Python 相依套件
-├── NetRedirector.dll        # 核心 C 語言 DLL
-├── WinDivert.dll           # WinDivert 動態連結庫
-├── WinDivert64.sys          # WinDivert 驅動程式
-├── vcruntime140.dll        # VC++ 執行時期庫
-└── NetRedirector/           # C 語言原始碼
-    ├── NetRedirector.c      # DLL 導出函數
-    ├── NR_Core.c            # 封包處理 (WinDivert) 與 UDP Relay
-    ├── NR_Protocol.c        # SOCKS5 / HTTP 協議實作
-    ├── NR_RuleEngine.c      # 規則引擎
+NetRedirector2/
+├── IntegratedApp.py         # 整合版主應用程式 (PySide6 GUI)
+├── proxy_core.py            # 本地 SOCKS5 / 端口路由代理核心
+├── network_utils.py         # 高效網路介面掃描與 Ping 診斷模組
+├── NetRedirector.py         # WinDivert C 核心 Python 封裝器
+├── requirements.txt         # Python 相依套件清單
+├── NetRedirector.dll        # 核心 C 語言 DLL (封包攔截與轉發)
+├── WinDivert.dll            # WinDivert 動態連結庫
+├── WinDivert64.sys          # WinDivert 核心驅動程式
+├── vcruntime140.dll         # Visual C++ 執行時期庫
+├── docs/
+│   └── images/              # UI 截圖目錄
+│       ├── hub.png
+│       ├── rules.png
+│       ├── proxies.png
+│       └── monitor.png
+└── NetRedirector/           # C 語言底層原始碼與編譯腳本
+    ├── NetRedirector.c
+    ├── NR_Core.c            # WinDivert 封包過濾與 UDP Relay
+    ├── NR_Protocol.c        # SOCKS5 / HTTP 協議解析
+    ├── NR_RuleEngine.c      # 規則比對引擎
     ├── NR_State.c           # 連線狀態追蹤
-    ├── NR_Utils.c           # 工具函式
-    ├── windivert.h          # WinDivert SDK 標頭
-    ├── WinDivert.lib        # WinDivert 匯入函式庫
-    └── build_dll.bat        # 重新編譯 DLL 腳本 (需 MSVC x64)
+    └── build_dll.bat        # MSVC x64 編譯腳本
 ```
 
-## 重新編譯 DLL
+---
 
-C 核心以 Visual Studio 編譯，需要 MSVC x64 工具鏈：
+## ⚙️ 重新編譯 C 核心 DLL
 
-```
-build_dll.bat
-```
+若您修改了 `NetRedirector/` 目錄下的 C 語言原始碼，需要重新編譯 DLL：
 
-輸出為 `NetRedirector/NetRedirector.dll`，取代根目錄的同名檔案後生效。
+1. 開啟 **Developer Command Prompt for VS** (確保具備 MSVC x64 工具鏈)。
+2. 進入 `NetRedirector/` 目錄或執行：
+   ```cmd
+   cd NetRedirector
+   call build_dll.bat
+   ```
+3. 編譯產出的 `NetRedirector.dll` 會自動輸出，覆蓋根目錄同名檔案即可生效。
 
-## 技術架構
+---
 
-- 前端：PySide6 GUI 框架
-- 後端：Python 套件
-- 核心：C 語言 DLL (基於 WinDivert)
-- 網路協定：SOCKS5 (支援 IPv4 / IPv6 目標) / HTTP CONNECT
-- 攔截技術：WinDivert 核心層封包攔截 (IPv4 + IPv6 雙棧)
+## ❓ 常見問題與故障排除 (FAQ)
 
-## 注意事項
+1. **Q: 為什麼程式啟動時提示無法載入 WinDivert 驅動？**
+   - A: 請確保以 **系統管理員身份 (Administrator)** 執行命令提示字元或 Python 腳本。部分防毒軟體可能會誤判 `WinDivert64.sys`，請加入排除清單。
+2. **Q: 為什麼區域網路（LAN）內的印表機或共享資料夾無法存取？**
+   - A: NetRedirector 內建「智慧局域網自動直連」功能，通常會自動放行私有網段。若仍有異常，請檢查規則分頁中是否有設定全域阻擋或覆蓋規則。
+3. **Q: 支援遊戲加速或指定進程代理嗎？**
+   - A: 支援。透過「進程攔截規則」指定遊戲主程式（如 `game.exe`）並套用 SOCKS5 代理即可實現精準遊戲加速。
 
-1. 必須以管理員權限執行應用程式
-2. 首次執行時可能需要允許 WinDivert 驅動程式安裝
-3. 防火牆可能會阻止應用程式的網路存取
-4. 某些防毒軟體可能將此應用程式標記為威脅
-5. 故障轉移功能可在主要連線失效時自動切換至備用連線
+---
 
-## 授權
+## 📄 授權條款
 
-此專案使用 MIT 授權 - 詳見 [LICENSE](LICENSE) 檔案。
+本專案採用 [MIT License](LICENSE) 授權條款。
 
-## 貢獻
+## 🤝 貢獻指南
 
-歡迎提交 Issue 和 Pull Request 來改善此專案。
+歡迎提交 Issue 或 Pull Request 來共同完善 NetRedirector！

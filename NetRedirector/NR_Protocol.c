@@ -150,7 +150,6 @@ int http_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UINT1
 int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG* proxy_config)
 {
     unsigned char buf[512];
-    int len;
     BOOL use_auth = (proxy_config != NULL && proxy_config->username[0] != '\0');
 
     buf[0] = SOCKS5_VERSION;
@@ -162,8 +161,7 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
         if (send(s, (char*)buf, 3, 0) != 3) return -1;
     }
 
-    len = recv(s, (char*)buf, 2, 0);
-    if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
+    if (recv_n(s, buf, 2) != 0 || buf[0] != SOCKS5_VERSION) return -1;
 
     if (buf[1] == 0x02) {
         if (!use_auth) return -1;
@@ -175,8 +173,7 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
         buf[2 + user_len] = (unsigned char)pass_len;
         memcpy(&buf[3 + user_len], proxy_config->password, pass_len);
         if (send(s, (char*)buf, (int)(3 + user_len + pass_len), 0) != (int)(3 + user_len + pass_len)) return -1;
-        len = recv(s, (char*)buf, 2, 0);
-        if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
+        if (recv_n(s, buf, 2) != 0 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
     } else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
 
     buf[0] = SOCKS5_VERSION;
@@ -186,8 +183,10 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
     memset(&buf[4], 0, 6); // 0.0.0.0:0
     if (send(s, (char*)buf, 10, 0) != 10) return -1;
 
-    len = recv(s, (char*)buf, 10, 0);
-    if (len < 10 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00) return -1;
+    // 完整讀取回覆 (TCP 為串流，裸 recv 可能只收到部分資料)
+    if (recv_n(s, buf, 4) != 0 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00) return -1;
+    if (buf[3] != SOCKS5_ATYP_IPV4) return -1;
+    if (recv_n(s, buf + 4, 6) != 0) return -1;
 
     relay_addr->sin_family = AF_INET;
     relay_addr->sin_addr.s_addr = *(UINT32*)&buf[4];

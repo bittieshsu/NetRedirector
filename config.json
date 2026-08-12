@@ -29,15 +29,6 @@
     {
       "type": "Name",
       "target": "*",
-      "hosts": "192.168.1.*",
-      "ports": "*",
-      "proto": "BOTH",
-      "action": "DIRECT (直連)",
-      "proxy_text": "[Custom] MyPhone"
-    },
-    {
-      "type": "Name",
-      "target": "*",
       "hosts": "*",
       "ports": "*",
       "proto": "BOTH",
