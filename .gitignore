@@ -8,5 +8,6 @@ IntegratedApp.dist/
 NetRedirector2-v1.0.0-win64.zip
 NetRedirector2-v1.1.0-win64.zip
 NetRedirector2-v1.2.0-win64.zip
+NetRedirector-v*-win64.zip
 # Packaged build leftovers
 IntegratedApp.dist.*/

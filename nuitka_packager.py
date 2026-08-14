@@ -170,7 +170,7 @@ class SmartNuitkaPackager:
             # 偵測資源目錄 (維持原樣，檢查根目錄下的預設資料夾)
             self.auto_data_dirs = [d for d in os.listdir(project_root)
                                    if os.path.isdir(os.path.join(project_root, d))
-                                   and d.lower() in ['libs', 'assets', 'resources', 'img', 'images']]
+                                   and d.lower() in ['libs', 'assets', 'resources', 'img', 'images', 'locale']]
 
             # 偵測專案執行時期支援檔案 (ctypes 載入的 DLL / 驅動)，打包時一併帶入
             # 注意: vcruntime140.dll 由 Nuitka 自動包含，不需 (也不能) 手動重複指定

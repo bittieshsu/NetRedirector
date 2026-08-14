@@ -20,6 +20,8 @@ import struct
 import base64
 import time
 
+from i18n import i18n as tr, SUPPORTED_LANGS
+
 # 匯入現有的模組
 import network_utils
 import proxy_core
@@ -164,7 +166,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NetRedirector x GameProxyHub 整合專業版")
+        self._i18n_registry = []
+        self.setWindowTitle(self.t("NetRedirector x GameProxyHub 整合專業版"))
+        self._reg("window", self, "NetRedirector x GameProxyHub 整合專業版")
         self.resize(1024, 768)
         dll_path = "NetRedirector.dll"
         
@@ -214,9 +218,103 @@ class MainWindow(QMainWindow):
 
         self.append_log("系統就緒。")
 
+    # --- 多國語系支援 ---
+    def t(self, s):
+        return tr.t(s)
+
+    def _reg(self, kind, *args):
+        self._i18n_registry.append((kind, args))
+        self._apply_i18n(kind, args)
+
+    def _apply_i18n(self, kind, args):
+        if kind == "text":
+            args[0].setText(self.t(args[1]))
+        elif kind == "title":
+            args[0].setTitle(self.t(args[1]))
+        elif kind == "placeholder":
+            args[0].setPlaceholderText(self.t(args[1]))
+        elif kind == "combo":
+            combo, keys = args
+            idx = combo.currentIndex()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems([self.t(k) for k in keys])
+            if idx >= 0 and idx < len(keys):
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        elif kind == "headers":
+            tbl, keys = args
+            tbl.setHorizontalHeaderLabels([self.t(k) for k in keys])
+        elif kind == "tab":
+            args[0].setTabText(args[1], self.t(args[2]))
+        elif kind == "window":
+            args[0].setWindowTitle(self.t(args[1]))
+
+    def retranslate_ui(self):
+        for kind, args in self._i18n_registry:
+            self._apply_i18n(kind, args)
+        self.update_service_status()
+        self.update_hub_status()
+        self.update_form_titles()
+        self.refresh_proxy_combobox()
+        self.refresh_rules_table()
+        self.refresh_custom_proxy_table()
+        self.refresh_hub_table()
+        idx = self.combo_lang.findData(tr.lang)
+        if idx >= 0 and idx != self.combo_lang.currentIndex():
+            self.combo_lang.blockSignals(True)
+            self.combo_lang.setCurrentIndex(idx)
+            self.combo_lang.blockSignals(False)
+
+    def on_lang_changed(self, idx):
+        code = self.combo_lang.itemData(idx)
+        if code and code != tr.lang:
+            tr.load(code)
+            self.retranslate_ui()
+            self.append_log(f"語言已切換: {tr.lang_name(code)}")
+
+    def update_service_status(self):
+        running = self.is_redirector_running
+        self.btn_master_switch.setText(
+            self.t("停止攔截服務 (Stop)") if running else self.t("啟動攔截服務 (Start Redirector)"))
+        self.btn_master_switch.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;" if running
+            else "background-color: #f44336; color: white; font-weight: bold; padding: 6px;")
+        self.lbl_status.setText(self.t("狀態: 運行中") if running else self.t("狀態: 停止"))
+        self.lbl_status.setStyleSheet("color: green; font-weight: bold;" if running else "color: red; font-weight: bold;")
+
+    def update_hub_status(self):
+        if self.selected_hub_port:
+            self.lbl_hub_status.setText(self.t("當前端口: {port}").format(port=self.selected_hub_port))
+        else:
+            self.lbl_hub_status.setText(self.t("未選擇端口"))
+
+    def update_form_titles(self):
+        if self.editing_rule_id is not None:
+            self.group_rule_form.setTitle(self.t("編輯規則 (ID: {rule_id})").format(rule_id=self.editing_rule_id))
+            self.btn_rule_action.setText(self.t("保存修改"))
+            self.btn_rule_action.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+            self.btn_rule_cancel.show()
+        else:
+            self.group_rule_form.setTitle(self.t("新增攔截規則"))
+            self.btn_rule_action.setText(self.t("新增規則"))
+            self.btn_rule_action.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+            self.btn_rule_cancel.hide()
+        if self.editing_proxy_id is not None:
+            self.group_proxy_form.setTitle(self.t("編輯代理 (ID: {pid})").format(pid=self.editing_proxy_id))
+            self.btn_proxy_save.setText(self.t("保存修改"))
+            self.btn_proxy_save.setStyleSheet("background-color: #FF9800; color: white;")
+            self.btn_proxy_cancel.show()
+        else:
+            self.group_proxy_form.setTitle(self.t("新增外部代理 (SOCKS5/HTTP)"))
+            self.btn_proxy_save.setText(self.t("新增代理"))
+            self.btn_proxy_save.setStyleSheet("background-color: #2196F3; color: white;")
+            self.btn_proxy_cancel.hide()
+
     # [新增] 儲存設定功能
     def save_config(self):
         config_data = {
+            "lang": tr.lang,
             "hubs": self.port_config,
             "proxies": [],
             "rules": []
@@ -242,6 +340,7 @@ class MainWindow(QMainWindow):
                 "ports": r.get('ports', '*'),
                 "proto": r.get('proto', 'BOTH'),
                 "action": r['action'],
+                "action_key": r.get('action_key'),
                 "proxy_text": r['proxy'] # 這裡保存 UI 上顯示的 Proxy 文字 (例如 "[Custom] MyVPN")
             })
 
@@ -260,6 +359,10 @@ class MainWindow(QMainWindow):
         try:
             with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
+            saved_lang = data.get("lang")
+            if saved_lang:
+                tr.load(saved_lang)
 
             self.append_log("正在還原設定...")
 
@@ -321,9 +424,12 @@ class MainWindow(QMainWindow):
                 elif r['proto'] == "UDP": protocol = RuleProtocol.UDP
 
                 # 動作轉換
-                action_idx = 0 # Default Proxy
-                if "DIRECT" in r['action']: action_idx = 1
-                elif "BLOCK" in r['action']: action_idx = 2
+                action_key = r.get('action_key')
+                if action_key is None:
+                    action_key = 0
+                    if "DIRECT" in r['action']: action_key = 1
+                    elif "BLOCK" in r['action']: action_key = 2
+                action_idx = action_key
 
                 # 呼叫 DLL
                 rid = 0
@@ -351,11 +457,13 @@ class MainWindow(QMainWindow):
                         'ports': ports,
                         'proto': r['proto'],
                         'action': r['action'],
+                        'action_key': action_key,
                         'proxy': proxy_text # 保持原本的顯示文字
                     })
 
             self.refresh_rules_table()
             self.append_log(f"設定還原完成: 代理 {len(self.custom_proxies)} 個, 路由 {len(self.port_config)} 個, 規則 {len(self.rules)} 條")
+            self.retranslate_ui()
 
         except Exception as e:
             self.append_log(f"還原設定失敗: {e}")
@@ -370,16 +478,21 @@ class MainWindow(QMainWindow):
 
         # 頂部控制列
         top_bar = QHBoxLayout()
-        self.btn_master_switch = QPushButton("啟動攔截服務 (Start Redirector)")
+        self.btn_master_switch = QPushButton("")
         self.btn_master_switch.setCheckable(True)
-        self.btn_master_switch.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 6px;")
         self.btn_master_switch.clicked.connect(self.toggle_redirector_service)
         top_bar.addWidget(self.btn_master_switch)
         
-        self.lbl_status = QLabel("攔截服務狀態: 停止")
-        self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+        self.lbl_status = QLabel("")
         top_bar.addWidget(self.lbl_status)
+
+        self.combo_lang = QComboBox()
+        self.combo_lang.setFixedWidth(110)
+        for code in SUPPORTED_LANGS:
+            self.combo_lang.addItem(tr.lang_name(code), code)
+        self.combo_lang.currentIndexChanged.connect(self.on_lang_changed)
         top_bar.addStretch()
+        top_bar.addWidget(self.combo_lang)
         main_layout.addLayout(top_bar)
 
         self.tabs = QTabWidget()
@@ -387,21 +500,26 @@ class MainWindow(QMainWindow):
 
         self.tab_hub = QWidget()
         self.setup_hub_tab()
-        self.tabs.addTab(self.tab_hub, "1. 端口路由管理 (Hub)")
+        self.tabs.addTab(self.tab_hub, "")
+        self._reg("tab", self.tabs, 0, "1. 端口路由管理 (Hub)")
 
         self.tab_rules = QWidget()
         self.setup_rules_tab()
-        self.tabs.addTab(self.tab_rules, "2. 進程攔截規則 (Rules)")
+        self.tabs.addTab(self.tab_rules, "")
+        self._reg("tab", self.tabs, 1, "2. 進程攔截規則 (Rules)")
 
         self.tab_proxies = QWidget()
         self.setup_custom_proxy_tab()
-        self.tabs.addTab(self.tab_proxies, "3. 自訂代理管理 (Proxies)")
+        self.tabs.addTab(self.tab_proxies, "")
+        self._reg("tab", self.tabs, 2, "3. 自訂代理管理 (Proxies)")
 
         self.tab_monitor = QWidget()
         self.setup_monitor_tab()
-        self.tabs.addTab(self.tab_monitor, "4. 流量監控 (Monitor)")
+        self.tabs.addTab(self.tab_monitor, "")
+        self._reg("tab", self.tabs, 3, "4. 流量監控 (Monitor)")
 
-        log_group = QGroupBox("系統日誌")
+        log_group = QGroupBox("")
+        self._reg("title", log_group, "系統日誌")
         log_layout = QVBoxLayout()
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
@@ -413,18 +531,24 @@ class MainWindow(QMainWindow):
         main_layout.setStretch(1, 4) 
         main_layout.setStretch(2, 1)
 
+        self.update_service_status()
+        self.update_hub_status()
+        self.update_form_titles()
+
     # (以下為各 Tab 的 setup 函式，與原版相同)
     def setup_hub_tab(self):
         layout = QHBoxLayout(self.tab_hub)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        left_panel = QGroupBox("本地監聽端口")
+        left_panel = QGroupBox("")
+        self._reg("title", left_panel, "本地監聽端口")
         left_layout = QVBoxLayout()
         input_layout = QHBoxLayout()
         self.spin_hub_port = QSpinBox()
         self.spin_hub_port.setRange(1000, 65535)
         self.spin_hub_port.setValue(30678)
-        btn_add = QPushButton("新增")
+        btn_add = QPushButton("")
+        self._reg("text", btn_add, "新增")
         btn_add.clicked.connect(self.add_hub_port)
         input_layout.addWidget(self.spin_hub_port)
         input_layout.addWidget(btn_add)
@@ -432,10 +556,12 @@ class MainWindow(QMainWindow):
         self.list_hub_ports = QListWidget()
         self.list_hub_ports.itemClicked.connect(self.on_hub_port_selected)
         
-        btn_del = QPushButton("刪除端口")
+        btn_del = QPushButton("")
+        self._reg("text", btn_del, "刪除端口")
         btn_del.clicked.connect(self.del_hub_port)
         
-        self.btn_apply_hub = QPushButton("啟動/重啟選中端口")
+        self.btn_apply_hub = QPushButton("")
+        self._reg("text", self.btn_apply_hub, "啟動/重啟選中端口")
         self.btn_apply_hub.setStyleSheet("background-color: #4CAF50; color: white;")
         self.btn_apply_hub.clicked.connect(self.apply_hub_config)
 
@@ -445,17 +571,19 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(btn_del)
         left_panel.setLayout(left_layout)
 
-        right_panel = QGroupBox("綁定出口網卡")
+        right_panel = QGroupBox("")
+        self._reg("title", right_panel, "綁定出口網卡")
         right_layout = QVBoxLayout()
-        self.lbl_hub_status = QLabel("未選擇端口")
+        self.lbl_hub_status = QLabel("")
         right_layout.addWidget(self.lbl_hub_status)
         
         filter_layout = QHBoxLayout()
         self.txt_hub_filter = QLineEdit()
-        self.txt_hub_filter.setPlaceholderText("🔍 篩選介面 (例: VPN)")
+        self._reg("placeholder", self.txt_hub_filter, "🔍 篩選介面 (例: VPN)")
         self.txt_hub_filter.textChanged.connect(self.refresh_hub_table) 
         
-        btn_select_all_visible = QPushButton("全選顯示項目")
+        btn_select_all_visible = QPushButton("")
+        self._reg("text", btn_select_all_visible, "全選顯示項目")
         btn_select_all_visible.clicked.connect(self.on_hub_select_all_visible)
         
         filter_layout.addWidget(self.txt_hub_filter)
@@ -464,7 +592,7 @@ class MainWindow(QMainWindow):
 
         self.table_hub = QTableWidget()
         self.table_hub.setColumnCount(5)
-        self.table_hub.setHorizontalHeaderLabels(["綁定", "介面名稱", "IP", "延遲", "負載"])
+        self._reg("headers", self.table_hub, ["綁定", "介面名稱", "IP", "延遲", "負載"])
         self.table_hub.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_hub.cellClicked.connect(self.on_hub_table_click)
 
@@ -478,7 +606,7 @@ class MainWindow(QMainWindow):
 
     def setup_rules_tab(self):
         layout = QVBoxLayout(self.tab_rules)
-        self.group_rule_form = QGroupBox("新增攔截規則")
+        self.group_rule_form = QGroupBox("")
         form_layout = QVBoxLayout()
         
         row1 = QHBoxLayout()
@@ -489,20 +617,22 @@ class MainWindow(QMainWindow):
         self.bg_rule_type.addButton(self.rb_name, 0)
         self.bg_rule_type.addButton(self.rb_pid, 1)
         self.ent_target = QLineEdit()
-        self.ent_target.setPlaceholderText("例如: chrome.*;Game*.exe ，或 PID 1234")
+        self._reg("placeholder", self.ent_target, "例如: chrome.*;Game*.exe ，或 PID 1234")
         row1.addWidget(self.rb_name)
         row1.addWidget(self.rb_pid)
-        row1.addWidget(QLabel("目標:"))
+        lbl_target = QLabel("")
+        self._reg("text", lbl_target, "目標:")
+        row1.addWidget(lbl_target)
         row1.addWidget(self.ent_target)
         form_layout.addLayout(row1)
         
         row2 = QHBoxLayout()
         self.ent_hosts = QLineEdit()
-        self.ent_hosts.setPlaceholderText("IP (預設 *)")
+        self._reg("placeholder", self.ent_hosts, "IP (預設 *)")
         self.ent_hosts.setText("*")
         self.ent_hosts.setFixedWidth(120)
         self.ent_ports = QLineEdit()
-        self.ent_ports.setPlaceholderText("Port (預設 *)")
+        self._reg("placeholder", self.ent_ports, "Port (預設 *)")
         self.ent_ports.setText("*")
         self.ent_ports.setFixedWidth(100)
         self.combo_proto = QComboBox()
@@ -519,18 +649,22 @@ class MainWindow(QMainWindow):
 
         row3 = QHBoxLayout()
         self.combo_action = QComboBox()
-        self.combo_action.addItems(["PROXY (轉發)", "DIRECT (直連)", "BLOCK (阻擋)"])
+        self._reg("combo", self.combo_action, ["PROXY (轉發)", "DIRECT (直連)", "BLOCK (阻擋)"])
         self.combo_proxy = QComboBox()
         self.refresh_proxy_combobox()
-        self.btn_rule_action = QPushButton("新增規則")
-        self.btn_rule_action.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.btn_rule_action = QPushButton("")
         self.btn_rule_action.clicked.connect(self.save_rule_action)
-        self.btn_rule_cancel = QPushButton("取消修改")
+        self.btn_rule_cancel = QPushButton("")
+        self._reg("text", self.btn_rule_cancel, "取消修改")
         self.btn_rule_cancel.clicked.connect(self.cancel_rule_edit)
         self.btn_rule_cancel.hide()
-        row3.addWidget(QLabel("動作:"))
+        lbl_action = QLabel("")
+        self._reg("text", lbl_action, "動作:")
+        lbl_proxy = QLabel("")
+        self._reg("text", lbl_proxy, "指定代理:")
+        row3.addWidget(lbl_action)
         row3.addWidget(self.combo_action)
-        row3.addWidget(QLabel("指定代理:"))
+        row3.addWidget(lbl_proxy)
         row3.addWidget(self.combo_proxy)
         row3.addWidget(self.btn_rule_action)
         row3.addWidget(self.btn_rule_cancel)
@@ -542,57 +676,79 @@ class MainWindow(QMainWindow):
         self.table_rules = QTableWidget()
         cols = ["ID", "類型", "目標", "Hosts", "Ports", "Proto", "動作", "代理"]
         self.table_rules.setColumnCount(len(cols))
-        self.table_rules.setHorizontalHeaderLabels(cols)
+        self._reg("headers", self.table_rules, cols)
         self.table_rules.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table_rules.setColumnHidden(0, True) 
         self.table_rules.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows) 
         self.table_rules.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) 
         self.table_rules.cellDoubleClicked.connect(self.on_rule_double_click)
+        self.table_rules.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_rules.customContextMenuRequested.connect(self.show_rule_menu)
         layout.addWidget(self.table_rules)
         
-        btn_del = QPushButton("刪除選中規則")
+        btn_row = QHBoxLayout()
+        btn_del = QPushButton("")
+        self._reg("text", btn_del, "刪除選中規則")
         btn_del.clicked.connect(self.del_rule)
-        layout.addWidget(btn_del)
+        lbl_hint = QLabel("")
+        self._reg("text", lbl_hint, "提示：雙擊規則列可編輯，或按右鍵開啟選單")
+        lbl_hint.setStyleSheet("color: gray;")
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch()
+        btn_row.addWidget(lbl_hint)
+        layout.addLayout(btn_row)
 
     def setup_custom_proxy_tab(self):
         layout = QVBoxLayout(self.tab_proxies)
-        self.group_proxy_form = QGroupBox("新增外部代理 (SOCKS5/HTTP)")
+        self.group_proxy_form = QGroupBox("")
         grid = QGridLayout()
         
         self.ent_cp_name = QLineEdit()
-        self.ent_cp_name.setPlaceholderText("名稱 (例: MyVPN)")
+        self._reg("placeholder", self.ent_cp_name, "名稱 (例: MyVPN)")
         self.combo_cp_type = QComboBox()
         self.combo_cp_type.addItems(["SOCKS5", "HTTP"])
-        grid.addWidget(QLabel("名稱:"), 0, 0)
+        lbl_cp_name = QLabel("")
+        self._reg("text", lbl_cp_name, "名稱:")
+        lbl_cp_type = QLabel("")
+        self._reg("text", lbl_cp_type, "類型:")
+        grid.addWidget(lbl_cp_name, 0, 0)
         grid.addWidget(self.ent_cp_name, 0, 1)
-        grid.addWidget(QLabel("類型:"), 0, 2)
+        grid.addWidget(lbl_cp_type, 0, 2)
         grid.addWidget(self.combo_cp_type, 0, 3)
         
         self.ent_cp_ip = QLineEdit()
-        self.ent_cp_ip.setPlaceholderText("IP 地址")
+        self._reg("placeholder", self.ent_cp_ip, "IP 地址")
         self.ent_cp_port = QLineEdit()
-        self.ent_cp_port.setPlaceholderText("Port")
+        self._reg("placeholder", self.ent_cp_port, "Port")
         self.ent_cp_port.setFixedWidth(80)
-        grid.addWidget(QLabel("IP Host:"), 1, 0)
+        lbl_cp_iph = QLabel("")
+        self._reg("text", lbl_cp_iph, "IP Host:")
+        lbl_cp_port = QLabel("")
+        self._reg("text", lbl_cp_port, "Port:")
+        grid.addWidget(lbl_cp_iph, 1, 0)
         grid.addWidget(self.ent_cp_ip, 1, 1)
-        grid.addWidget(QLabel("Port:"), 1, 2)
+        grid.addWidget(lbl_cp_port, 1, 2)
         grid.addWidget(self.ent_cp_port, 1, 3)
         
         self.ent_cp_user = QLineEdit()
-        self.ent_cp_user.setPlaceholderText("驗證帳號 (選填)")
+        self._reg("placeholder", self.ent_cp_user, "驗證帳號 (選填)")
         self.ent_cp_pass = QLineEdit()
-        self.ent_cp_pass.setPlaceholderText("驗證密碼 (選填)")
+        self._reg("placeholder", self.ent_cp_pass, "驗證密碼 (選填)")
         self.ent_cp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        grid.addWidget(QLabel("User:"), 2, 0)
+        lbl_cp_user = QLabel("")
+        self._reg("text", lbl_cp_user, "User:")
+        lbl_cp_pass = QLabel("")
+        self._reg("text", lbl_cp_pass, "Pass:")
+        grid.addWidget(lbl_cp_user, 2, 0)
         grid.addWidget(self.ent_cp_user, 2, 1)
-        grid.addWidget(QLabel("Pass:"), 2, 2)
+        grid.addWidget(lbl_cp_pass, 2, 2)
         grid.addWidget(self.ent_cp_pass, 2, 3)
         
         btn_layout = QHBoxLayout()
-        self.btn_proxy_save = QPushButton("新增代理")
-        self.btn_proxy_save.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.btn_proxy_save = QPushButton("")
         self.btn_proxy_save.clicked.connect(self.save_custom_proxy)
-        self.btn_proxy_cancel = QPushButton("取消修改")
+        self.btn_proxy_cancel = QPushButton("")
+        self._reg("text", self.btn_proxy_cancel, "取消修改")
         self.btn_proxy_cancel.clicked.connect(self.cancel_proxy_edit)
         self.btn_proxy_cancel.hide()
         btn_layout.addStretch()
@@ -604,24 +760,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.group_proxy_form)
         
         toolbar = QHBoxLayout()
-        btn_test = QPushButton("測試所有代理連線 (Ping)")
+        btn_test = QPushButton("")
+        self._reg("text", btn_test, "測試所有代理連線 (Ping)")
         btn_test.clicked.connect(self.test_all_proxies)
-        btn_del = QPushButton("刪除選中代理")
+        btn_del = QPushButton("")
+        self._reg("text", btn_del, "刪除選中代理")
         btn_del.clicked.connect(self.del_custom_proxy)
         toolbar.addWidget(btn_test)
-        toolbar.addStretch()
         toolbar.addWidget(btn_del)
+        lbl_hint = QLabel("")
+        self._reg("text", lbl_hint, "提示：雙擊代理列可編輯，或按右鍵開啟選單")
+        lbl_hint.setStyleSheet("color: gray;")
+        toolbar.addStretch()
+        toolbar.addWidget(lbl_hint)
         layout.addLayout(toolbar)
 
         self.table_custom_proxies = QTableWidget()
         cols = ["ID", "名稱", "類型", "IP:Port", "驗證", "延遲"]
         self.table_custom_proxies.setColumnCount(len(cols))
-        self.table_custom_proxies.setHorizontalHeaderLabels(cols)
+        self._reg("headers", self.table_custom_proxies, cols)
         self.table_custom_proxies.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_custom_proxies.setColumnHidden(0, True)
         self.table_custom_proxies.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_custom_proxies.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_custom_proxies.cellDoubleClicked.connect(self.on_proxy_double_click)
+        self.table_custom_proxies.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_custom_proxies.customContextMenuRequested.connect(self.show_proxy_menu)
         layout.addWidget(self.table_custom_proxies)
 
     def setup_monitor_tab(self):
@@ -635,7 +799,8 @@ class MainWindow(QMainWindow):
         self.tree_traffic.customContextMenuRequested.connect(self.show_traffic_menu)
         layout.addWidget(self.tree_traffic)
         
-        btn_clear = QPushButton("清除記錄")
+        btn_clear = QPushButton("")
+        self._reg("text", btn_clear, "清除記錄")
         btn_clear.clicked.connect(lambda: self.tree_traffic.setRowCount(0))
         layout.addWidget(btn_clear)
 
@@ -663,7 +828,7 @@ class MainWindow(QMainWindow):
     def on_hub_port_selected(self, item):
         if not item: return
         self.selected_hub_port = int(item.text().split()[0])
-        self.lbl_hub_status.setText(f"當前端口: {self.selected_hub_port}")
+        self.update_hub_status()
         self.refresh_hub_table()
 
     def apply_hub_config(self):
@@ -688,7 +853,7 @@ class MainWindow(QMainWindow):
         for i in range(self.list_hub_ports.count()):
             item = self.list_hub_ports.item(i)
             if item.text().startswith(str(port)):
-                status = "(運行中)" if is_running else "(失敗)"
+                status = self.t("(運行中)") if is_running else self.t("(失敗)")
                 item.setText(f"{port} {status}")
                 item.setForeground(QBrush(QColor("green") if is_running else QColor("red")))
                 break
@@ -725,7 +890,7 @@ class MainWindow(QMainWindow):
                 self.table_hub.setItem(row, 4, QTableWidgetItem(str(active)))
             else:
                 name_item.setForeground(QBrush(QColor("gray")))
-                offline_item = QTableWidgetItem("離線 (等待重連...)")
+                offline_item = QTableWidgetItem(self.t("離線 (等待重連...)"))
                 offline_item.setForeground(QBrush(QColor("gray")))
                 self.table_hub.setItem(row, 2, offline_item)
                 self.table_hub.setItem(row, 3, QTableWidgetItem("-"))
@@ -786,10 +951,6 @@ class MainWindow(QMainWindow):
         if not rule_data: return
 
         self.editing_rule_id = rule_id
-        self.group_rule_form.setTitle(f"編輯規則 (ID: {rule_id})")
-        self.btn_rule_action.setText("保存修改")
-        self.btn_rule_action.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
-        self.btn_rule_cancel.show()
 
         self.ent_target.setText(rule_data['target'])
         self.ent_hosts.setText(rule_data.get('hosts', '*'))
@@ -798,24 +959,33 @@ class MainWindow(QMainWindow):
         else: self.rb_name.setChecked(True)
         idx_proto = self.combo_proto.findText(rule_data.get('proto', 'BOTH'))
         if idx_proto >= 0: self.combo_proto.setCurrentIndex(idx_proto)
-        idx_action = self.combo_action.findText(rule_data['action'])
-        if idx_action >= 0: self.combo_action.setCurrentIndex(idx_action)
+        self.combo_action.setCurrentIndex(self._rule_action_idx(rule_data))
         current_proxy_text = rule_data['proxy']
         idx_proxy = self.combo_proxy.findText(current_proxy_text)
         if idx_proxy >= 0: self.combo_proxy.setCurrentIndex(idx_proxy)
         else: self.combo_proxy.setCurrentIndex(0)
+        self.update_form_titles()
+
+    def _rule_action_idx(self, rule_data):
+        key = rule_data.get('action_key')
+        if key is not None:
+            return int(key)
+        a = rule_data.get('action', '')
+        if "DIRECT" in a: return 1
+        if "BLOCK" in a: return 2
+        return 0
+
+    def _action_display(self, rule_data):
+        return self.t(["PROXY (轉發)", "DIRECT (直連)", "BLOCK (阻擋)"][self._rule_action_idx(rule_data)])
 
     def cancel_rule_edit(self):
         self.editing_rule_id = None
-        self.group_rule_form.setTitle("新增攔截規則")
-        self.btn_rule_action.setText("新增規則")
-        self.btn_rule_action.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-        self.btn_rule_cancel.hide()
         self.ent_target.clear()
         self.ent_hosts.setText("*")
         self.ent_ports.setText("*")
         self.combo_proxy.setCurrentIndex(0)
         self.combo_action.setCurrentIndex(0)
+        self.update_form_titles()
 
     def save_rule_action(self):
         target = self.ent_target.text().strip()
@@ -833,6 +1003,7 @@ class MainWindow(QMainWindow):
         pid_proxy = self.combo_proxy.currentData() or 0
         pid_proxy = int(pid_proxy)
         proxy_text = self.combo_proxy.currentText()
+        was_edit = self.editing_rule_id is not None
 
         if self.editing_rule_id is not None:
             if hasattr(self.bridge.lib, 'NetRedirector_DeleteRule'):
@@ -843,7 +1014,7 @@ class MainWindow(QMainWindow):
         rid = 0
         if is_pid:
             if not target.isdigit():
-                QMessageBox.warning(self, "錯誤", "PID 需為數字")
+                QMessageBox.warning(self, self.t("錯誤"), self.t("PID 需為數字"))
                 return
             rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, pid_proxy)
         else:
@@ -863,13 +1034,14 @@ class MainWindow(QMainWindow):
                 'ports': ports,
                 'proto': proto_str,
                 'action': action_text,
+                'action_key': action_idx,
                 'proxy': proxy_text
             })
             self.refresh_rules_table()
             self.cancel_rule_edit()
-            self.append_log(f"規則已{'更新' if self.editing_rule_id else '新增'} (ID: {rid})")
+            self.append_log(f"規則已{'更新' if was_edit else '新增'} (ID: {rid})")
         else:
-            QMessageBox.warning(self, "失敗", "驅動返回錯誤，規則添加失敗。")
+            QMessageBox.warning(self, self.t("失敗"), self.t("驅動返回錯誤，規則添加失敗。"))
 
     def del_rule(self):
         row = self.table_rules.currentRow()
@@ -890,7 +1062,7 @@ class MainWindow(QMainWindow):
             self.table_rules.setItem(row, 3, QTableWidgetItem(r.get('hosts', '*')))
             self.table_rules.setItem(row, 4, QTableWidgetItem(r.get('ports', '*')))
             self.table_rules.setItem(row, 5, QTableWidgetItem(r.get('proto', 'BOTH')))
-            self.table_rules.setItem(row, 6, QTableWidgetItem(r['action']))
+            self.table_rules.setItem(row, 6, QTableWidgetItem(self._action_display(r)))
             self.table_rules.setItem(row, 7, QTableWidgetItem(r['proxy']))
 
     def save_custom_proxy(self):
@@ -901,7 +1073,7 @@ class MainWindow(QMainWindow):
         pwd = self.ent_cp_pass.text()
         ptype_str = self.combo_cp_type.currentText()
         if not name or not ip or not port_str:
-            QMessageBox.warning(self, "警告", "名稱、IP 與 Port 為必填")
+            QMessageBox.warning(self, self.t("警告"), self.t("名稱、IP 與 Port 為必填"))
             return
         try: port = int(port_str)
         except: return
@@ -933,7 +1105,7 @@ class MainWindow(QMainWindow):
                     self.append_log(f"自訂代理已更新 (ID 不變，立即生效): {name}")
                     return
                 else:
-                    QMessageBox.warning(self, "失敗", "DLL 無法更新代理配置")
+                    QMessageBox.warning(self, self.t("失敗"), self.t("DLL 無法更新代理配置"))
                     return
 
             # 舊版 DLL 沒有 EditProxyConfig 的 fallback：刪除+重建（ID 會變，需重刷規則）
@@ -962,7 +1134,7 @@ class MainWindow(QMainWindow):
                 self.append_log(f"代理 ID 已變更 ({old_proxy_id} -> {pid})，重刷引用該代理的規則...")
                 self.reapply_all_rules(only_proxy_id=old_proxy_id)
         else:
-            QMessageBox.warning(self, "失敗", "DLL 無法添加代理配置")
+            QMessageBox.warning(self, self.t("失敗"), self.t("DLL 無法添加代理配置"))
 
     def test_all_proxies(self):
         self.append_log("開始測試所有自訂代理 (目標: api.ipify.org)...")
@@ -1013,10 +1185,6 @@ class MainWindow(QMainWindow):
         proxy_data = next((p for p in self.custom_proxies if p['id'] == pid), None)
         if not proxy_data: return
         self.editing_proxy_id = pid
-        self.group_proxy_form.setTitle(f"編輯代理 (ID: {pid})")
-        self.btn_proxy_save.setText("保存修改")
-        self.btn_proxy_save.setStyleSheet("background-color: #FF9800; color: white;")
-        self.btn_proxy_cancel.show()
         self.ent_cp_name.setText(proxy_data['name'])
         idx = self.combo_cp_type.findText(proxy_data['type'])
         if idx >= 0: self.combo_cp_type.setCurrentIndex(idx)
@@ -1024,18 +1192,16 @@ class MainWindow(QMainWindow):
         self.ent_cp_port.setText(str(proxy_data['port']))
         self.ent_cp_user.setText(proxy_data.get('user', ''))
         self.ent_cp_pass.setText(proxy_data.get('pass', ''))
+        self.update_form_titles()
 
     def cancel_proxy_edit(self):
         self.editing_proxy_id = None
-        self.group_proxy_form.setTitle("新增外部代理 (SOCKS5/HTTP)")
-        self.btn_proxy_save.setText("新增代理")
-        self.btn_proxy_save.setStyleSheet("background-color: #2196F3; color: white;")
-        self.btn_proxy_cancel.hide()
         self.ent_cp_name.clear()
         self.ent_cp_ip.clear()
         self.ent_cp_port.clear()
         self.ent_cp_user.clear()
         self.ent_cp_pass.clear()
+        self.update_form_titles()
 
     def refresh_custom_proxy_table(self):
         scroll = self.table_custom_proxies.verticalScrollBar().value()
@@ -1066,6 +1232,32 @@ class MainWindow(QMainWindow):
         self.table_custom_proxies.verticalScrollBar().setValue(scroll)
         self.table_custom_proxies.resizeColumnToContents(5)
 
+    def show_rule_menu(self, pos):
+        row = self.table_rules.rowAt(pos.y())
+        if row < 0: return
+        self.table_rules.selectRow(row)
+        menu = QMenu()
+        act_edit = QAction(self.t("編輯規則"), self)
+        act_edit.triggered.connect(lambda: self.on_rule_double_click(row, 0))
+        act_del = QAction(self.t("刪除規則"), self)
+        act_del.triggered.connect(self.del_rule)
+        menu.addAction(act_edit)
+        menu.addAction(act_del)
+        menu.exec(self.table_rules.viewport().mapToGlobal(pos))
+
+    def show_proxy_menu(self, pos):
+        row = self.table_custom_proxies.rowAt(pos.y())
+        if row < 0: return
+        self.table_custom_proxies.selectRow(row)
+        menu = QMenu()
+        act_edit = QAction(self.t("編輯代理"), self)
+        act_edit.triggered.connect(lambda: self.on_proxy_double_click(row, 0))
+        act_del = QAction(self.t("刪除代理"), self)
+        act_del.triggered.connect(self.del_custom_proxy)
+        menu.addAction(act_edit)
+        menu.addAction(act_del)
+        menu.exec(self.table_custom_proxies.viewport().mapToGlobal(pos))
+
     def show_traffic_menu(self, pos):
         item = self.tree_traffic.itemAt(pos)
         if not item: return
@@ -1073,9 +1265,9 @@ class MainWindow(QMainWindow):
         pid = self.tree_traffic.item(row, 2).text()
         proc = self.tree_traffic.item(row, 1).text()
         menu = QMenu()
-        act_pid = QAction(f"為 PID {pid} 新增規則", self)
+        act_pid = QAction(self.t("為 PID {pid} 新增規則").format(pid=pid), self)
         act_pid.triggered.connect(lambda: self.quick_add_rule(pid, True))
-        act_proc = QAction(f"為 {proc} 新增規則", self)
+        act_proc = QAction(self.t("為 {proc} 新增規則").format(proc=proc), self)
         act_proc.triggered.connect(lambda: self.quick_add_rule(proc, False))
         menu.addAction(act_pid)
         menu.addAction(act_proc)
@@ -1142,9 +1334,7 @@ class MainWindow(QMainWindow):
             # 但在此修正案中，我們假設 Proxy Config 在 Start 前載入是有效的 (通常 Proxy Config 不依賴驅動 Handle)
             # 如果 Proxy 也失效，這裡需要類似邏輯處理 Proxy，但通常只有 Rule 需要。
             
-            action_idx = 0
-            if "DIRECT" in r['action']: action_idx = 1
-            elif "BLOCK" in r['action']: action_idx = 2
+            action_idx = self._rule_action_idx(r)
             
             # 嘗試從 UI 文字找回 Proxy ID (因為 ID 可能在重啟程式後變更)
             # [修正] 若代理已被刪除/重新加入，這裡會解析到最新的 ID，讓新帳密立即生效
@@ -1186,10 +1376,7 @@ class MainWindow(QMainWindow):
             # === 嘗試啟動 ===
             if self.bridge.start():
                 self.is_redirector_running = True
-                self.btn_master_switch.setText("停止攔截服務 (Stop)")
-                self.btn_master_switch.setStyleSheet("background-color: #4CAF50; color: white;")
-                self.lbl_status.setText("狀態: 運行中")
-                self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+                self.update_service_status()
                 logging.info("NetRedirector Started")
                 
                 # [關鍵修正] 啟動成功後，立即重刷所有規則
@@ -1199,15 +1386,12 @@ class MainWindow(QMainWindow):
             else:
                 # 啟動失敗，將按鈕彈回
                 self.btn_master_switch.setChecked(False)
-                QMessageBox.critical(self, "錯誤", "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。")
+                QMessageBox.critical(self, self.t("錯誤"), self.t("無法啟動驅動，請確認管理員權限或驅動檔案是否存在。"))
         else:
             # === 停止服務 ===
             self.bridge.stop()
             self.is_redirector_running = False
-            self.btn_master_switch.setText("啟動攔截服務 (Start)")
-            self.btn_master_switch.setStyleSheet("background-color: #f44336; color: white;")
-            self.lbl_status.setText("狀態: 停止")
-            self.lbl_status.setStyleSheet("color: red;")
+            self.update_service_status()
             logging.info("NetRedirector Stopped")
 
     def on_network_update(self, interfaces):
@@ -1254,7 +1438,7 @@ if __name__ == '__main__':
     
     app = QApplication(sys.argv)
     if not is_admin:
-        QMessageBox.warning(None, "權限不足", "請以管理員身分執行！")
+        QMessageBox.warning(None, tr.t("權限不足"), tr.t("請以管理員身分執行！"))
         sys.exit(1)
 
     window = MainWindow()
