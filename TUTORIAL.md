@@ -34,6 +34,8 @@
 
 ## 3. 步驟 1：手機端啟動 5G Proxy Pro
 
+![Server 初始畫面](docs/images/server_initial.png)
+
 1. 開啟手機上的 **5G Proxy Pro** App。
 2. 點擊 **「🚀 一鍵開啟 5G 代理」**。
 3. 啟動成功後，畫面會顯示：
@@ -124,6 +126,7 @@ curl.exe --proxy socks5h://192.168.1.178:1080 https://api.ipify.org
 
 | 檔案路徑 | 對應功能分頁 | 畫面重點 |
 |---|---|---|
+| `docs/images/server_initial.png` | 步驟 1（手機端） | 5G Proxy Pro 實機初始畫面 |
 | `docs/images/1.png` | 1. Hub | 本地監聽埠列表、網卡綁定 (30678) |
 | `docs/images/2-1.png` | 2. Rules | 新增規則表單 (Process/Action/Proxy) |
 | `docs/images/2-2.png` | 2. Rules | 已啟用的攔截規則列表 |
