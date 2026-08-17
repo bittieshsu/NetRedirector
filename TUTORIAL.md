@@ -12,10 +12,6 @@
 | **Server 端** | 手機 | 5G Proxy Pro | 將 5G 網路轉為 SOCKS5 代理（監聽於 Wi-Fi 內網） |
 | **Client 端** | Windows 電腦 | NetRedirector | 攔截本機流量並轉發至手機代理 |
 
-> **⚠️ 重要提醒：**
-> 手機端顯示的 `192.168.1.178:35577` 是 **遠端 ADB 控制埠**，**不是代理埠**！
-> 請務必以 App 介面上標示的「**Wi-Fi 代理**」IP 與 Port（預設 **1080**）為準。
-
 ### 流量路徑 (Architecture)
 
 ```text
