@@ -8,6 +8,8 @@
 
 **NetRedirector** 是一個功能強大且專為進階玩家與開發者設計的Windows網路流量轉發與代理工具。它結合了高效能的本地端口路由（Hub）與系統級封包攔截（WinDivert 驅動層），支援 IPv4 / IPv6 雙棧、多網卡故障轉移、負載平衡及智慧局域網自動直連，並透過現代化的 PySide6 圖形介面提供極佳的操作體驗。
 
+> 📖 **完整圖文操作教學**：[NetRedirector 使用教學（結合手機 5G Proxy Pro）](TUTORIAL.md) — 含實機截圖、逐步設定流程與常見問題。
+
 ---
 
 ## 📸 介面預覽 (UI Gallery)
