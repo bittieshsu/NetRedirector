@@ -7,6 +7,7 @@ import sys
 import re
 import time  # 1. 導入時間模組
 import ast # 需在文件開頭匯入
+import shutil
 
 class SmartNuitkaPackager:
     def __init__(self, root):
@@ -172,6 +173,10 @@ class SmartNuitkaPackager:
                                    if os.path.isdir(os.path.join(project_root, d))
                                    and d.lower() in ['libs', 'assets', 'resources', 'img', 'images', 'locale']]
 
+            # 無論分析結果為何，語系檔目錄一律強制打包 (i18n 運行時必須存在)
+            if os.path.isdir(os.path.join(project_root, 'locale')) and 'locale' not in self.auto_data_dirs:
+                self.auto_data_dirs.append('locale')
+
             # 偵測專案執行時期支援檔案 (ctypes 載入的 DLL / 驅動)，打包時一併帶入
             # 注意: vcruntime140.dll 由 Nuitka 自動包含，不需 (也不能) 手動重複指定
             self.auto_runtime_files = [f for f in ['NetRedirector.dll', 'WinDivert.dll', 'WinDivert64.sys',
@@ -198,6 +203,37 @@ class SmartNuitkaPackager:
         self.log_area.insert(tk.END, msg + "\n")
         self.log_area.see(tk.END)
 
+    def cleanup_old_build(self, script):
+        """終結執行中的舊程式並刪除舊輸出目錄，避免檔案被鎖定導致打包失敗"""
+        script_dir = os.path.dirname(script)
+        base = os.path.splitext(os.path.basename(script))[0]
+        self.log("🧹 清理舊版執行程序與輸出目錄...")
+
+        # 1. 終結可能仍在執行的舊 exe (WinDivert 驅動被載入時 .sys 會被鎖定)
+        for exe_name in [f"{base}.exe", "NetRedirector.exe"]:
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", exe_name],
+                               capture_output=True, timeout=15)
+            except Exception:
+                pass
+        time.sleep(1.5)  # 等待驅動卸載
+
+        # 2. 刪除舊輸出目錄 (dist / build / onefile 暫存)
+        for folder_name in [f"{base}.dist", f"{base}.build", f"{base}.onefile-build",
+                            f"{base}.onefile-dist", f"{base}.dist.exe"]:
+            folder = os.path.join(script_dir, folder_name)
+            if not os.path.exists(folder):
+                continue
+            for attempt in range(5):
+                try:
+                    if os.path.isdir(folder):
+                        shutil.rmtree(folder)
+                    else:
+                        os.remove(folder)
+                    break
+                except (PermissionError, OSError):
+                    time.sleep(1.5)
+
     def start_build(self):
         script = self.py_path.get()
         if not script: return
@@ -210,6 +246,15 @@ class SmartNuitkaPackager:
 
         if mode == "simple":
             self.log("ℹ️ 模式：極簡編譯 (僅編譯主程式，依賴本地環境)")
+
+            # 極簡模式下也一併帶上資源目錄 (locale 等)，避免 exe 移動後找不到語系檔
+            script_dir = os.path.dirname(script)
+            for d in self.auto_data_dirs:
+                full_path = os.path.join(script_dir, d).replace('\\', '/')
+                cmd.append(f"--include-data-dir={full_path}={d}")
+            for f in self.auto_runtime_files:
+                src = os.path.join(script_dir, f).replace('\\', '/')
+                cmd.append(f"--include-data-files={src}={f}")
         else:
             cmd.append(f"--{mode}")
             for p in self.auto_plugins:
@@ -237,6 +282,7 @@ class SmartNuitkaPackager:
         
         self.btn_build.config(state="disabled", text="🚧 正在編譯...")
         self.log_area.delete(1.0, tk.END)
+        self.cleanup_old_build(script)
         threading.Thread(target=self.run_process, args=(cmd,)).start()
 
     def run_process(self, cmd):

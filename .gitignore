@@ -11,3 +11,6 @@ NetRedirector2-v1.2.0-win64.zip
 NetRedirector-v*-win64.zip
 # Packaged build leftovers
 IntegratedApp.dist.*/
+# Nuitka crash reports / misc junk
+nuitka-crash-report.xml
+query

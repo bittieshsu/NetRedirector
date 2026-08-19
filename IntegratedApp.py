@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.lbl_status)
 
         self.combo_lang = QComboBox()
-        self.combo_lang.setFixedWidth(110)
+        self.combo_lang.setFixedWidth(150)
         for code in SUPPORTED_LANGS:
             self.combo_lang.addItem(tr.lang_name(code), code)
         self.combo_lang.currentIndexChanged.connect(self.on_lang_changed)

@@ -1,4 +1,5 @@
 {
+  "lang": "en_US",
   "hubs": {
     "30678": [
       "VPN - VPN Client",
@@ -33,6 +34,7 @@
       "ports": "*",
       "proto": "BOTH",
       "action": "PROXY (轉發)",
+      "action_key": 0,
       "proxy_text": "[Custom] MyPhone"
     }
   ]
