@@ -365,11 +365,15 @@ DWORD WINAPI connection_handler(LPVOID arg)
         }
     } else {
         if (g_proxy_ip[0] != '\0' && g_proxy_port != 0) {
-            strncpy(selected_proxy_config.proxy_ip, g_proxy_ip, 63);
+            memset(&selected_proxy_config, 0, sizeof(selected_proxy_config));
+            strncpy(selected_proxy_config.proxy_ip, g_proxy_ip, sizeof(selected_proxy_config.proxy_ip)-1);
+            selected_proxy_config.proxy_ip[sizeof(selected_proxy_config.proxy_ip)-1] = '\0';
             selected_proxy_config.proxy_port = g_proxy_port;
             selected_proxy_config.proxy_type = g_proxy_type;
-            strncpy(selected_proxy_config.username, g_proxy_username, 255);
-            strncpy(selected_proxy_config.password, g_proxy_password, 255);
+            strncpy(selected_proxy_config.username, g_proxy_username, sizeof(selected_proxy_config.username)-1);
+            selected_proxy_config.username[sizeof(selected_proxy_config.username)-1] = '\0';
+            strncpy(selected_proxy_config.password, g_proxy_password, sizeof(selected_proxy_config.password)-1);
+            selected_proxy_config.password[sizeof(selected_proxy_config.password)-1] = '\0';
             has_proxy = TRUE;
         }
     }

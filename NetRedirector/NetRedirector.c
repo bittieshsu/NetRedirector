@@ -214,14 +214,17 @@ NETREDIRECTOR_API BOOL NetRedirector_SetProxyConfig(ProxyType type, const char* 
 
     EnterCriticalSection(&lock_proxies);
     strncpy(g_proxy_ip, proxy_ip, sizeof(g_proxy_ip)-1);
+    g_proxy_ip[sizeof(g_proxy_ip)-1] = '\0';   // always null-terminate
     g_proxy_port = proxy_port;
     g_proxy_type = type;
     
     if (username) strncpy(g_proxy_username, username, sizeof(g_proxy_username)-1);
     else g_proxy_username[0] = '\0';
+    g_proxy_username[sizeof(g_proxy_username)-1] = '\0';
     
     if (password) strncpy(g_proxy_password, password, sizeof(g_proxy_password)-1);
     else g_proxy_password[0] = '\0';
+    g_proxy_password[sizeof(g_proxy_password)-1] = '\0';
     LeaveCriticalSection(&lock_proxies);
 
     return TRUE;
@@ -235,19 +238,30 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddProxyConfig(ProxyType type, const char
     PROXY_CONFIG *config = (PROXY_CONFIG *)malloc(sizeof(PROXY_CONFIG));
     if (!config) return 0;
 
+    memset(config, 0, sizeof(PROXY_CONFIG));
     config->proxy_id = g_next_proxy_id++;
     config->proxy_type = type;
     config->proxy_port = proxy_port;
     config->enabled = enabled;
-    strncpy(config->proxy_ip, proxy_ip, 63);
+    strncpy(config->proxy_ip, proxy_ip, sizeof(config->proxy_ip)-1);
+    config->proxy_ip[sizeof(config->proxy_ip)-1] = '\0';
     
-    if (name && name[0]) strncpy(config->name, name, 255);
-    else snprintf(config->name, 255, "Proxy %u", config->proxy_id);
+    if (name && name[0]) {
+        strncpy(config->name, name, sizeof(config->name)-1);
+        config->name[sizeof(config->name)-1] = '\0';
+    }
+    else snprintf(config->name, sizeof(config->name), "Proxy %u", config->proxy_id);
 
-    if (username) strncpy(config->username, username, 255);
+    if (username) {
+        strncpy(config->username, username, sizeof(config->username)-1);
+        config->username[sizeof(config->username)-1] = '\0';
+    }
     else config->username[0] = 0;
 
-    if (password) strncpy(config->password, password, 255);
+    if (password) {
+        strncpy(config->password, password, sizeof(config->password)-1);
+        config->password[sizeof(config->password)-1] = '\0';
+    }
     else config->password[0] = 0;
 
     EnterCriticalSection(&lock_proxies);
@@ -269,10 +283,10 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
         config->proxy_type = type;
         config->proxy_port = proxy_port;
         config->enabled = enabled;
-        if (proxy_ip) strncpy(config->proxy_ip, proxy_ip, 63);
-        if (name) strncpy(config->name, name, 255);
-        if (username) strncpy(config->username, username, 255);
-        if (password) strncpy(config->password, password, 255);
+        if (proxy_ip) { strncpy(config->proxy_ip, proxy_ip, sizeof(config->proxy_ip)-1); config->proxy_ip[sizeof(config->proxy_ip)-1] = '\0'; }
+        if (name) { strncpy(config->name, name, sizeof(config->name)-1); config->name[sizeof(config->name)-1] = '\0'; }
+        if (username) { strncpy(config->username, username, sizeof(config->username)-1); config->username[sizeof(config->username)-1] = '\0'; }
+        if (password) { strncpy(config->password, password, sizeof(config->password)-1); config->password[sizeof(config->password)-1] = '\0'; }
         log_message("Updated proxy config ID: %u", proxy_id);
         LeaveCriticalSection(&lock_proxies);
         return TRUE;
