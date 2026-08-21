@@ -25,6 +25,7 @@ from i18n import i18n as tr, SUPPORTED_LANGS
 # 匯入現有的模組
 import network_utils
 import proxy_core
+import secure_config  # [新增] 密碼 DPAPI 加密儲存
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 # ... (check_proxy_connection 函式保持不變，省略以節省篇幅) ...
@@ -320,7 +321,7 @@ class MainWindow(QMainWindow):
             "rules": []
         }
 
-        # 序列化 Proxy (移除動態數據如 latency, ID)
+        # 序列化 Proxy (移除動態數據如 latency, ID；密碼以 DPAPI 加密存放)
         for p in self.custom_proxies:
             config_data["proxies"].append({
                 "name": p['name'],
@@ -328,7 +329,7 @@ class MainWindow(QMainWindow):
                 "ip": p['ip'],
                 "port": p['port'],
                 "user": p['user'],
-                "pass": p['pass']
+                "pass": secure_config.encrypt_password(p['pass'])
             })
 
         # 序列化 Rules (需要保存 Proxy 的辨識字串，而非動態 ID)
@@ -370,7 +371,8 @@ class MainWindow(QMainWindow):
             saved_proxies = data.get("proxies", [])
             for p in saved_proxies:
                 ptype = ProxyType.SOCKS5 if p['type'] == "SOCKS5" else ProxyType.HTTP
-                pid = self.bridge.add_proxy(p['ip'], int(p['port']), p['user'], p['pass'], ptype, p['name'])
+                plain_pass = secure_config.decrypt_password(p.get('pass', ''))  # [新增] 解密儲存的密碼
+                pid = self.bridge.add_proxy(p['ip'], int(p['port']), p['user'], plain_pass, ptype, p['name'])
                 if pid > 0:
                     self.custom_proxies.append({
                         'id': pid, # 取得新的 ID
@@ -379,7 +381,7 @@ class MainWindow(QMainWindow):
                         'ip': p['ip'],
                         'port': p['port'],
                         'user': p['user'],
-                        'pass': p['pass'],
+                        'pass': plain_pass,
                         'latency': '-'
                     })
             self.refresh_custom_proxy_table()
