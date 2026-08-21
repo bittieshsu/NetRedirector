@@ -1007,28 +1007,53 @@ class MainWindow(QMainWindow):
         proxy_text = self.combo_proxy.currentText()
         was_edit = self.editing_rule_id is not None
 
-        if self.editing_rule_id is not None:
-            if hasattr(self.bridge.lib, 'NetRedirector_DeleteRule'):
-                 self.bridge.lib.NetRedirector_DeleteRule(self.editing_rule_id)
-            self.rules = [r for r in self.rules if r['id'] != self.editing_rule_id]
-            logging.info(f"正在更新規則 ID {self.editing_rule_id} -> 先行刪除")
-
+        # [改進] 編輯規則時優先「原地更新」(EditRuleWithProxy 保留相同 ID)，
+        # 避免規則 ID 跳動；僅「PID 規則」或「名稱/PID 類型切換」才需刪除重建
+        # (C 核心的 EditRuleWithProxy 不處理 target_pid 欄位)
         rid = 0
-        if is_pid:
-            if not target.isdigit():
-                QMessageBox.warning(self, self.t("錯誤"), self.t("PID 需為數字"))
-                return
-            rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, pid_proxy)
-        else:
-            if hasattr(self.bridge.lib, 'NetRedirector_AddRuleWithProxy'):
-                 rid = self.bridge.lib.NetRedirector_AddRuleWithProxy(
-                    target.encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'), protocol, action_idx, pid_proxy
+        if was_edit:
+            old_rule = next((r for r in self.rules if r['id'] == self.editing_rule_id), None)
+            old_is_pid = bool(old_rule and old_rule.get('type') == 'PID')
+            edit_fn = getattr(self.bridge.lib, 'NetRedirector_EditRuleWithProxy', None)
+
+            if edit_fn is not None and not is_pid and not old_is_pid:
+                ok = edit_fn(
+                    self.editing_rule_id,
+                    target.encode('utf-8'),
+                    hosts.encode('utf-8'),
+                    ports.encode('utf-8'),
+                    protocol,
+                    action_idx,
+                    pid_proxy,
                 )
+                if ok:
+                    rid = self.editing_rule_id  # ID 不變，原地生效
+                else:
+                    # 原地更新失敗 → 回退為刪除+重建
+                    self.bridge.lib.NetRedirector_DeleteRule(self.editing_rule_id)
+                    self.rules = [r for r in self.rules if r['id'] != self.editing_rule_id]
             else:
-                rid = self.bridge.add_rule(target, hosts, ports, protocol, action_idx)
+                if hasattr(self.bridge.lib, 'NetRedirector_DeleteRule'):
+                    self.bridge.lib.NetRedirector_DeleteRule(self.editing_rule_id)
+                self.rules = [r for r in self.rules if r['id'] != self.editing_rule_id]
+                logging.info(f"正在更新規則 ID {self.editing_rule_id} -> 先行刪除")
+
+        if rid == 0:
+            if is_pid:
+                if not target.isdigit():
+                    QMessageBox.warning(self, self.t("錯誤"), self.t("PID 需為數字"))
+                    return
+                rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, pid_proxy)
+            else:
+                if hasattr(self.bridge.lib, 'NetRedirector_AddRuleWithProxy'):
+                     rid = self.bridge.lib.NetRedirector_AddRuleWithProxy(
+                        target.encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'), protocol, action_idx, pid_proxy
+                    )
+                else:
+                    rid = self.bridge.add_rule(target, hosts, ports, protocol, action_idx)
         
         if rid > 0:
-            self.rules.append({
+            new_rule = {
                 'id': rid,
                 'type': 'PID' if is_pid else 'Name',
                 'target': target,
@@ -1038,7 +1063,12 @@ class MainWindow(QMainWindow):
                 'action': action_text,
                 'action_key': action_idx,
                 'proxy': proxy_text
-            })
+            }
+            if was_edit and rid == self.editing_rule_id:
+                # 原地更新：取代對應項目，保持 ID 不變
+                self.rules = [new_rule if r['id'] == rid else r for r in self.rules]
+            else:
+                self.rules.append(new_rule)
             self.refresh_rules_table()
             self.cancel_rule_edit()
             self.append_log(f"規則已{'更新' if was_edit else '新增'} (ID: {rid})")
