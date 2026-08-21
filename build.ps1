@@ -99,7 +99,9 @@ if (-not $NoDll) {
     $batPath = Join-Path $env:TEMP "build_dll_$PID.bat"
     $batContent = "@echo off`r`n"
     if ($vcvars) {
-        $batContent += "`"$vcvars`" >nul 2>&1`r`n"
+        # [Fixed] 必須使用 CALL: 在 bat 內執行另一個 bat 若不加 CALL, 控制權不會返回,
+        # cl 永遠不會執行, 導致 DLL 一直複製舊檔 (功能修復不會進到 DLL)
+        $batContent += "CALL `"$vcvars`" >nul 2>&1`r`n"
     }
     $batContent += "cl /nologo /LD /DNETREDIRECTOR_EXPORTS $($dllSrc -join ' ') /Fe:NetRedirector.dll /I. $dllLibs"
     [System.IO.File]::WriteAllText($batPath, $batContent)

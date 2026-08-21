@@ -9,8 +9,9 @@ UDP_ASSOCIATION *udp_associations = NULL;
 PROXY_CONFIG *proxy_configs = NULL;
 
 // Define ID Counters
-UINT32 g_next_rule_id = 1;
-UINT32 g_next_proxy_id = 1;
+// [Fixed] 從 0 起算: 分配用 InterlockedIncrement (先加再回傳), 第一個 ID 仍為 1
+UINT32 g_next_rule_id = 0;
+UINT32 g_next_proxy_id = 0;
 
 // === Connection Tracking ===
 // (protected by lock_connections)

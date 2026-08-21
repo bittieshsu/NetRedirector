@@ -11,6 +11,12 @@ __pycache__/
 /NetRedirector/NetRedirector.dll
 /NetRedirector.dll
 
+# C 測試產物 (NetRedirector/tests/run_tests.ps1 產出)
+/NetRedirector/tests/*.exe
+/NetRedirector/tests/*.obj
+/NetRedirector/tests/*.lib
+/NetRedirector/tests/*.exp
+
 # Nuitka build output
 /IntegratedApp.build/
 /IntegratedApp.dist/

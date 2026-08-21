@@ -62,8 +62,11 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name
     
     PROCESS_RULE *rule = (PROCESS_RULE *)malloc(sizeof(PROCESS_RULE));
     if (!rule) return 0;
+    // [Fixed] 清空結構: 名稱規則的 target_pid 必須為 0, 否則 match_rule 會把它當成
+    // PID 規則而跳過名稱比對 -> 規則永不匹配, 流量全部走 DIRECT (重大 bug)
+    memset(rule, 0, sizeof(PROCESS_RULE));
 
-    rule->rule_id = g_next_rule_id++;
+    rule->rule_id = (UINT32)InterlockedIncrement((volatile LONG*)&g_next_rule_id);  // [Fixed] 原子遞增, 避免多執行緒拿到相同 ID
     strncpy(rule->process_name, process_name, MAX_PROCESS_NAME - 1);
     rule->process_name[MAX_PROCESS_NAME - 1] = '\0';
     rule->protocol = protocol;
@@ -91,8 +94,9 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleByPID(DWORD pid, const char* targe
 {
     PROCESS_RULE *rule = (PROCESS_RULE *)malloc(sizeof(PROCESS_RULE));
     if (!rule) return 0;
+    memset(rule, 0, sizeof(PROCESS_RULE));  // [Fixed] 清空結構, 避免未初始化欄位
 
-    rule->rule_id = g_next_rule_id++;
+    rule->rule_id = (UINT32)InterlockedIncrement((volatile LONG*)&g_next_rule_id);  // [Fixed] 原子遞增, 避免多執行緒拿到相同 ID
     rule->target_pid = pid;      // Set PID
     rule->process_name[0] = '\0'; // Name empty for PID-based rules
     rule->protocol = protocol;
@@ -239,7 +243,7 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddProxyConfig(ProxyType type, const char
     if (!config) return 0;
 
     memset(config, 0, sizeof(PROXY_CONFIG));
-    config->proxy_id = g_next_proxy_id++;
+    config->proxy_id = (UINT32)InterlockedIncrement((volatile LONG*)&g_next_proxy_id);  // [Fixed] 原子遞增
     config->proxy_type = type;
     config->proxy_port = proxy_port;
     config->enabled = enabled;
