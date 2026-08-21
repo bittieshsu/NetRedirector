@@ -39,11 +39,12 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
             continue;
         }
 
-        BOOL is_wildcard_process = (strcmp(rule->process_name, "*") == 0 || strcmp(rule->process_name, "ANY") == 0);
+        // [Fixed] 支援全形 "＊" 作為萬用字元 (is_wildcard_str 亦認得 "ANY")
+        BOOL is_wildcard_process = is_wildcard_str(rule->process_name);
 
         if (is_wildcard_process) {
-            BOOL has_ip_filter = (strcmp(rule->target_hosts, "*") != 0);
-            BOOL has_port_filter = (strcmp(rule->target_ports, "*") != 0);
+            BOOL has_ip_filter = !is_wildcard_str(rule->target_hosts);
+            BOOL has_port_filter = !is_wildcard_str(rule->target_ports);
 
             if (has_ip_filter || has_port_filter) {
                 BOOL ip_ok = (family == AF_INET6) ? match_ip_list6(rule->target_hosts, dest_addr)

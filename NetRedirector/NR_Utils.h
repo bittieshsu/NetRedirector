@@ -28,6 +28,10 @@ void refresh_local_addresses(void);
 BOOL is_lan_or_on_link_address(int family, const UINT8 *addr);
 
 // Matching Logic
+// [Fixed] 萬用字元辨識: 半形 "*"、字面 "ANY"，以及全形 "＊" (U+FF0A, UTF-8 EF BC 8A)
+// 全形星號常見於中文輸入法；若不處理，規則永不匹配、流量會走直連
+#define is_wildcard_str(s) ((s) != NULL && (strcmp((s), "*") == 0 || strcmp((s), "ANY") == 0 || strcmp((s), "\xEF\xBC\x8A") == 0))
+
 BOOL match_ip_pattern(const char *pattern, UINT32 ip);
 BOOL match_port_pattern(const char *pattern, UINT16 port);
 BOOL match_ip_list(const char *ip_list, UINT32 ip);

@@ -462,9 +462,10 @@ class MainWindow(QMainWindow):
 
                 # 呼叫 DLL
                 rid = 0
-                target = r['target']
-                hosts = r.get('hosts', '*')
-                ports = r.get('ports', '*')
+                # [Fixed] 正規化設定檔中可能存在的全形星號 (U+FF0A)
+                target = r['target'].replace('\uFF0A', '*')
+                hosts = r.get('hosts', '*').replace('\uFF0A', '*')
+                ports = r.get('ports', '*').replace('\uFF0A', '*')
                 
                 if r['type'] == 'PID':
                     if target.isdigit():
@@ -1028,10 +1029,11 @@ class MainWindow(QMainWindow):
         self.update_form_titles()
 
     def save_rule_action(self):
-        target = self.ent_target.text().strip()
+        # [Fixed] 正規化全形星號 (U+FF0A) 為半形，避免中文輸入法產生的規則永不匹配
+        target = self.ent_target.text().strip().replace('\uFF0A', '*')
         if not target: return
-        hosts = self.ent_hosts.text().strip() or "*"
-        ports = self.ent_ports.text().strip() or "*"
+        hosts = self.ent_hosts.text().strip().replace('\uFF0A', '*') or "*"
+        ports = self.ent_ports.text().strip().replace('\uFF0A', '*') or "*"
         proto_str = self.combo_proto.currentText()
         protocol = RuleProtocol.BOTH
         if proto_str == "TCP": protocol = RuleProtocol.TCP

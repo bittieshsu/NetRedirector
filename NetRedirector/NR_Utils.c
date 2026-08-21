@@ -443,7 +443,7 @@ BOOL is_lan_or_on_link_address(int family, const UINT8 *addr)
 
 BOOL match_ip_pattern6(const char *pattern, const UINT8 *ip)
 {
-    if (pattern == NULL || strcmp(pattern, "*") == 0) return TRUE;
+    if (is_wildcard_str(pattern)) return TRUE;
     char addr_str[MAX_IP_STR];
     addr_to_string(AF_INET6, ip, addr_str, sizeof(addr_str));
     return _stricmp(pattern, addr_str) == 0;
@@ -451,7 +451,7 @@ BOOL match_ip_pattern6(const char *pattern, const UINT8 *ip)
 
 BOOL match_ip_list6(const char *ip_list, const UINT8 *ip)
 {
-    if (!ip_list || !ip_list[0] || !strcmp(ip_list, "*")) return TRUE;
+    if (!ip_list || !ip_list[0] || is_wildcard_str(ip_list)) return TRUE;
     size_t len = strlen(ip_list)+1; char *copy = malloc(len); if(!copy) return FALSE;
     strncpy(copy, ip_list, len); BOOL matched = FALSE;
     char *token = strtok(copy, ";");
@@ -519,7 +519,7 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
 
 // [Preserved] IP/Port Pattern matching logic
 BOOL match_ip_pattern(const char *pattern, UINT32 ip) {
-    if (pattern == NULL || strcmp(pattern, "*") == 0) return TRUE;
+    if (is_wildcard_str(pattern)) return TRUE;
     unsigned char ip_octets[4];
     ip_octets[0] = (ip >> 0) & 0xFF; ip_octets[1] = (ip >> 8) & 0xFF;
     ip_octets[2] = (ip >> 16) & 0xFF; ip_octets[3] = (ip >> 24) & 0xFF;
@@ -540,7 +540,7 @@ BOOL match_ip_pattern(const char *pattern, UINT32 ip) {
 }
 
 BOOL match_port_pattern(const char *pattern, UINT16 port) {
-    if (pattern == NULL || strcmp(pattern, "*") == 0) return TRUE;
+    if (is_wildcard_str(pattern)) return TRUE;
     char *dash = strchr(pattern, '-');
     if (dash != NULL) {
         int start = atoi(pattern); int end = atoi(dash + 1);
@@ -550,7 +550,7 @@ BOOL match_port_pattern(const char *pattern, UINT16 port) {
 }
 
 BOOL match_ip_list(const char *ip_list, UINT32 ip) {
-    if (!ip_list || !ip_list[0] || !strcmp(ip_list, "*")) return TRUE;
+    if (!ip_list || !ip_list[0] || is_wildcard_str(ip_list)) return TRUE;
     size_t len = strlen(ip_list)+1; char *copy = malloc(len); if(!copy) return FALSE;
     strncpy(copy, ip_list, len); BOOL matched = FALSE;
     char *token = strtok(copy, ";");
@@ -563,7 +563,7 @@ BOOL match_ip_list(const char *ip_list, UINT32 ip) {
 }
 
 BOOL match_port_list(const char *port_list, UINT16 port) {
-    if (!port_list || !port_list[0] || !strcmp(port_list, "*")) return TRUE;
+    if (!port_list || !port_list[0] || is_wildcard_str(port_list)) return TRUE;
     size_t len = strlen(port_list)+1; char *copy = malloc(len); if(!copy) return FALSE;
     strncpy(copy, port_list, len); BOOL matched = FALSE;
     char *token = strtok(copy, ",;");
@@ -578,7 +578,7 @@ BOOL match_port_list(const char *port_list, UINT16 port) {
 // [Modified] Use  improved matching logic (Wildcard & Full Path Fixes)
 BOOL match_process_pattern(const char *pattern, const char *process_full_path)
 {
-    if (pattern == NULL || strcmp(pattern, "*") == 0) return TRUE;
+    if (is_wildcard_str(pattern)) return TRUE;
 
     // Windows path processing: Extract filename
     const char *filename = strrchr(process_full_path, '\\');
@@ -628,7 +628,7 @@ BOOL match_process_pattern(const char *pattern, const char *process_full_path)
 // [Modified] Use List matching logic (more robust handling of quotes and whitespace)
 BOOL match_process_list(const char *process_list, const char *process_name)
 {
-    if (process_list == NULL || process_list[0] == '\0' || strcmp(process_list, "*") == 0) return TRUE;
+    if (process_list == NULL || process_list[0] == '\0' || is_wildcard_str(process_list)) return TRUE;
     size_t len = strlen(process_list) + 1;
     char *list_copy = (char *)malloc(len);
     if (!list_copy) return FALSE;

@@ -1,21 +1,7 @@
 {
-  "lang": "en_US",
-  "hubs": {
-    "30678": [
-      "VPN - VPN Client",
-      "VPN10 - VPN Client",
-      "VPN11 - VPN Client",
-      "VPN2 - VPN Client",
-      "VPN5 - VPN Client",
-      "VPN6 - VPN Client",
-      "VPN7 - VPN Client",
-      "VPN8 - VPN Client",
-      "VPN9 - VPN Client",
-      "VPN3 - VPN Client",
-      "VPN4 - VPN Client",
-      "乙太網路"
-    ]
-  },
+  "lang": "zh_TW",
+  "ping_target": "8.8.8.8",
+  "hubs": {},
   "proxies": [
     {
       "name": "MyPhone",
