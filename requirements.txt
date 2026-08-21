@@ -1,3 +1,5 @@
 PySide6
 nuitka
 pytest
+flake8
+pyflakes

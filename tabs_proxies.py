@@ -22,6 +22,7 @@ import network_utils
 import proxy_core
 import secure_config
 import rule_utils
+from app_helpers import check_proxy_connection  # [Fixed] test_all_proxies 需要
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 

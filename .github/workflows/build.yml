@@ -42,6 +42,12 @@ jobs:
         run: |
           python -m pytest tests/ -q
 
+      # 靜態檢查: 未定義名稱 (防止 mixin 漏 import 的 NameError)
+      - name: Static check (undefined names)
+        shell: pwsh
+        run: |
+          python -m flake8 --select=F821 IntegratedApp.py app_helpers.py config_store.py rule_utils.py tabs_hub.py tabs_rules.py tabs_proxies.py tabs_monitor.py
+
       # C 核心單元測試 (連結原始碼的測試 EXE)
       - name: C core tests
         shell: pwsh
