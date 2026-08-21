@@ -201,11 +201,13 @@ class MainWindow(QMainWindow):
         self.bridge.set_log_callback(self.redir_signals.log_received.emit)
         self.bridge.set_connection_callback(self.redir_signals.traffic_received.emit)
 
+        # [新增] 可配置的 Ping 目標 (需在 setup_ui 之前初始化，UI 會引用)
+        self.ping_target = network_utils.PING_TARGET
+
         # UI 初始化
         self.setup_ui()
         
         # 啟動網路監控
-        self.ping_target = network_utils.PING_TARGET  # [新增] 可配置的 Ping 目標
         self.monitor_thread = NetworkMonitorWorker(self.ping_target)
         self.monitor_thread.data_updated.connect(self.on_network_update)
         self.monitor_thread.start()
