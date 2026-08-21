@@ -3,7 +3,6 @@ import time
 import logging
 import ctypes
 import os
-import json  # [新增] 用於儲存設定
 from datetime import datetime
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QGridLayout,
@@ -21,6 +20,7 @@ import network_utils
 import proxy_core
 import secure_config  # [新增] 密碼 DPAPI 加密儲存
 import rule_utils  # [模組化] 規則欄位處理 (全形星號正規化等)
+import config_store  # [模組化] 設定序列化與檔案 I/O
 from app_helpers import (  # [模組化] GUI 輔助元件 (自本檔抽出)
     check_proxy_connection, SignalLogHandler, NetworkMonitorWorker, RedirectorSignals,
 )
@@ -195,56 +195,23 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.btn_proxy_save.setStyleSheet("background-color: #2196F3; color: white;")
             self.btn_proxy_cancel.hide()
 
-    # [新增] 儲存設定功能
+    # [模組化] 儲存設定 (序列化/檔案 I/O 移至 config_store)
     def save_config(self):
-        config_data = {
-            "lang": tr.lang,
-            "ping_target": self.ping_target,  # [新增] 儲存 Ping 目標
-            "hubs": self.port_config,
-            "proxies": [],
-            "rules": []
-        }
-
-        # 序列化 Proxy (移除動態數據如 latency, ID；密碼以 DPAPI 加密存放)
-        for p in self.custom_proxies:
-            config_data["proxies"].append({
-                "name": p['name'],
-                "type": p['type'],
-                "ip": p['ip'],
-                "port": p['port'],
-                "user": p['user'],
-                "pass": secure_config.encrypt_password(p['pass'])
-            })
-
-        # 序列化 Rules (需要保存 Proxy 的辨識字串，而非動態 ID)
-        for r in self.rules:
-            config_data["rules"].append({
-                "type": r['type'],
-                "target": r['target'],
-                "hosts": r.get('hosts', '*'),
-                "ports": r.get('ports', '*'),
-                "proto": r.get('proto', 'BOTH'),
-                "action": r['action'],
-                "action_key": r.get('action_key'),
-                "proxy_text": r['proxy'] # 這裡保存 UI 上顯示的 Proxy 文字 (例如 "[Custom] MyVPN")
-            })
-
-        try:
-            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(config_data, f, indent=2, ensure_ascii=False)
+        data = config_store.build_config_data(
+            tr.lang, self.ping_target, self.port_config, self.custom_proxies, self.rules)
+        err = config_store.save_config_file(self.CONFIG_FILE, data)
+        if err is None:
             self.append_log("設定已儲存至 config.json")
-        except Exception as e:
-            self.append_log(f"儲存設定失敗: {e}")
+        else:
+            self.append_log(f"儲存設定失敗: {err}")
 
-    # [新增] 讀取設定功能
+    # [模組化] 讀取設定 (檔案 I/O 移至 config_store)
     def load_config(self):
-        if not os.path.exists(self.CONFIG_FILE):
+        data = config_store.load_config_file(self.CONFIG_FILE)
+        if data is None:
             return
 
         try:
-            with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
             saved_lang = data.get("lang")
             if saved_lang:
                 tr.load(saved_lang)
@@ -284,14 +251,14 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 port = int(port_str)
                 self.port_config[port] = interfaces
                 self.list_hub_ports.addItem(f"{port}")
-                
+
                 # 自動啟動 Hub
                 proxy_core.route_manager.update_port_binding(port, interfaces)
                 success = proxy_core.server_controller.start_port(port)
                 self.update_hub_list_item(port, success)
                 if success:
                     self.sync_hub_proxy(port)
-            
+
             # 確保 SpinBox 不會跟現有重複
             if saved_hubs:
                 max_port = max([int(p) for p in saved_hubs.keys()])
@@ -306,12 +273,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 # 嘗試根據 proxy_text 找回對應的 新ID
                 proxy_text = r['proxy_text']
                 proxy_id = 0 # 預設 Direct/Unspecified
-                
+
                 # 在 combo box 尋找對應的 ID
                 idx = self.combo_proxy.findText(proxy_text)
                 if idx >= 0:
                     proxy_id = self.combo_proxy.itemData(idx)
-                
+
                 # 協議轉換
                 protocol = RuleProtocol.BOTH
                 if r['proto'] == "TCP": protocol = RuleProtocol.TCP
@@ -331,7 +298,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 target = rule_utils.normalize_rule_target(r['target'])
                 hosts = rule_utils.normalize_rule_pattern(r.get('hosts'))
                 ports = rule_utils.normalize_rule_pattern(r.get('ports'))
-                
+
                 if r['type'] == 'PID':
                     if target.isdigit():
                         rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, int(proxy_id))
