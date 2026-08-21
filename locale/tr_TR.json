@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "{proc} için kural ekle",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Sürücü başlatılamadı. Yönetici haklarını veya sürücü dosyasını kontrol edin.",
     "權限不足": "Yetersiz ayrıcalık",
-    "請以管理員身分執行！": "Lütfen yönetici olarak çalıştırın!"
+    "請以管理員身分執行！": "Lütfen yönetici olarak çalıştırın!",
+    "Ping 目標:": "Ping Hedefi:"
 }

@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "Thêm quy tắc cho {proc}",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Không thể khởi động trình điều khiển. Hãy kiểm tra quyền quản trị viên hoặc tệp trình điều khiển.",
     "權限不足": "Không đủ quyền",
-    "請以管理員身分執行！": "Vui lòng chạy với quyền quản trị viên!"
+    "請以管理員身分執行！": "Vui lòng chạy với quyền quản trị viên!",
+    "Ping 目標:": "Mục tiêu Ping:"
 }

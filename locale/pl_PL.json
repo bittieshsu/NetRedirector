@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "Dodaj regułę dla {proc}",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Nie można uruchomić sterownika. Sprawdź uprawnienia administratora lub plik sterownika.",
     "權限不足": "Niewystarczające uprawnienia",
-    "請以管理員身分執行！": "Uruchom jako administrator!"
+    "請以管理員身分執行！": "Uruchom jako administrator!",
+    "Ping 目標:": "Cel Ping:"
 }

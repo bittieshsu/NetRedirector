@@ -9,6 +9,9 @@ from ctypes import Structure, POINTER, c_void_p, c_char_p, c_wchar_p, c_ulong, c
 # Windows API 定義 (IP Helper API & Winsock)
 # ==========================================
 
+# 預設 Ping 目標（可透過 config.json 的 "ping_target" 覆寫）
+PING_TARGET = "8.8.8.8"
+
 try:
     iphlpapi = ctypes.windll.iphlpapi
     ws2_32 = ctypes.windll.ws2_32
@@ -192,7 +195,7 @@ def check_is_vpn(name):
     ]
     return any(p in name_lower for p in vpn_patterns)
 
-def ping_address(source_ip, target="8.8.8.8", timeout_ms=500):
+def ping_address(source_ip, target=PING_TARGET, timeout_ms=500):
     if not iphlpapi or not ws2_32:
         return tcp_ping(target, 80, timeout_ms)
 

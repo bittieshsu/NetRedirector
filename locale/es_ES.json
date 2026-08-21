@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "Agregar regla para {proc}",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "No se pudo iniciar el controlador. Verifique los permisos de administrador o el archivo del controlador.",
     "權限不足": "Privilegios insuficientes",
-    "請以管理員身分執行！": "¡Ejecute como administrador!"
+    "請以管理員身分執行！": "¡Ejecute como administrador!",
+    "Ping 目標:": "Destino Ping:"
 }

@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "Add rule for {proc}",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Failed to start driver. Check admin privileges or driver file.",
     "權限不足": "Insufficient Privileges",
-    "請以管理員身分執行！": "Please run as Administrator!"
+    "請以管理員身分執行！": "Please run as Administrator!",
+    "Ping 目標:": "Ping Target:"
 }

@@ -134,16 +134,20 @@ class SignalLogHandler(logging.Handler, QObject):
 class NetworkMonitorWorker(QThread):
     data_updated = Signal(dict) 
 
-    def __init__(self):
+    def __init__(self, ping_target=network_utils.PING_TARGET):
         super().__init__()
         self.running = True
+        self.ping_target = ping_target
+
+    def set_ping_target(self, target):
+        self.ping_target = target
 
     def run(self):
         while self.running:
             interfaces = network_utils.get_system_interfaces()
             for name, details in interfaces.items():
                 if details['connected']:
-                    details['latency'] = network_utils.ping_address(details['ipv4'], "8.8.8.8")
+                    details['latency'] = network_utils.ping_address(details['ipv4'], self.ping_target)
                 else:
                     details['latency'] = 9999
             
@@ -201,7 +205,8 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         
         # 啟動網路監控
-        self.monitor_thread = NetworkMonitorWorker()
+        self.ping_target = network_utils.PING_TARGET  # [新增] 可配置的 Ping 目標
+        self.monitor_thread = NetworkMonitorWorker(self.ping_target)
         self.monitor_thread.data_updated.connect(self.on_network_update)
         self.monitor_thread.start()
         
@@ -274,6 +279,17 @@ class MainWindow(QMainWindow):
             self.retranslate_ui()
             self.append_log(f"語言已切換: {tr.lang_name(code)}")
 
+    # [新增] Ping 目標變更 (即時套用至監控執行緒，並於下次存檔時寫入 config.json)
+    def on_ping_target_changed(self):
+        target = self.ent_ping_target.text().strip()
+        if not target:
+            target = network_utils.PING_TARGET
+            self.ent_ping_target.setText(target)
+        if target != self.ping_target:
+            self.ping_target = target
+            self.monitor_thread.set_ping_target(target)
+            self.append_log(f"Ping 目標已更新: {target}")
+
     def update_service_status(self):
         running = self.is_redirector_running
         self.btn_master_switch.setText(
@@ -316,6 +332,7 @@ class MainWindow(QMainWindow):
     def save_config(self):
         config_data = {
             "lang": tr.lang,
+            "ping_target": self.ping_target,  # [新增] 儲存 Ping 目標
             "hubs": self.port_config,
             "proxies": [],
             "rules": []
@@ -364,6 +381,14 @@ class MainWindow(QMainWindow):
             saved_lang = data.get("lang")
             if saved_lang:
                 tr.load(saved_lang)
+
+            # [新增] 還原 Ping 目標 (若設定檔未提供則使用預設)
+            saved_ping = data.get("ping_target", "")
+            if saved_ping:
+                self.ping_target = saved_ping
+                self.monitor_thread.set_ping_target(saved_ping)
+                if hasattr(self, 'ent_ping_target'):
+                    self.ent_ping_target.setText(saved_ping)
 
             self.append_log("正在還原設定...")
 
@@ -493,7 +518,18 @@ class MainWindow(QMainWindow):
         for code in SUPPORTED_LANGS:
             self.combo_lang.addItem(tr.lang_name(code), code)
         self.combo_lang.currentIndexChanged.connect(self.on_lang_changed)
+
+        # [新增] Ping 目標設定 (預設 8.8.8.8，可依地區改為其他目標)
+        lbl_ping = QLabel("")
+        self._reg("text", lbl_ping, "Ping 目標:")
+        self.ent_ping_target = QLineEdit(self.ping_target)
+        self.ent_ping_target.setFixedWidth(120)
+        self.ent_ping_target.setToolTip("網路介面延遲偵測的 Ping 目標 (IP 或域名)")
+        self.ent_ping_target.editingFinished.connect(self.on_ping_target_changed)
+
         top_bar.addStretch()
+        top_bar.addWidget(lbl_ping)
+        top_bar.addWidget(self.ent_ping_target)
         top_bar.addWidget(self.combo_lang)
         main_layout.addLayout(top_bar)
 

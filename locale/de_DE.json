@@ -83,5 +83,6 @@
     "為 {proc} 新增規則": "Regel für {proc} hinzufügen",
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Treiber konnte nicht gestartet werden. Überprüfen Sie die Administratorrechte oder die Treiberdatei.",
     "權限不足": "Unzureichende Berechtigungen",
-    "請以管理員身分執行！": "Bitte als Administrator ausführen!"
+    "請以管理員身分執行！": "Bitte als Administrator ausführen!",
+    "Ping 目標:": "Ping-Ziel:"
 }

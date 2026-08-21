@@ -35,7 +35,7 @@ class NetworkMonitorWorker(QThread):
             # 對每個介面 Ping (簡化版：只Ping已連線的)
             for name, details in interfaces.items():
                 if details['connected']:
-                    details['latency'] = network_utils.ping_address(details['ipv4'], "8.8.8.8")
+                    details['latency'] = network_utils.ping_address(details['ipv4'], network_utils.PING_TARGET)
                 else:
                     details['latency'] = 9999
             
