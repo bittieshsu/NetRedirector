@@ -1,4 +1,4 @@
-﻿// --- START OF FILE NR_Core.c ---
+// --- START OF FILE NR_Core.c ---
 #include "NR_Core.h"
 
 // Define Handles
@@ -195,7 +195,7 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
     while (running) {
         Sleep(10000);
         DWORD current_time = GetTickCount();
-        EnterCriticalSection(&lock_cs);
+        EnterCriticalSection(&lock_connections);
         CONNECTION_INFO **conn_ptr = &connection_list;
         while (*conn_ptr != NULL) {
             CONNECTION_INFO *curr = *conn_ptr;
@@ -211,7 +211,7 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
                 conn_ptr = &(*conn_ptr)->next;
             }
         }
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_connections);
     }
     return 0;
 }
@@ -356,14 +356,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
     struct sockaddr_in proxy_addr;
     BOOL has_proxy = FALSE;
 
+    EnterCriticalSection(&lock_proxies);
     if (proxy_id != 0) {
-        EnterCriticalSection(&lock_cs);
         PROXY_CONFIG *ptr = get_proxy_by_id(proxy_id);
         if (ptr && ptr->enabled) {
             selected_proxy_config = *ptr;
             has_proxy = TRUE;
         }
-        LeaveCriticalSection(&lock_cs);
     } else {
         if (g_proxy_ip[0] != '\0' && g_proxy_port != 0) {
             strncpy(selected_proxy_config.proxy_ip, g_proxy_ip, 63);
@@ -374,6 +373,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
             has_proxy = TRUE;
         }
     }
+    LeaveCriticalSection(&lock_proxies);
     free(config);
 
     if (!has_proxy) { closesocket(client_sock); return 0; }
@@ -524,7 +524,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
         if (udp_relay_socket6 != INVALID_SOCKET) FD_SET(udp_relay_socket6, &read_fds);
         SOCKET max_fd = udp_relay_socket;
 
-        EnterCriticalSection(&lock_cs);
+        EnterCriticalSection(&lock_udp);
         UDP_ASSOCIATION *assoc = udp_associations;
         while (assoc != NULL) {
             FD_SET(assoc->control_socket, &read_fds);
@@ -533,7 +533,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
             if (assoc->udp_socket > max_fd) max_fd = assoc->udp_socket;
             assoc = assoc->next;
         }
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_udp);
 
         struct timeval timeout = {1, 0};
         if (select(0, &read_fds, NULL, NULL, &timeout) <= 0) continue;
@@ -550,25 +550,31 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 int family;
                 if (get_connection(from_port, &family, dest_addr, &dest_port, &proxy_id, NULL) && family == AF_INET) {
                     UDP_ASSOCIATION *target_assoc = NULL;
-                    EnterCriticalSection(&lock_cs);
+                    EnterCriticalSection(&lock_udp);
                     assoc = udp_associations;
                     while (assoc != NULL) {
                         if (assoc->proxy_id == proxy_id) { target_assoc = assoc; break; }
                         assoc = assoc->next;
                     }
-                    LeaveCriticalSection(&lock_cs);
+                    LeaveCriticalSection(&lock_udp);
 
                     if (!target_assoc) {
+                        PROXY_CONFIG cfg_copy;
+                        BOOL have_cfg = FALSE;
+                        EnterCriticalSection(&lock_proxies);
                         PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
-                        if (cfg && cfg->enabled) {
-                            target_assoc = establish_udp_associate_with_config(cfg);
+                        if (cfg && cfg->enabled) { cfg_copy = *cfg; have_cfg = TRUE; }
+                        LeaveCriticalSection(&lock_proxies);
+
+                        if (have_cfg) {
+                            target_assoc = establish_udp_associate_with_config(&cfg_copy);
                             if (target_assoc) {
-                                EnterCriticalSection(&lock_cs);
+                                EnterCriticalSection(&lock_udp);
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
-                                LeaveCriticalSection(&lock_cs);
+                                LeaveCriticalSection(&lock_udp);
                             } else {
-                                log_message("UDP relay: UDP ASSOCIATE failed (proxy id %u, %s:%u)", proxy_id, cfg->proxy_ip, cfg->proxy_port);
+                                log_message("UDP relay: UDP ASSOCIATE failed (proxy id %u, %s:%u)", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
                             }
                         } else {
                             log_message("UDP relay: no usable proxy config (proxy id %u)", proxy_id);
@@ -602,25 +608,31 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 int family;
                 if (get_connection(from_port, &family, dest_addr, &dest_port, &proxy_id, NULL) && family == AF_INET6) {
                     UDP_ASSOCIATION *target_assoc = NULL;
-                    EnterCriticalSection(&lock_cs);
+                    EnterCriticalSection(&lock_udp);
                     assoc = udp_associations;
                     while (assoc != NULL) {
                         if (assoc->proxy_id == proxy_id) { target_assoc = assoc; break; }
                         assoc = assoc->next;
                     }
-                    LeaveCriticalSection(&lock_cs);
+                    LeaveCriticalSection(&lock_udp);
 
                     if (!target_assoc) {
+                        PROXY_CONFIG cfg_copy;
+                        BOOL have_cfg = FALSE;
+                        EnterCriticalSection(&lock_proxies);
                         PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
-                        if (cfg && cfg->enabled) {
-                            target_assoc = establish_udp_associate_with_config(cfg);
+                        if (cfg && cfg->enabled) { cfg_copy = *cfg; have_cfg = TRUE; }
+                        LeaveCriticalSection(&lock_proxies);
+
+                        if (have_cfg) {
+                            target_assoc = establish_udp_associate_with_config(&cfg_copy);
                             if (target_assoc) {
-                                EnterCriticalSection(&lock_cs);
+                                EnterCriticalSection(&lock_udp);
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
-                                LeaveCriticalSection(&lock_cs);
+                                LeaveCriticalSection(&lock_udp);
                             } else {
-                                log_message("UDP relay: UDP ASSOCIATE failed (IPv6, proxy id %u, %s:%u)", proxy_id, cfg->proxy_ip, cfg->proxy_port);
+                                log_message("UDP relay: UDP ASSOCIATE failed (IPv6, proxy id %u, %s:%u)", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
                             }
                         } else {
                             log_message("UDP relay: no usable proxy config (IPv6, proxy id %u)", proxy_id);
@@ -643,7 +655,9 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
         }
 
         // Proxy -> Relay -> Apps
-        EnterCriticalSection(&lock_cs);
+        // (holds lock_udp for the walk; briefly takes lock_connections inside —
+        //  the reverse order never occurs anywhere, so this nesting is safe)
+        EnterCriticalSection(&lock_udp);
         UDP_ASSOCIATION **assoc_ptr = &udp_associations;
         while (*assoc_ptr != NULL) {
             UDP_ASSOCIATION *curr = *assoc_ptr;
@@ -665,6 +679,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[8]);
                     BOOL matched = FALSE;
 
+                    EnterCriticalSection(&lock_connections);
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
                         if (conn->family == AF_INET &&
@@ -682,6 +697,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         }
                         conn = conn->next;
                     }
+                    LeaveCriticalSection(&lock_connections);
                     if (!matched) {
                         log_message("UDP relay: response no matching connection (%u.%u.%u.%u:%u)",
                             recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
@@ -692,6 +708,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[20]);
                     BOOL matched = FALSE;
 
+                    EnterCriticalSection(&lock_connections);
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
                         if (conn->family == AF_INET6 &&
@@ -711,6 +728,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         }
                         conn = conn->next;
                     }
+                    LeaveCriticalSection(&lock_connections);
                     if (!matched) {
                         log_message("UDP relay: response no matching connection (IPv6, port %u)", src_port);
                     }
@@ -726,7 +744,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 assoc_ptr = &(*assoc_ptr)->next;
             }
         }
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_udp);
     }
     
     // Final Cleanup of Assocs

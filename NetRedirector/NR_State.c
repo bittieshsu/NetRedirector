@@ -13,10 +13,11 @@ UINT32 g_next_rule_id = 1;
 UINT32 g_next_proxy_id = 1;
 
 // === Connection Tracking ===
+// (protected by lock_connections)
 
 void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_connections);
 
     CONNECTION_INFO *existing = connection_list;
     while (existing != NULL) {
@@ -28,7 +29,7 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
             existing->proxy_id = proxy_id;
             existing->action = action;
             existing->last_activity = GetTickCount();
-            LeaveCriticalSection(&lock_cs);
+            LeaveCriticalSection(&lock_connections);
             return;
         }
         existing = existing->next;
@@ -36,7 +37,7 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
 
     CONNECTION_INFO *conn = (CONNECTION_INFO *)malloc(sizeof(CONNECTION_INFO));
     if (conn == NULL) {
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_connections);
         return;
     }
 
@@ -52,13 +53,13 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
     conn->last_activity = GetTickCount();
     conn->next = connection_list;
     connection_list = conn;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_connections);
 }
 
 BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action)
 {
     BOOL found = FALSE;
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_connections);
     CONNECTION_INFO *conn = connection_list;
     CONNECTION_INFO *prev = NULL;
 
@@ -87,14 +88,14 @@ BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest
         prev = conn;
         conn = conn->next;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_connections);
     return found;
 }
 
 BOOL is_connection_tracked(UINT16 src_port)
 {
     BOOL tracked = FALSE;
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_connections);
     CONNECTION_INFO *conn = connection_list;
     CONNECTION_INFO *prev = NULL;
     while (conn != NULL) {
@@ -113,13 +114,13 @@ BOOL is_connection_tracked(UINT16 src_port)
         prev = conn;
         conn = conn->next;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_connections);
     return tracked;
 }
 
 void remove_connection(UINT16 src_port)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_connections);
     CONNECTION_INFO **conn_ptr = &connection_list;
     while (*conn_ptr != NULL)
     {
@@ -132,27 +133,28 @@ void remove_connection(UINT16 src_port)
         }
         conn_ptr = &(*conn_ptr)->next;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_connections);
 }
 
 void clear_connections()
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_connections);
     while (connection_list != NULL)
     {
         CONNECTION_INFO *to_free = connection_list;
         connection_list = connection_list->next;
         free(to_free);
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_connections);
 }
 
 // === Logged Connections ===
+// (protected by lock_logged)
 
 BOOL is_connection_already_logged(DWORD pid, int family, const UINT8 *dest_addr, UINT16 dest_port, RuleAction action)
 {
     BOOL found = FALSE;
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_logged);
     LOGGED_CONNECTION *logged = logged_connections;
     while (logged != NULL)
     {
@@ -167,13 +169,13 @@ BOOL is_connection_already_logged(DWORD pid, int family, const UINT8 *dest_addr,
         }
         logged = logged->next;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_logged);
     return found;
 }
 
 void add_logged_connection(DWORD pid, int family, const UINT8 *dest_addr, UINT16 dest_port, RuleAction action)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_logged);
     LOGGED_CONNECTION *logged = (LOGGED_CONNECTION *)malloc(sizeof(LOGGED_CONNECTION));
     if (logged != NULL)
     {
@@ -185,30 +187,29 @@ void add_logged_connection(DWORD pid, int family, const UINT8 *dest_addr, UINT16
         logged->next = logged_connections;
         logged_connections = logged;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_logged);
 }
 
 void clear_logged_connections()
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_logged);
     while (logged_connections != NULL)
     {
         LOGGED_CONNECTION *to_free = logged_connections;
         logged_connections = logged_connections->next;
         free(to_free);
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_logged);
 }
 
 // === Proxy Configs ===
+// (protected by lock_proxies; get_proxy_by_id assumes the caller holds it)
 
 PROXY_CONFIG* get_proxy_by_id(UINT32 proxy_id)
 {
-    // Note: Caller usually holds lock, or we should lock here. 
-    // Since this returns a pointer that might be used after unlock, allow concurrency carefully.
-    // In this project, get_proxy_by_id is called mostly within locked contexts or locally.
-    // We will assume the caller handles locking if they need strict safety, 
-    // OR we iterate linearly.
+    // IMPORTANT: the caller MUST hold lock_proxies. This function only walks
+    // the list; it never locks itself, because several callers need the
+    // returned pointer only briefly while other callers make a stack copy.
     
     PROXY_CONFIG *config = proxy_configs;
     while (config != NULL)
@@ -224,29 +225,30 @@ PROXY_CONFIG* get_proxy_by_id(UINT32 proxy_id)
 
 void clear_proxy_configs()
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     while (proxy_configs != NULL)
     {
         PROXY_CONFIG *to_free = proxy_configs;
         proxy_configs = proxy_configs->next;
         free(to_free);
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
 }
 
 // === UDP Associations ===
+// (protected by lock_udp)
 
 void add_udp_association(UDP_ASSOCIATION* assoc)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_udp);
     assoc->next = udp_associations;
     udp_associations = assoc;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_udp);
 }
 
 void clear_udp_associations()
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_udp);
     while (udp_associations != NULL)
     {
         UDP_ASSOCIATION *to_free = udp_associations;
@@ -255,5 +257,5 @@ void clear_udp_associations()
         closesocket(to_free->udp_socket);
         free(to_free);
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_udp);
 }

@@ -19,10 +19,10 @@
 //      OpenProcess + QueryFullProcessImageNameA syscall pair for subsequent
 //      connections opened by the same process (browsers/games open hundreds).
 //
-// Both are guarded by lock_cs. They are only touched on the "new connection"
-// path (not per steady-state packet), so lock contention is negligible.
-// Entries expire via TTL (GetTickCount, wraps safely with unsigned math) and
-// are fully cleared by clear_pid_cache() on NetRedirector_Stop.
+// Both are guarded by lock_pid_cache. They are only touched on the "new
+// connection" path (not per steady-state packet), so lock contention is
+// negligible. Entries expire via TTL (GetTickCount, wraps safely with unsigned
+// math) and are fully cleared by clear_pid_cache() on NetRedirector_Stop.
 
 #define PID_RESULT_CACHE_SIZE 128
 #define PID_RESULT_CACHE_TTL_TCP_MS 1500
@@ -58,17 +58,17 @@ static DWORD pid_result_cache_lookup(int family, BOOL is_udp, const UINT8 *local
     DWORD ttl = is_udp ? PID_RESULT_CACHE_TTL_UDP_MS : PID_RESULT_CACHE_TTL_TCP_MS;
     int addr_len = (family == AF_INET) ? 4 : 16;
 
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_pid_cache);
     for (UINT32 i = 0; i < PID_RESULT_CACHE_SIZE; i++) {
         PID_RESULT_CACHE_ENTRY *e = &g_pid_result_cache[i];
         if (e->pid == 0) continue;
         if (e->family != family || e->is_udp != is_udp || e->local_port != local_port) continue;
         if ((now - e->timestamp) > ttl) continue;
         if (memcmp(e->local_addr, local_addr, addr_len) != 0) continue;
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_pid_cache);
         return e->pid;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_pid_cache);
     return 0;
 }
 
@@ -80,7 +80,7 @@ static void pid_result_cache_store(int family, BOOL is_udp, const UINT8 *local_a
     if (pid == 0) return;
     int addr_len = (family == AF_INET) ? 4 : 16;
 
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_pid_cache);
     for (UINT32 i = 0; i < PID_RESULT_CACHE_SIZE; i++) {
         PID_RESULT_CACHE_ENTRY *e = &g_pid_result_cache[i];
         if (e->pid == 0) continue;
@@ -88,7 +88,7 @@ static void pid_result_cache_store(int family, BOOL is_udp, const UINT8 *local_a
             memcmp(e->local_addr, local_addr, addr_len) == 0) {
             e->timestamp = GetTickCount();
             e->pid = pid;
-            LeaveCriticalSection(&lock_cs);
+            LeaveCriticalSection(&lock_pid_cache);
             return;
         }
     }
@@ -100,16 +100,16 @@ static void pid_result_cache_store(int family, BOOL is_udp, const UINT8 *local_a
     memcpy(slot->local_addr, local_addr, addr_len);
     slot->local_port = local_port;
     slot->pid = pid;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_pid_cache);
 }
 
 void clear_pid_cache(void)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_pid_cache);
     memset(g_pid_result_cache, 0, sizeof(g_pid_result_cache));
     memset(g_process_name_cache, 0, sizeof(g_process_name_cache));
     g_pid_cache_next_slot = 0;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_pid_cache);
 }
 
 // [Preserved] Original parse_ipv4 (as auxiliary for resolve_hostname)
@@ -470,17 +470,17 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
     DWORD now = GetTickCount();
 
     // 1. Cache lookup (avoids OpenProcess + QueryFullProcessImageNameA per new connection)
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_pid_cache);
     for (int i = 0; i < PROCESS_NAME_CACHE_SIZE; i++) {
         PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[i];
         if (e->pid == pid && e->name[0] && (now - e->timestamp) <= PROCESS_NAME_CACHE_TTL_MS) {
             strncpy(name, e->name, name_size - 1);
             name[name_size - 1] = '\0';
-            LeaveCriticalSection(&lock_cs);
+            LeaveCriticalSection(&lock_pid_cache);
             return TRUE;
         }
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_pid_cache);
 
     // 2. Miss: query the system
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -495,7 +495,7 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
 
         // 3. Store into cache: refresh the slot for this pid, else reuse the
         //    oldest/empty slot (simple LRU-ish replacement).
-        EnterCriticalSection(&lock_cs);
+        EnterCriticalSection(&lock_pid_cache);
         int slot = -1;
         int oldest_slot = 0;
         DWORD oldest_ts = 0xFFFFFFFF;
@@ -511,7 +511,7 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
         e->timestamp = now;
         strncpy(e->name, full_path, MAX_PROCESS_NAME - 1);
         e->name[MAX_PROCESS_NAME - 1] = '\0';
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_pid_cache);
     }
     CloseHandle(hProcess);
     return ok;

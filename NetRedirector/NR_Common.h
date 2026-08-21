@@ -124,7 +124,20 @@ typedef struct LOGGED_CONNECTION {
 
 // === Shared Global Variables (Extern) ===
 
-extern CRITICAL_SECTION lock_cs;
+// Per-structure locks (replaces the former single global lock_cs so that
+// packet threads touching the connection list no longer contend with rule /
+// proxy / UDP-association lock holders).
+//
+// Lock ordering rule: never hold two of these at once, EXCEPT the UDP relay
+// main walk may briefly take lock_connections while holding lock_udp (the
+// reverse order never occurs). Keep acquisitions short.
+extern CRITICAL_SECTION lock_rules;       // protects rules_list
+extern CRITICAL_SECTION lock_connections; // protects connection_list
+extern CRITICAL_SECTION lock_logged;      // protects logged_connections
+extern CRITICAL_SECTION lock_proxies;     // protects proxy_configs + g_proxy_* globals
+extern CRITICAL_SECTION lock_udp;         // protects udp_associations
+extern CRITICAL_SECTION lock_pid_cache;   // protects the PID caches in NR_Utils.c
+
 extern BOOL running;
 extern DWORD g_current_process_id;
 

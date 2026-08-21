@@ -13,7 +13,14 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name
 NETREDIRECTOR_API BOOL NetRedirector_EditRuleWithProxy(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_id);
 
 // === Global Variable Definitions ===
-CRITICAL_SECTION lock_cs;
+// Per-structure locks (see NR_Common.h for the ordering rule).
+CRITICAL_SECTION lock_rules;
+CRITICAL_SECTION lock_connections;
+CRITICAL_SECTION lock_logged;
+CRITICAL_SECTION lock_proxies;
+CRITICAL_SECTION lock_udp;
+CRITICAL_SECTION lock_pid_cache;
+
 BOOL running = FALSE;
 DWORD g_current_process_id = 0;
 
@@ -72,10 +79,10 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name
     if (target_ports && target_ports[0]) rule->target_ports = _strdup(target_ports);
     else rule->target_ports = _strdup("*");
 
-    EnterCriticalSection(&lock_cs); // Optional if single thread config, but safer
+    EnterCriticalSection(&lock_rules); // Optional if single thread config, but safer
     rule->next = rules_list;
     rules_list = rule;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_rules);
 
     return rule->rule_id;
 }
@@ -101,10 +108,10 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleByPID(DWORD pid, const char* targe
     if (target_ports && target_ports[0]) rule->target_ports = _strdup(target_ports);
     else rule->target_ports = _strdup("*");
 
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_rules);
     rule->next = rules_list;
     rules_list = rule;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_rules);
 
     return rule->rule_id;
 }
@@ -112,30 +119,38 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleByPID(DWORD pid, const char* targe
 NETREDIRECTOR_API BOOL NetRedirector_EnableRule(UINT32 rule_id)
 {
     if (rule_id == 0) return FALSE;
+    BOOL found = FALSE;
+    EnterCriticalSection(&lock_rules);
     PROCESS_RULE *rule = rules_list;
     while (rule) {
-        if (rule->rule_id == rule_id) { rule->enabled = TRUE; return TRUE; }
+        if (rule->rule_id == rule_id) { rule->enabled = TRUE; found = TRUE; break; }
         rule = rule->next;
     }
-    return FALSE;
+    LeaveCriticalSection(&lock_rules);
+    return found;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_DisableRule(UINT32 rule_id)
 {
     if (rule_id == 0) return FALSE;
+    BOOL found = FALSE;
+    EnterCriticalSection(&lock_rules);
     PROCESS_RULE *rule = rules_list;
     while (rule) {
-        if (rule->rule_id == rule_id) { rule->enabled = FALSE; return TRUE; }
+        if (rule->rule_id == rule_id) { rule->enabled = FALSE; found = TRUE; break; }
         rule = rule->next;
     }
-    return FALSE;
+    LeaveCriticalSection(&lock_rules);
+    return found;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_DeleteRule(UINT32 rule_id)
 {
     if (rule_id == 0) return FALSE;
+    EnterCriticalSection(&lock_rules);
     PROCESS_RULE *rule = rules_list;
     PROCESS_RULE *prev = NULL;
+    BOOL found = FALSE;
 
     while (rule) {
         if (rule->rule_id == rule_id) {
@@ -145,12 +160,14 @@ NETREDIRECTOR_API BOOL NetRedirector_DeleteRule(UINT32 rule_id)
             free(rule->target_ports);
             free(rule);
             log_message("Deleted rule ID: %u", rule_id);
-            return TRUE;
+            found = TRUE;
+            break;
         }
         prev = rule;
         rule = rule->next;
     }
-    return FALSE;
+    LeaveCriticalSection(&lock_rules);
+    return found;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_EditRule(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action)
@@ -161,6 +178,8 @@ NETREDIRECTOR_API BOOL NetRedirector_EditRule(UINT32 rule_id, const char* proces
 NETREDIRECTOR_API BOOL NetRedirector_EditRuleWithProxy(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_id)
 {
     if (rule_id == 0 || !process_name) return FALSE;
+    BOOL found = FALSE;
+    EnterCriticalSection(&lock_rules);
     PROCESS_RULE *rule = rules_list;
     while (rule) {
         if (rule->rule_id == rule_id) {
@@ -177,11 +196,13 @@ NETREDIRECTOR_API BOOL NetRedirector_EditRuleWithProxy(UINT32 rule_id, const cha
             rule->action = action;
             rule->proxy_id = proxy_id;
             log_message("Updated rule ID: %u", rule_id);
-            return TRUE;
+            found = TRUE;
+            break;
         }
         rule = rule->next;
     }
-    return FALSE;
+    LeaveCriticalSection(&lock_rules);
+    return found;
 }
 
 // === Proxy Config APIs ===
@@ -191,6 +212,7 @@ NETREDIRECTOR_API BOOL NetRedirector_SetProxyConfig(ProxyType type, const char* 
     if (!proxy_ip || !proxy_ip[0] || proxy_port == 0) return FALSE;
     if (resolve_hostname(proxy_ip) == 0) return FALSE;
 
+    EnterCriticalSection(&lock_proxies);
     strncpy(g_proxy_ip, proxy_ip, sizeof(g_proxy_ip)-1);
     g_proxy_port = proxy_port;
     g_proxy_type = type;
@@ -200,6 +222,7 @@ NETREDIRECTOR_API BOOL NetRedirector_SetProxyConfig(ProxyType type, const char* 
     
     if (password) strncpy(g_proxy_password, password, sizeof(g_proxy_password)-1);
     else g_proxy_password[0] = '\0';
+    LeaveCriticalSection(&lock_proxies);
 
     return TRUE;
 }
@@ -227,10 +250,10 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddProxyConfig(ProxyType type, const char
     if (password) strncpy(config->password, password, 255);
     else config->password[0] = 0;
 
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     config->next = proxy_configs;
     proxy_configs = config;
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
 
     log_message("Added proxy config ID: %u", config->proxy_id);
     return config->proxy_id;
@@ -240,7 +263,7 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
 {
     if (proxy_id == 0) return FALSE;
     
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     PROXY_CONFIG *config = get_proxy_by_id(proxy_id);
     if (config) {
         config->proxy_type = type;
@@ -251,17 +274,17 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
         if (username) strncpy(config->username, username, 255);
         if (password) strncpy(config->password, password, 255);
         log_message("Updated proxy config ID: %u", proxy_id);
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_proxies);
         return TRUE;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
     return FALSE;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_DeleteProxyConfig(UINT32 proxy_id)
 {
     if (proxy_id == 0) return FALSE;
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     PROXY_CONFIG *config = proxy_configs;
     PROXY_CONFIG *prev = NULL;
     while (config) {
@@ -270,57 +293,59 @@ NETREDIRECTOR_API BOOL NetRedirector_DeleteProxyConfig(UINT32 proxy_id)
             else proxy_configs = config->next;
             free(config);
             log_message("Deleted proxy config ID: %u", proxy_id);
-            LeaveCriticalSection(&lock_cs);
+            LeaveCriticalSection(&lock_proxies);
             return TRUE;
         }
         prev = config;
         config = config->next;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
     return FALSE;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_EnableProxyConfig(UINT32 proxy_id)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     PROXY_CONFIG *config = get_proxy_by_id(proxy_id);
     if (config) {
         config->enabled = TRUE;
         log_message("Enabled proxy config ID: %u", proxy_id);
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_proxies);
         return TRUE;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
     return FALSE;
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_DisableProxyConfig(UINT32 proxy_id)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_proxies);
     PROXY_CONFIG *config = get_proxy_by_id(proxy_id);
     if (config) {
         config->enabled = FALSE;
         log_message("Disabled proxy config ID: %u", proxy_id);
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_proxies);
         return TRUE;
     }
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_proxies);
     return FALSE;
 }
 
 NETREDIRECTOR_API PROXY_CONFIG_API* NetRedirector_GetProxyConfig(UINT32 proxy_id)
 {
+    // NOTE: returns an internal pointer without a lock — the caller must not
+    // hold the result across concurrent Edit/DeleteProxyConfig calls.
     return (PROXY_CONFIG_API*)get_proxy_by_id(proxy_id);
 }
 
 NETREDIRECTOR_API PROXY_CONFIG_API* NetRedirector_GetAllProxyConfigs(UINT32* count)
 {
     if (count) {
-        EnterCriticalSection(&lock_cs);
+        EnterCriticalSection(&lock_proxies);
         PROXY_CONFIG *c = proxy_configs;
         *count = 0;
         while(c) { (*count)++; c = c->next; }
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_proxies);
     }
     return (PROXY_CONFIG_API*)proxy_configs;
 }
@@ -433,7 +458,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
     {
         case DLL_PROCESS_ATTACH:
             g_current_process_id = GetCurrentProcessId();
-            InitializeCriticalSection(&lock_cs);
+            InitializeCriticalSection(&lock_rules);
+            InitializeCriticalSection(&lock_connections);
+            InitializeCriticalSection(&lock_logged);
+            InitializeCriticalSection(&lock_proxies);
+            InitializeCriticalSection(&lock_udp);
+            InitializeCriticalSection(&lock_pid_cache);
             break;
 
         case DLL_PROCESS_DETACH:
@@ -447,7 +477,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
             }
             clear_proxy_configs();
             
-            DeleteCriticalSection(&lock_cs);
+            DeleteCriticalSection(&lock_rules);
+            DeleteCriticalSection(&lock_connections);
+            DeleteCriticalSection(&lock_logged);
+            DeleteCriticalSection(&lock_proxies);
+            DeleteCriticalSection(&lock_udp);
+            DeleteCriticalSection(&lock_pid_cache);
             break;
     }
     return TRUE;

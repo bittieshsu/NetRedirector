@@ -3,7 +3,7 @@
 
 RuleAction match_rule(DWORD current_pid, const char *process_name, int family, const UINT8 *dest_addr, UINT16 dest_port, BOOL is_udp, UINT32* out_proxy_id)
 {
-    EnterCriticalSection(&lock_cs);
+    EnterCriticalSection(&lock_rules);
 
     PROCESS_RULE *rule = rules_list;
     PROCESS_RULE *wildcard_rule = NULL;
@@ -30,7 +30,7 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
                                                    : match_ip_list(rule->target_hosts, *(UINT32*)dest_addr);
                  if (ip_ok && match_port_list(rule->target_ports, dest_port)) {
                      if (out_proxy_id) *out_proxy_id = rule->proxy_id;
-                     LeaveCriticalSection(&lock_cs);
+                     LeaveCriticalSection(&lock_rules);
                      return rule->action;
                  }
             }
@@ -50,7 +50,7 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
                                                   : match_ip_list(rule->target_hosts, *(UINT32*)dest_addr);
                 if (ip_ok && match_port_list(rule->target_ports, dest_port)) {
                     if (out_proxy_id) *out_proxy_id = rule->proxy_id;
-                    LeaveCriticalSection(&lock_cs);
+                    LeaveCriticalSection(&lock_rules);
                     return rule->action;
                 }
                 rule = rule->next;
@@ -66,7 +66,7 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
                                               : match_ip_list(rule->target_hosts, *(UINT32*)dest_addr);
             if (ip_ok && match_port_list(rule->target_ports, dest_port)) {
                 if (out_proxy_id) *out_proxy_id = rule->proxy_id;
-                LeaveCriticalSection(&lock_cs);
+                LeaveCriticalSection(&lock_rules);
                 return rule->action;
             }
         }
@@ -75,11 +75,11 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
 
     if (wildcard_rule != NULL) {
         if (out_proxy_id) *out_proxy_id = wildcard_rule->proxy_id;
-        LeaveCriticalSection(&lock_cs);
+        LeaveCriticalSection(&lock_rules);
         return wildcard_rule->action;
     }
 
-    LeaveCriticalSection(&lock_cs);
+    LeaveCriticalSection(&lock_rules);
     return RULE_ACTION_DIRECT;
 }
 
@@ -114,27 +114,35 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
 
     RuleAction action = match_rule(pid, process_name, family, dest_addr, dest_port, is_udp, &selected_proxy_id);
 
-    // UDP & HTTP Proxy check
+    // UDP & HTTP Proxy check (reads proxy configs, guarded by lock_proxies)
     if (action == RULE_ACTION_PROXY && is_udp) {
+        ProxyType p_type;
+        EnterCriticalSection(&lock_proxies);
         PROXY_CONFIG* proxy_config = NULL;
         if (selected_proxy_id != 0) {
             proxy_config = get_proxy_by_id(selected_proxy_id);
         }
-        
-        // If specific proxy not found (or default), check global type or specific type
-        ProxyType p_type = (proxy_config != NULL) ? proxy_config->proxy_type : g_proxy_type;
+        p_type = (proxy_config != NULL) ? proxy_config->proxy_type : g_proxy_type;
+        LeaveCriticalSection(&lock_proxies);
+
         if (p_type == PROXY_TYPE_HTTP) {
             return RULE_ACTION_DIRECT; // HTTP proxy doesn't support UDP
         }
     }
 
-    // Validation
+    // Validation: proxy config must be present and enabled
     if (action == RULE_ACTION_PROXY) {
         if (selected_proxy_id != 0) {
+            EnterCriticalSection(&lock_proxies);
             PROXY_CONFIG* cfg = get_proxy_by_id(selected_proxy_id);
-            if (cfg == NULL || !cfg->enabled) return RULE_ACTION_DIRECT;
+            BOOL usable = (cfg != NULL && cfg->enabled);
+            LeaveCriticalSection(&lock_proxies);
+            if (!usable) return RULE_ACTION_DIRECT;
         } else {
-            if (g_proxy_ip[0] == '\0' || g_proxy_port == 0) return RULE_ACTION_DIRECT;
+            EnterCriticalSection(&lock_proxies);
+            BOOL has_default = (g_proxy_ip[0] != '\0' && g_proxy_port != 0);
+            LeaveCriticalSection(&lock_proxies);
+            if (!has_default) return RULE_ACTION_DIRECT;
         }
     }
 
