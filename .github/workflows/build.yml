@@ -1,0 +1,77 @@
+# NetRedirector CI/CD — 自動建置 DLL + Nuitka 打包
+# 觸發: push/PR 到 main, 或手動 workflow_dispatch
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (cl)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 語法檢查 + 模組匯入 smoke test (免啟動 GUI)
+      - name: Smoke test (syntax + imports)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          python -c "import ast; ast.parse(open('IntegratedApp.py', encoding='utf-8').read()); print('syntax OK')"
+          python -c "import i18n, network_utils, proxy_core, secure_config, NetRedirector; print('modules import OK')"
+
+      # 統一建置腳本: 編譯 C DLL 並複製到根目錄
+      - name: Compile C DLL
+        shell: pwsh
+        run: ./build.ps1 -DllOnly
+
+      - name: Verify DLL
+        shell: pwsh
+        run: |
+          if (-not (Test-Path NetRedirector.dll)) { throw "NetRedirector.dll not found" }
+          $len = (Get-Item NetRedirector.dll).Length
+          Write-Host "NetRedirector.dll OK: $len bytes"
+          if ($len -lt 100000) { throw "NetRedirector.dll suspiciously small" }
+
+      # Nuitka standalone 打包 (DLL 已編譯, 用 -NoDll 跳過重編)
+      - name: Package with Nuitka (standalone)
+        shell: pwsh
+        run: ./build.ps1 -Standalone -NoDll
+        env:
+          PYTHONUTF8: '1'
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          $dist = Get-ChildItem -Directory -Filter "*.dist" | Select-Object -First 1
+          if (-not $dist) { throw "No .dist output folder found" }
+          $exe = Get-ChildItem $dist.FullName -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "No exe found in $($dist.FullName)" }
+          Write-Host "Package OK: $($exe.FullName)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRedirector-build
+          path: |
+            NetRedirector.dll
+            *.dist/
+            WinDivert.dll
+            WinDivert64.sys
+          if-no-files-found: error

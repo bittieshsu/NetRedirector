@@ -1,6 +1,7 @@
 # NetRedirector 🚀
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Build](https://github.com/tokyoxpa3/NetRedirector/actions/workflows/build.yml/badge.svg)](https://github.com/tokyoxpa3/NetRedirector/actions/workflows/build.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey.svg)](https://www.microsoft.com/)
 [![GUI: PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)](https://doc.qt.io/qtforpython/)
@@ -162,22 +163,38 @@ NetRedirector/
     ├── NR_RuleEngine.c      # 規則比對引擎
     ├── NR_State.c           # 連線狀態追蹤
     ├── NR_Utils.c           # 工具函式 (EXE 解析、LAN/on-link 偵測、比對邏輯)
-    └── build_dll.bat        # MSVC x64 編譯腳本
+    └── build_dll.bat        # 相容入口 (指向 build.ps1)
 ```
 
 ---
 
-## ⚙️ 重新編譯 C 核心 DLL
+## ⚙️ 建置 (Build)
 
-若您修改了 `NetRedirector/` 目錄下的 C 語言原始碼，需要重新編譯 DLL：
+### 方式 1: 統一建置腳本 `build.ps1` (推薦)
+
+自動偵測 MSVC Build Tools，免手動開啟 Developer Command Prompt：
+
+```powershell
+.\build.ps1                  # 僅編譯 C DLL
+.\build.ps1 -Standalone      # 編譯 DLL + Nuitka 目錄模式打包
+.\build.ps1 -Onefile         # 編譯 DLL + Nuitka 單一 exe 模式打包
+.\build.ps1 -Standalone -NoDll   # 僅打包 (跳過 DLL 編譯)
+```
+
+### 方式 2: 手動 MSVC 編譯
 
 1. 開啟 **Developer Command Prompt for VS** (確保具備 MSVC x64 工具鏈)。
-2. 進入 `NetRedirector/` 目錄或執行：
+2. 執行：
    ```cmd
    cd NetRedirector
    call build_dll.bat
    ```
 3. 編譯產出的 `NetRedirector.dll` 會自動輸出，覆蓋根目錄同名檔案即可生效。
+
+### CI/CD
+
+推送到 `main` 分支會自動觸發 GitHub Actions (`.github/workflows/build.yml`)：
+編譯 C DLL → 語法/匯入 smoke test → Nuitka standalone 打包 → 上傳建置產物。
 
 ---
 
