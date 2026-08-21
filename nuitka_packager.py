@@ -1,3 +1,10 @@
+# ============================================================
+# [已棄用] 請改用統一建置腳本 build.ps1 (根目錄)。
+#   用法: .\build.ps1                 -> 僅編譯 DLL
+#         .\build.ps1 -Standalone     -> 編譯 DLL + Nuitka 目錄模式
+#         .\build.ps1 -Onefile        -> 編譯 DLL + Nuitka 單一 exe 模式
+# 本 GUI 工具保留供參考，不再維護。
+# ============================================================
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 import subprocess
