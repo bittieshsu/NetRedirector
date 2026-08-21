@@ -96,11 +96,21 @@ BOOL is_connection_tracked(UINT16 src_port)
     BOOL tracked = FALSE;
     EnterCriticalSection(&lock_cs);
     CONNECTION_INFO *conn = connection_list;
+    CONNECTION_INFO *prev = NULL;
     while (conn != NULL) {
         if (conn->src_port == src_port) {
             tracked = TRUE;
+            // Move to front: this is on the per-packet hot path for UDP relay
+            // traffic; keeping frequently-used sockets near the head makes the
+            // common case O(1) instead of O(n).
+            if (prev != NULL) {
+                prev->next = conn->next;
+                conn->next = connection_list;
+                connection_list = conn;
+            }
             break;
         }
+        prev = conn;
         conn = conn->next;
     }
     LeaveCriticalSection(&lock_cs);

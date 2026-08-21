@@ -17,6 +17,7 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port);
 DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port);
 DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port);
 BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
+void clear_pid_cache(void);
 
 // IPv6 Helpers
 void addr_to_string(int family, const UINT8 *addr, char *buf, size_t size);

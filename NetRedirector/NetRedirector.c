@@ -419,6 +419,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Stop(void)
     clear_connections();
     clear_logged_connections();
     clear_udp_associations(); // Clean sockets
+    clear_pid_cache();        // Drop stale PID/process-name cache entries
 
     log_message("NetRedirector stopped");
     return TRUE;

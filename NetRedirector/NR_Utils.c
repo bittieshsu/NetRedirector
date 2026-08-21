@@ -2,6 +2,116 @@
 #include "NR_Utils.h"
 #include <ws2tcpip.h> // [Added] for getaddrinfo
 
+// === PID Lookup Caches ===
+//
+// get_process_id_from_*() call GetExtendedTcpTable / GetExtendedUdpTable, which
+// enumerate the ENTIRE system connection table. On an active machine that is a
+// sizeable kernel+user-space cost when it happens for every new connection.
+//
+// Two complementary caches reduce the cost:
+//   1. PID_RESULT_CACHE  : (family, local ip, local port, is_udp) -> pid
+//      UDP sockets are long-lived and reused for many destinations, so a single
+//      socket only needs ONE table scan per TTL window instead of one per
+//      packet/flow. TCP port reuse (TIME_WAIT recycling, SYN retransmits) also
+//      benefits. A cache MISS always falls through to a fresh table scan, so a
+//      brand-new connection can never be "lost" to a stale snapshot.
+//   2. PROCESS_NAME_CACHE: pid -> full process path. Eliminates the
+//      OpenProcess + QueryFullProcessImageNameA syscall pair for subsequent
+//      connections opened by the same process (browsers/games open hundreds).
+//
+// Both are guarded by lock_cs. They are only touched on the "new connection"
+// path (not per steady-state packet), so lock contention is negligible.
+// Entries expire via TTL (GetTickCount, wraps safely with unsigned math) and
+// are fully cleared by clear_pid_cache() on NetRedirector_Stop.
+
+#define PID_RESULT_CACHE_SIZE 128
+#define PID_RESULT_CACHE_TTL_TCP_MS 1500
+#define PID_RESULT_CACHE_TTL_UDP_MS 5000
+
+typedef struct {
+    DWORD timestamp;
+    int family;               // AF_INET or AF_INET6
+    BOOL is_udp;
+    UINT8 local_addr[16];     // network byte order (IPv4 uses first 4 bytes)
+    UINT16 local_port;        // host byte order
+    DWORD pid;
+} PID_RESULT_CACHE_ENTRY;
+
+static PID_RESULT_CACHE_ENTRY g_pid_result_cache[PID_RESULT_CACHE_SIZE];
+static UINT32 g_pid_cache_next_slot = 0;   // round-robin replacement
+
+#define PROCESS_NAME_CACHE_SIZE 64
+#define PROCESS_NAME_CACHE_TTL_MS 5000
+
+typedef struct {
+    DWORD pid;
+    DWORD timestamp;
+    char name[MAX_PROCESS_NAME];
+} PROCESS_NAME_CACHE_ENTRY;
+
+static PROCESS_NAME_CACHE_ENTRY g_process_name_cache[PROCESS_NAME_CACHE_SIZE];
+
+// Look up a cached pid result. Returns 0 on miss/expired.
+static DWORD pid_result_cache_lookup(int family, BOOL is_udp, const UINT8 *local_addr, UINT16 local_port)
+{
+    DWORD now = GetTickCount();
+    DWORD ttl = is_udp ? PID_RESULT_CACHE_TTL_UDP_MS : PID_RESULT_CACHE_TTL_TCP_MS;
+    int addr_len = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_cs);
+    for (UINT32 i = 0; i < PID_RESULT_CACHE_SIZE; i++) {
+        PID_RESULT_CACHE_ENTRY *e = &g_pid_result_cache[i];
+        if (e->pid == 0) continue;
+        if (e->family != family || e->is_udp != is_udp || e->local_port != local_port) continue;
+        if ((now - e->timestamp) > ttl) continue;
+        if (memcmp(e->local_addr, local_addr, addr_len) != 0) continue;
+        LeaveCriticalSection(&lock_cs);
+        return e->pid;
+    }
+    LeaveCriticalSection(&lock_cs);
+    return 0;
+}
+
+// Store a pid result. Refreshes an existing entry for the same socket, else
+// replaces the next round-robin slot. Failures (pid == 0) are NOT cached so a
+// transient miss always retries a real table scan.
+static void pid_result_cache_store(int family, BOOL is_udp, const UINT8 *local_addr, UINT16 local_port, DWORD pid)
+{
+    if (pid == 0) return;
+    int addr_len = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_cs);
+    for (UINT32 i = 0; i < PID_RESULT_CACHE_SIZE; i++) {
+        PID_RESULT_CACHE_ENTRY *e = &g_pid_result_cache[i];
+        if (e->pid == 0) continue;
+        if (e->family == family && e->is_udp == is_udp && e->local_port == local_port &&
+            memcmp(e->local_addr, local_addr, addr_len) == 0) {
+            e->timestamp = GetTickCount();
+            e->pid = pid;
+            LeaveCriticalSection(&lock_cs);
+            return;
+        }
+    }
+    PID_RESULT_CACHE_ENTRY *slot = &g_pid_result_cache[g_pid_cache_next_slot++ % PID_RESULT_CACHE_SIZE];
+    slot->timestamp = GetTickCount();
+    slot->family = family;
+    slot->is_udp = is_udp;
+    memset(slot->local_addr, 0, sizeof(slot->local_addr));
+    memcpy(slot->local_addr, local_addr, addr_len);
+    slot->local_port = local_port;
+    slot->pid = pid;
+    LeaveCriticalSection(&lock_cs);
+}
+
+void clear_pid_cache(void)
+{
+    EnterCriticalSection(&lock_cs);
+    memset(g_pid_result_cache, 0, sizeof(g_pid_result_cache));
+    memset(g_process_name_cache, 0, sizeof(g_process_name_cache));
+    g_pid_cache_next_slot = 0;
+    LeaveCriticalSection(&lock_cs);
+}
+
 // [Preserved] Original parse_ipv4 (as auxiliary for resolve_hostname)
 UINT32 parse_ipv4(const char *ip)
 {
@@ -87,10 +197,16 @@ void base64_encode(const char* input, char* output, size_t output_size) {
     output[output_len] = '\0';
 }
 
-// [Preserved] Process ID retrieval logic (though  didn't improve it, keep as is)
+// [Preserved] Process ID retrieval logic — now cache-first (see caches above)
 DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port) {
+    UINT8 addr4[4];
+    memcpy(addr4, &src_ip, 4);
+    DWORD cached = pid_result_cache_lookup(AF_INET, FALSE, addr4, src_port);
+    if (cached != 0) return cached;
+
+    DWORD pid = 0;
     MIB_TCPTABLE_OWNER_PID *tcp_table = NULL;
-    DWORD size = 0; DWORD pid = 0;
+    DWORD size = 0;
     if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
     tcp_table = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
     if (!tcp_table) return 0;
@@ -102,12 +218,20 @@ DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port) {
             }
         }
     }
-    free(tcp_table); return pid;
+    free(tcp_table);
+    pid_result_cache_store(AF_INET, FALSE, addr4, src_port, pid);
+    return pid;
 }
 
 DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port) {
+    UINT8 addr4[4];
+    memcpy(addr4, &src_ip, 4);
+    DWORD cached = pid_result_cache_lookup(AF_INET, TRUE, addr4, src_port);
+    if (cached != 0) return cached;
+
+    DWORD pid = 0;
     MIB_UDPTABLE_OWNER_PID *udp_table = NULL;
-    DWORD size = 0; DWORD pid = 0;
+    DWORD size = 0;
     if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
     udp_table = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
     if (!udp_table) return 0;
@@ -123,13 +247,19 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port) {
             }
         }
     }
-    free(udp_table); return pid;
+    free(udp_table);
+    pid_result_cache_store(AF_INET, TRUE, addr4, src_port, pid);
+    return pid;
 }
 
 // === IPv6 Process ID lookup ===
 DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
+    DWORD cached = pid_result_cache_lookup(AF_INET6, FALSE, src_ip6, src_port);
+    if (cached != 0) return cached;
+
+    DWORD pid = 0;
     MIB_TCP6TABLE_OWNER_PID *tcp_table = NULL;
-    DWORD size = 0; DWORD pid = 0;
+    DWORD size = 0;
     if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
     tcp_table = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
     if (!tcp_table) return 0;
@@ -141,12 +271,18 @@ DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
             }
         }
     }
-    free(tcp_table); return pid;
+    free(tcp_table);
+    pid_result_cache_store(AF_INET6, FALSE, src_ip6, src_port, pid);
+    return pid;
 }
 
 DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port) {
+    DWORD cached = pid_result_cache_lookup(AF_INET6, TRUE, src_ip6, src_port);
+    if (cached != 0) return cached;
+
+    DWORD pid = 0;
     MIB_UDP6TABLE_OWNER_PID *udp_table = NULL;
-    DWORD size = 0; DWORD pid = 0;
+    DWORD size = 0;
     if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER) return 0;
     udp_table = (MIB_UDP6TABLE_OWNER_PID *)malloc(size);
     if (!udp_table) return 0;
@@ -163,7 +299,9 @@ DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port)
             }
         }
     }
-    free(udp_table); return pid;
+    free(udp_table);
+    pid_result_cache_store(AF_INET6, TRUE, src_ip6, src_port, pid);
+    return pid;
 }
 
 // === IPv6 helpers ===
@@ -326,17 +464,57 @@ BOOL match_ip_list6(const char *ip_list, const UINT8 *ip)
 }
 
 BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
-    HANDLE hProcess; char full_path[MAX_PATH]; DWORD path_len = MAX_PATH;
-    if (pid == 0) return FALSE;
-    if (pid == 4) { strncpy(name, "System", name_size - 1); return TRUE; } // Small improvement in : System process
-    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (pid == 0 || name == NULL || name_size == 0) return FALSE;
+    if (pid == 4) { strncpy(name, "System", name_size - 1); name[name_size - 1] = '\0'; return TRUE; } // Small improvement in : System process
+
+    DWORD now = GetTickCount();
+
+    // 1. Cache lookup (avoids OpenProcess + QueryFullProcessImageNameA per new connection)
+    EnterCriticalSection(&lock_cs);
+    for (int i = 0; i < PROCESS_NAME_CACHE_SIZE; i++) {
+        PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[i];
+        if (e->pid == pid && e->name[0] && (now - e->timestamp) <= PROCESS_NAME_CACHE_TTL_MS) {
+            strncpy(name, e->name, name_size - 1);
+            name[name_size - 1] = '\0';
+            LeaveCriticalSection(&lock_cs);
+            return TRUE;
+        }
+    }
+    LeaveCriticalSection(&lock_cs);
+
+    // 2. Miss: query the system
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProcess) return FALSE;
+    char full_path[MAX_PATH];
+    DWORD path_len = MAX_PATH;
+    BOOL ok = FALSE;
     if (QueryFullProcessImageNameA(hProcess, 0, full_path, &path_len)) {
         strncpy(name, full_path, name_size - 1);
         name[name_size - 1] = '\0';
-        CloseHandle(hProcess); return TRUE;
+        ok = TRUE;
+
+        // 3. Store into cache: refresh the slot for this pid, else reuse the
+        //    oldest/empty slot (simple LRU-ish replacement).
+        EnterCriticalSection(&lock_cs);
+        int slot = -1;
+        int oldest_slot = 0;
+        DWORD oldest_ts = 0xFFFFFFFF;
+        for (int i = 0; i < PROCESS_NAME_CACHE_SIZE; i++) {
+            PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[i];
+            if (e->pid == pid) { slot = i; break; }
+            if (!e->name[0]) { slot = i; break; }
+            if (e->timestamp < oldest_ts) { oldest_ts = e->timestamp; oldest_slot = i; }
+        }
+        if (slot < 0) slot = oldest_slot;
+        PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[slot];
+        e->pid = pid;
+        e->timestamp = now;
+        strncpy(e->name, full_path, MAX_PROCESS_NAME - 1);
+        e->name[MAX_PROCESS_NAME - 1] = '\0';
+        LeaveCriticalSection(&lock_cs);
     }
-    CloseHandle(hProcess); return FALSE;
+    CloseHandle(hProcess);
+    return ok;
 }
 
 // [Preserved] IP/Port Pattern matching logic
