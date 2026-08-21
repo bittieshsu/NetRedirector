@@ -26,6 +26,7 @@ from i18n import i18n as tr, SUPPORTED_LANGS
 import network_utils
 import proxy_core
 import secure_config  # [新增] 密碼 DPAPI 加密儲存
+import rule_utils  # [模組化] 規則欄位處理 (全形星號正規化等)
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 # ... (check_proxy_connection 函式保持不變，省略以節省篇幅) ...
@@ -463,9 +464,9 @@ class MainWindow(QMainWindow):
                 # 呼叫 DLL
                 rid = 0
                 # [Fixed] 正規化設定檔中可能存在的全形星號 (U+FF0A)
-                target = r['target'].replace('\uFF0A', '*')
-                hosts = r.get('hosts', '*').replace('\uFF0A', '*')
-                ports = r.get('ports', '*').replace('\uFF0A', '*')
+                target = rule_utils.normalize_rule_target(r['target'])
+                hosts = rule_utils.normalize_rule_pattern(r.get('hosts'))
+                ports = rule_utils.normalize_rule_pattern(r.get('ports'))
                 
                 if r['type'] == 'PID':
                     if target.isdigit():
@@ -1030,10 +1031,10 @@ class MainWindow(QMainWindow):
 
     def save_rule_action(self):
         # [Fixed] 正規化全形星號 (U+FF0A) 為半形，避免中文輸入法產生的規則永不匹配
-        target = self.ent_target.text().strip().replace('\uFF0A', '*')
+        target = rule_utils.normalize_rule_target(self.ent_target.text())
         if not target: return
-        hosts = self.ent_hosts.text().strip().replace('\uFF0A', '*') or "*"
-        ports = self.ent_ports.text().strip().replace('\uFF0A', '*') or "*"
+        hosts = rule_utils.normalize_rule_pattern(self.ent_hosts.text())
+        ports = rule_utils.normalize_rule_pattern(self.ent_ports.text())
         proto_str = self.combo_proto.currentText()
         protocol = RuleProtocol.BOTH
         if proto_str == "TCP": protocol = RuleProtocol.TCP
