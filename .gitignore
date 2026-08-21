@@ -1,16 +1,28 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+*.egg-info/
 
-# Packaged builds
-IntegratedApp.dist/
-NetRedirector2-v1.0.0-win64.zip
-NetRedirector2-v1.1.0-win64.zip
-NetRedirector2-v1.2.0-win64.zip
+# C build artifacts (MSVC output from NetRedirector/build_dll.bat)
+/NetRedirector/*.obj
+/NetRedirector/NetRedirector.exp
+/NetRedirector/NetRedirector.lib
+/NetRedirector/NetRedirector.dll
+/NetRedirector.dll
+
+# Nuitka build output
+/IntegratedApp.build/
+/IntegratedApp.dist/
+/IntegratedApp.dist.*/
+/IntegratedApp.onefile-build/
+/IntegratedApp.onefile-dist/
+
+# Release packages (old zips live in releases/)
+/releases/
 NetRedirector-v*-win64.zip
-# Packaged build leftovers
-IntegratedApp.dist.*/
+NetRedirector2-v*-win64.zip
+
 # Nuitka crash reports / misc junk
 nuitka-crash-report.xml
 query
