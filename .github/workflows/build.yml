@@ -36,6 +36,17 @@ jobs:
           python -c "import ast; ast.parse(open('IntegratedApp.py', encoding='utf-8').read()); print('syntax OK')"
           python -c "import i18n, network_utils, proxy_core, secure_config, NetRedirector; print('modules import OK')"
 
+      # Python 單元測試 (pytest)
+      - name: Python unit tests
+        shell: pwsh
+        run: |
+          python -m pytest tests/ -q
+
+      # C 核心單元測試 (連結原始碼的測試 EXE)
+      - name: C core tests
+        shell: pwsh
+        run: ./NetRedirector/tests/run_tests.ps1
+
       # 統一建置腳本: 編譯 C DLL 並複製到根目錄
       - name: Compile C DLL
         shell: pwsh
