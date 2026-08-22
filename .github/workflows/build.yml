@@ -26,7 +26,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
 
       # 語法檢查 + 模組匯入 smoke test (免啟動 GUI)
       - name: Smoke test (syntax + imports)

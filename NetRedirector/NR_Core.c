@@ -24,11 +24,26 @@ static void swap_addr_bytes(int family, UINT8 *a, UINT8 *b)
 
 // === Packet Processor (WinDivert) ===
 
-DWORD WINAPI packet_processor(LPVOID arg)
+// [Added] WinDivertSend with error logging. A failed injection silently drops
+// the packet; for the NAT-rewritten flows (returning/relay branches) a dropped
+// packet means the rewrite is lost, so at least leave a trace. Rate-limited to
+// avoid log storms under packet floods.
+static void send_packet_checked(const unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr, const char *what)
 {
-    unsigned char packet[MAXBUF];
-    UINT packet_len;
-    WINDIVERT_ADDRESS addr;
+    if (WinDivertSend(windivert_handle, packet, packet_len, NULL, addr)) return;
+    static volatile LONG send_fail_count = 0;
+    LONG n = InterlockedIncrement(&send_fail_count);
+    if (n == 1 || n % 100 == 0) {
+        log_message("WinDivertSend failed (%s), error=%lu (occurrence %ld)",
+            what, GetLastError(), n);
+    }
+}
+
+// [Added] Per-packet NAT/rule processing, extracted verbatim from the old
+// packet_processor loop body (the `continue`s became `return`s). Runs on a
+// flow worker thread - or inline on the receiver when its queue is full.
+static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr)
+{
     PWINDIVERT_IPHDR ip_header;
     PWINDIVERT_IPV6HDR ipv6_header;
     PWINDIVERT_TCPHDR tcp_header;
@@ -37,97 +52,83 @@ DWORD WINAPI packet_processor(LPVOID arg)
     UINT8 *dst_addr;
     int family;
 
-    while (running)
-    {
-        if (!WinDivertRecv(windivert_handle, packet, sizeof(packet), &packet_len, &addr)) {
-            DWORD error = GetLastError();
-            
-            // [修正重點] 過濾 995 (ERROR_OPERATION_ABORTED) 和 6 (ERROR_INVALID_HANDLE)
-            // 當呼叫 NetRedirector_Stop 時，WinDivertClose 會觸發這些錯誤，這是正常的退出訊號。
-            if (error == ERROR_INVALID_HANDLE || error == 995) {
-                break; // 安靜地退出迴圈
+    WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL, NULL, NULL,
+        &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+
+    if (ip_header != NULL) {
+        family = AF_INET;
+        src_addr = (UINT8*)&ip_header->SrcAddr;
+        dst_addr = (UINT8*)&ip_header->DstAddr;
+    } else if (ipv6_header != NULL) {
+        family = AF_INET6;
+        src_addr = (UINT8*)ipv6_header->SrcAddr;
+        dst_addr = (UINT8*)ipv6_header->DstAddr;
+    } else {
+        return;
+    }
+
+    // --- 以下邏輯對 IPv4 / IPv6 皆適用 (位址統一為 16 bytes) ---
+
+    // UDP Logic
+    if (udp_header != NULL && tcp_header == NULL) {
+        if (addr->Outbound) {
+            // 1. Returning from Relay
+            if (udp_header->SrcPort == htons(LOCAL_UDP_RELAY_PORT)) {
+                UINT16 dst_port = ntohs(udp_header->DstPort);
+                UINT16 orig_dest_port;
+                if (get_udp_dest_port_for_app(dst_port, &orig_dest_port)) {
+                    udp_header->SrcPort = htons(orig_dest_port);
+                    // Swap IPs
+                    swap_addr_bytes(family, src_addr, dst_addr);
+                }
+                addr->Outbound = FALSE; // Inject to App
             }
-            
-            log_message("Failed to receive packet (%lu)", error);
-            continue;
-        }
+            // 2. Tracked Outbound (keyed by src_port + destination: the
+            // socket may send to several destinations)
+            else if (is_connection_tracked_udp(ntohs(udp_header->SrcPort), family, dst_addr)) {
+                UINT16 src_port = ntohs(udp_header->SrcPort);
+                UINT32 proxy_id = 0;
+                get_connection_udp(src_port, family, dst_addr, NULL, &proxy_id);
 
-        WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL, NULL, NULL,
-            &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+                if (proxy_id > 0) {
+                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                    // Swap IPs
+                    swap_addr_bytes(family, src_addr, dst_addr);
+                    addr->Outbound = FALSE; // Inject to Relay
+                }
+            }
+            // 3. New Connection
+            else {
+                UINT16 src_port = ntohs(udp_header->SrcPort);
+                UINT16 dest_port = ntohs(udp_header->DstPort);
+                UINT32 selected_proxy_id = 0;
+                RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, TRUE, &selected_proxy_id);
 
-        if (ip_header != NULL) {
-            family = AF_INET;
-            src_addr = (UINT8*)&ip_header->SrcAddr;
-            dst_addr = (UINT8*)&ip_header->DstAddr;
-        } else if (ipv6_header != NULL) {
-            family = AF_INET6;
-            src_addr = (UINT8*)ipv6_header->SrcAddr;
-            dst_addr = (UINT8*)ipv6_header->DstAddr;
+                if (action == RULE_ACTION_DIRECT) {
+                    add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, TRUE);
+                } else if (action == RULE_ACTION_BLOCK) {
+                    return; // Drop
+                } else if (action == RULE_ACTION_PROXY) {
+                    add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, TRUE);
+                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                    swap_addr_bytes(family, src_addr, dst_addr);
+                    addr->Outbound = FALSE;
+                }
+            }
         } else {
-            continue;
-        }
-
-        // --- 以下邏輯對 IPv4 / IPv6 皆適用 (位址統一為 16 bytes) ---
-
-        // UDP Logic
-        if (udp_header != NULL && tcp_header == NULL) {
-            if (addr.Outbound) {
-                // 1. Returning from Relay
-                if (udp_header->SrcPort == htons(LOCAL_UDP_RELAY_PORT)) {
-                    UINT16 dst_port = ntohs(udp_header->DstPort);
-                    UINT16 orig_dest_port;
-                    if (get_connection(dst_port, NULL, NULL, &orig_dest_port, NULL, NULL)) {
-                        udp_header->SrcPort = htons(orig_dest_port);
-                        // Swap IPs
-                        swap_addr_bytes(family, src_addr, dst_addr);
-                    }
-                    addr.Outbound = FALSE; // Inject to App
-                }
-                // 2. Tracked Outbound
-                else if (is_connection_tracked(ntohs(udp_header->SrcPort))) {
-                    UINT16 src_port = ntohs(udp_header->SrcPort);
-                    UINT32 proxy_id = 0;
-                    get_connection(src_port, NULL, NULL, NULL, &proxy_id, NULL);
-                    
-                    if (proxy_id > 0) {
-                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-                        // Swap IPs
-                        swap_addr_bytes(family, src_addr, dst_addr);
-                        addr.Outbound = FALSE; // Inject to Relay
-                    }
-                }
-                // 3. New Connection
-                else {
-                    UINT16 src_port = ntohs(udp_header->SrcPort);
-                    UINT16 dest_port = ntohs(udp_header->DstPort);
-                    UINT32 selected_proxy_id = 0;
-                    RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, TRUE, &selected_proxy_id);
-
-                    if (action == RULE_ACTION_DIRECT) {
-                        add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT);
-                    } else if (action == RULE_ACTION_BLOCK) {
-                        continue; // Drop
-                    } else if (action == RULE_ACTION_PROXY) {
-                        add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY);
-                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-                        swap_addr_bytes(family, src_addr, dst_addr);
-                        addr.Outbound = FALSE;
-                    }
-                }
-            } else {
-                if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT)) {
-                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                    continue;
-                }
+            if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT)) {
+                send_packet_checked(packet, packet_len, addr, "udp passthrough");
+                return;
             }
-            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
-            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-            continue;
         }
+        WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
+        send_packet_checked(packet, packet_len, addr, "udp rewritten");
+        return;
+    }
 
         // TCP Logic
         if (tcp_header != NULL) {
-            if (addr.Outbound) {
+            if (addr->Outbound) {
                 // 1. Returning from Local Proxy
                 if (tcp_header->SrcPort == htons(g_local_relay_port)) {
                     UINT16 dst_port = ntohs(tcp_header->DstPort);
@@ -140,7 +141,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         memcpy(dst_addr, src_addr, n);
                         memcpy(src_addr, orig_dest_addr, n);
                     }
-                    addr.Outbound = FALSE;
+                    addr->Outbound = FALSE;
                     if (tcp_header->Fin || tcp_header->Rst) remove_connection(dst_port);
                 }
                 // 2. Tracked Outbound
@@ -148,44 +149,308 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     UINT16 src_port = ntohs(tcp_header->SrcPort);
                     UINT32 proxy_id = 0;
                     get_connection(src_port, NULL, NULL, NULL, &proxy_id, NULL);
-                    
+
                     if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port);
 
                     if (proxy_id > 0) {
                         tcp_header->DstPort = htons(g_local_relay_port);
                         swap_addr_bytes(family, src_addr, dst_addr);
-                        addr.Outbound = FALSE; // Inject to Proxy
+                        addr->Outbound = FALSE; // Inject to Proxy
                     }
                 }
-                // 3. New Connection
-                else {
-                    UINT16 src_port = ntohs(tcp_header->SrcPort);
-                    UINT16 dest_port = ntohs(tcp_header->DstPort);
-                    UINT32 selected_proxy_id = 0;
-                    RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
+            // 3. New Connection
+            else {
+                UINT16 src_port = ntohs(tcp_header->SrcPort);
+                UINT16 dest_port = ntohs(tcp_header->DstPort);
+                UINT32 selected_proxy_id = 0;
+                RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
 
-                    if (action == RULE_ACTION_DIRECT) {
-                        add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT);
-                    } else if (action == RULE_ACTION_BLOCK) {
-                        continue;
-                    } else if (action == RULE_ACTION_PROXY) {
-                        add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY);
-                        tcp_header->DstPort = htons(g_local_relay_port);
-                        swap_addr_bytes(family, src_addr, dst_addr);
-                        addr.Outbound = FALSE;
-                    }
-                }
-            } else {
-                if (tcp_header->DstPort != htons(g_local_relay_port)) {
-                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
-                    continue;
+                if (action == RULE_ACTION_DIRECT) {
+                    add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, FALSE);
+                } else if (action == RULE_ACTION_BLOCK) {
+                    return;
+                } else if (action == RULE_ACTION_PROXY) {
+                    add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, FALSE);
+                    tcp_header->DstPort = htons(g_local_relay_port);
+                    swap_addr_bytes(family, src_addr, dst_addr);
+                    addr->Outbound = FALSE;
                 }
             }
-            WinDivertHelperCalcChecksums(packet, packet_len, &addr, 0);
-            WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+        } else {
+            if (tcp_header->DstPort != htons(g_local_relay_port)) {
+                send_packet_checked(packet, packet_len, addr, "tcp passthrough");
+                return;
+            }
+        }
+        WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
+        send_packet_checked(packet, packet_len, addr, "tcp rewritten");
+    }
+}
+
+// === Flow Dispatch (receiver + workers) ===
+//
+// [Fixed] Previously NUM_PACKET_THREADS threads all blocked in WinDivertRecv
+// on the same handle. WinDivert hands each packet to exactly ONE waiting
+// Recv call, so consecutive packets of the same flow could be picked up by
+// different threads and re-injected in the wrong order (TCP retransmits /
+// fast-retrans, UDP jitter for games).
+//
+// Now a single receiver thread pops packets from WinDivert and dispatches
+// them by a direction-insensitive flow hash: every packet of a flow runs on
+// the same worker in FIFO order, while different flows still process in
+// parallel (the expensive new-connection rule evaluation no longer head-of-
+// line blocks unrelated flows). When a worker queue is full the receiver
+// processes that packet inline - a rare degradation that trades a slight
+// reordering risk under extreme overload for not dropping the packet.
+
+#define FLOW_WORKERS (NUM_PACKET_THREADS - 1)   // thread[0] is the receiver
+#define FLOW_QUEUE_SLOTS 512
+
+C_ASSERT(NUM_PACKET_THREADS >= 2);   // FLOW_WORKERS must be >= 1
+
+typedef struct {
+    unsigned char *pkt;      // heap copy owned by the queue until processed
+    UINT len;
+    WINDIVERT_ADDRESS addr;
+} FLOW_SLOT;
+
+typedef struct {
+    CRITICAL_SECTION lock;   // short push/pop critical sections
+    HANDLE sem;              // tokens == queued items
+    FLOW_SLOT slots[FLOW_QUEUE_SLOTS];
+    int head, tail, count;
+} FLOW_QUEUE;
+
+static FLOW_QUEUE g_flow_queues[FLOW_WORKERS];
+static BOOL g_flow_queues_ready = FALSE;
+
+BOOL flow_queues_init(void)
+{
+    memset(g_flow_queues, 0, sizeof(g_flow_queues));
+    for (int i = 0; i < FLOW_WORKERS; i++) {
+        InitializeCriticalSection(&g_flow_queues[i].lock);
+        g_flow_queues[i].sem = CreateSemaphore(NULL, 0, FLOW_QUEUE_SLOTS, NULL);
+        if (g_flow_queues[i].sem == NULL) {
+            for (int j = 0; j < i; j++) {
+                CloseHandle(g_flow_queues[j].sem);
+                DeleteCriticalSection(&g_flow_queues[j].lock);
+            }
+            return FALSE;
+        }
+    }
+    g_flow_queues_ready = TRUE;
+    return TRUE;
+}
+
+// Drain and release every queue. Only valid after the receiver and all
+// workers have been joined (Stop / Start-failure paths).
+void flow_queues_shutdown(void)
+{
+    if (!g_flow_queues_ready) return;
+    g_flow_queues_ready = FALSE;
+    for (int i = 0; i < FLOW_WORKERS; i++) {
+        FLOW_QUEUE *q = &g_flow_queues[i];
+        while (q->count > 0) {
+            free(q->slots[q->head].pkt);
+            q->head = (q->head + 1) % FLOW_QUEUE_SLOTS;
+            q->count--;
+        }
+        CloseHandle(q->sem);
+        DeleteCriticalSection(&q->lock);
+    }
+}
+
+// Direction-insensitive 5-tuple FNV-1a hash: both directions of the same
+// conversation land on the same worker, which also keeps a flow's conntrack
+// entry un-contended.
+static UINT flow_hash(int family, BOOL is_tcp, const UINT8 *src, UINT16 sport, const UINT8 *dst, UINT16 dport)
+{
+    const UINT8 *a, *b;
+    UINT16 pa, pb;
+    int n = (family == AF_INET) ? 4 : 16;
+    int cmp = memcmp(src, dst, n);
+    if (cmp < 0 || (cmp == 0 && sport <= dport)) { a = src; pa = sport; b = dst; pb = dport; }
+    else { a = dst; pa = dport; b = src; pb = sport; }
+
+    UINT32 h = 2166136261u;
+    for (int i = 0; i < n; i++) h = (h ^ a[i]) * 16777619u;
+    h = (h ^ (UINT32)(pa & 0xFF)) * 16777619u;
+    h = (h ^ (UINT32)(pa >> 8)) * 16777619u;
+    for (int i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+    h = (h ^ (UINT32)(pb & 0xFF)) * 16777619u;
+    h = (h ^ (UINT32)(pb >> 8)) * 16777619u;
+    h = (h ^ (is_tcp ? 0xABu : 0xCDu)) * 16777619u;
+    return (UINT)h;
+}
+
+static void dispatch_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADDRESS *addr,
+                            int family, BOOL is_tcp, const UINT8 *src, UINT16 sport,
+                            const UINT8 *dst, UINT16 dport)
+{
+    FLOW_QUEUE *q = &g_flow_queues[flow_hash(family, is_tcp, src, sport, dst, dport) % FLOW_WORKERS];
+
+    unsigned char *copy = (unsigned char*)malloc(packet_len);
+    if (copy != NULL) {
+        memcpy(copy, packet, packet_len);
+        EnterCriticalSection(&q->lock);
+        if (q->count < FLOW_QUEUE_SLOTS) {
+            FLOW_SLOT *slot = &q->slots[q->tail];
+            slot->pkt = copy;
+            slot->len = packet_len;
+            slot->addr = *addr;
+            q->tail = (q->tail + 1) % FLOW_QUEUE_SLOTS;
+            q->count++;
+            LeaveCriticalSection(&q->lock);
+            ReleaseSemaphore(q->sem, 1, NULL);
+            return;
+        }
+        LeaveCriticalSection(&q->lock);
+        free(copy);   // queue full -> fall through to inline processing
+    }
+    process_packet(packet, packet_len, addr);
+}
+
+DWORD WINAPI packet_receiver(LPVOID arg)
+{
+    unsigned char packet[MAXBUF];
+    UINT packet_len;
+    WINDIVERT_ADDRESS addr;
+    PWINDIVERT_IPHDR ip_header;
+    PWINDIVERT_IPV6HDR ipv6_header;
+    PWINDIVERT_TCPHDR tcp_header;
+    PWINDIVERT_UDPHDR udp_header;
+
+    while (running)
+    {
+        if (!WinDivertRecv(windivert_handle, packet, sizeof(packet), &packet_len, &addr)) {
+            DWORD error = GetLastError();
+
+            // [修正重點] 過濾 995 (ERROR_OPERATION_ABORTED) 和 6 (ERROR_INVALID_HANDLE)
+            // 當呼叫 NetRedirector_Stop 時，WinDivertClose 會觸發這些錯誤，這是正常的退出訊號。
+            if (error == ERROR_INVALID_HANDLE || error == 995) {
+                break; // 安靜地退出迴圈
+            }
+
+            log_message("Failed to receive packet (%lu)", error);
+            continue;
+        }
+
+        WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL, NULL, NULL,
+            &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+
+        if (tcp_header == NULL && udp_header == NULL) continue;   // not TCP/UDP (filter guarantees this anyway)
+
+        if (ip_header != NULL) {
+            dispatch_packet(packet, packet_len, &addr, AF_INET, tcp_header != NULL,
+                (const UINT8*)&ip_header->SrcAddr, ntohs(tcp_header ? tcp_header->SrcPort : udp_header->SrcPort),
+                (const UINT8*)&ip_header->DstAddr, ntohs(tcp_header ? tcp_header->DstPort : udp_header->DstPort));
+        } else if (ipv6_header != NULL) {
+            dispatch_packet(packet, packet_len, &addr, AF_INET6, tcp_header != NULL,
+                (const UINT8*)ipv6_header->SrcAddr, ntohs(tcp_header ? tcp_header->SrcPort : udp_header->SrcPort),
+                (const UINT8*)ipv6_header->DstAddr, ntohs(tcp_header ? tcp_header->DstPort : udp_header->DstPort));
         }
     }
     return 0;
+}
+
+DWORD WINAPI flow_worker(LPVOID arg)
+{
+    int index = (int)(LONG_PTR)arg;
+    FLOW_QUEUE *q = &g_flow_queues[index];
+
+    while (running) {
+        // 1 s timeout keeps `running` responsive during shutdown even if the
+        // semaphore/count are momentarily out of sync after a timeout race.
+        WaitForSingleObject(q->sem, 1000);
+
+        unsigned char *pkt = NULL;
+        UINT len = 0;
+        WINDIVERT_ADDRESS addr;
+        BOOL have = FALSE;
+
+        EnterCriticalSection(&q->lock);
+        if (q->count > 0) {
+            FLOW_SLOT *slot = &q->slots[q->head];
+            pkt = slot->pkt;
+            len = slot->len;
+            addr = slot->addr;
+            q->head = (q->head + 1) % FLOW_QUEUE_SLOTS;
+            q->count--;
+            have = TRUE;
+        }
+        LeaveCriticalSection(&q->lock);
+
+        if (have) {
+            process_packet(pkt, len, &addr);
+            free(pkt);
+        }
+    }
+    return 0;
+}
+
+// === Transfer-Socket Registry ===
+// (guarded by lock_connections; acquisitions are tiny push/remove walks and
+// never nest with the conntrack operations)
+//
+// Stop() shuts every registered pair down with SD_BOTH, which unblocks the
+// connection/transfer threads parked in recv() on those sockets. The owning
+// threads then exit on their own and keep closesocket() ownership, so there
+// is no double-close. Registration refuses new entries once stopping began
+// (running == FALSE), preventing a fresh handler from outliving the shutdown.
+
+typedef struct ACTIVE_SOCKET {
+    SOCKET client_socket;
+    SOCKET proxy_socket;
+    struct ACTIVE_SOCKET *next;
+} ACTIVE_SOCKET;
+
+static ACTIVE_SOCKET *g_active_sockets = NULL;
+
+BOOL register_connection_sockets(SOCKET client_socket, SOCKET proxy_socket)
+{
+    BOOL ok = FALSE;
+    EnterCriticalSection(&lock_connections);
+    if (running) {
+        ACTIVE_SOCKET *entry = (ACTIVE_SOCKET*)malloc(sizeof(ACTIVE_SOCKET));
+        if (entry != NULL) {
+            entry->client_socket = client_socket;
+            entry->proxy_socket = proxy_socket;
+            entry->next = g_active_sockets;
+            g_active_sockets = entry;
+            ok = TRUE;
+        }
+    }
+    LeaveCriticalSection(&lock_connections);
+    return ok;
+}
+
+void unregister_connection_sockets(SOCKET client_socket, SOCKET proxy_socket)
+{
+    EnterCriticalSection(&lock_connections);
+    ACTIVE_SOCKET **ptr = &g_active_sockets;
+    while (*ptr != NULL) {
+        if ((*ptr)->client_socket == client_socket && (*ptr)->proxy_socket == proxy_socket) {
+            ACTIVE_SOCKET *entry = *ptr;
+            *ptr = entry->next;
+            free(entry);
+            break;
+        }
+        ptr = &(*ptr)->next;
+    }
+    LeaveCriticalSection(&lock_connections);
+}
+
+void shutdown_all_connections(void)
+{
+    EnterCriticalSection(&lock_connections);
+    while (g_active_sockets != NULL) {
+        ACTIVE_SOCKET *entry = g_active_sockets;
+        g_active_sockets = entry->next;
+        if (entry->client_socket != INVALID_SOCKET) shutdown(entry->client_socket, SD_BOTH);
+        if (entry->proxy_socket != INVALID_SOCKET) shutdown(entry->proxy_socket, SD_BOTH);
+        free(entry);
+    }
+    LeaveCriticalSection(&lock_connections);
 }
 
 // === Cleanup Thread ===
@@ -193,7 +458,17 @@ DWORD WINAPI packet_processor(LPVOID arg)
 DWORD WINAPI cleanup_thread(LPVOID arg)
 {
     while (running) {
-        Sleep(10000);
+        // [Fixed] Was Sleep(10000): a sleeping cleanup thread could wake up
+        // seconds AFTER NetRedirector_Stop finished and call EnterCriticalSection
+        // on an already-deleted lock (Stop closes the handles, DllMain then
+        // calls DeleteCriticalSection). Waiting on the stop event with a 10 s
+        // timeout keeps the periodic sweep but lets Stop wake us immediately.
+        if (g_stop_event != NULL) {
+            if (WaitForSingleObject(g_stop_event, 10000) == WAIT_OBJECT_0) break;
+        } else {
+            Sleep(10000);   // fallback when the event could not be created
+        }
+        if (!running) break;
         DWORD current_time = GetTickCount();
         EnterCriticalSection(&lock_connections);
         CONNECTION_INFO **conn_ptr = &connection_list;
@@ -201,8 +476,8 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
             CONNECTION_INFO *curr = *conn_ptr;
             BOOL remove = FALSE;
             DWORD elapsed = current_time - curr->last_activity;
-            if (elapsed > TCP_TIMEOUT_MS) remove = TRUE;
-            else if (elapsed > UDP_TIMEOUT_MS) remove = TRUE;
+            DWORD timeout = curr->is_udp ? UDP_TIMEOUT_MS : TCP_TIMEOUT_MS;
+            if (elapsed > timeout) remove = TRUE;
 
             if (remove) {
                 *conn_ptr = curr->next;
@@ -212,6 +487,9 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
             }
         }
         LeaveCriticalSection(&lock_connections);
+
+        // Prune expired logged-connection dedup entries (10 minute TTL)
+        prune_logged_connections(current_time, 600000);
     }
     return 0;
 }
@@ -386,11 +664,19 @@ DWORD WINAPI connection_handler(LPVOID arg)
     if (proxy_sock == INVALID_SOCKET) { closesocket(client_sock); return 0; }
 
     // Socket Opts
-    DWORD timeout = 0;
+    // [Fixed] Handshake phase gets a bounded timeout on the proxy socket: a
+    // dead proxy used to park this thread forever in recv() during the
+    // SOCKS5/HTTP handshake (the old code set SO_RCVTIMEO = 0 = infinite).
+    // After the handshake succeeds the timeout is reset to infinite so the
+    // established tunnel tolerates legitimately idle periods.
+    #define PROXY_HANDSHAKE_TIMEOUT_MS 10000
+    DWORD timeout = PROXY_HANDSHAKE_TIMEOUT_MS;
     int opt_val = 1;
     int buf_size = 64 * 1024;
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    DWORD no_timeout = 0;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&no_timeout, sizeof(no_timeout));
     setsockopt(proxy_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(proxy_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
     setsockopt(proxy_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
     setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
@@ -400,7 +686,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_addr.s_addr = resolve_hostname(selected_proxy_config.proxy_ip);
     proxy_addr.sin_port = htons(selected_proxy_config.proxy_port);
-    
+
     // 如果解析失敗 (0)，直接返回
     if (proxy_addr.sin_addr.s_addr == 0) {
         closesocket(client_sock);
@@ -408,7 +694,9 @@ DWORD WINAPI connection_handler(LPVOID arg)
         return 0;
     }
 
-    if (connect(proxy_sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr)) == SOCKET_ERROR) {
+    // [Fixed] Bounded connect: blocking connect() burns ~21 s of SYN retries
+    // on unreachable proxies while the client waits.
+    if (!connect_with_timeout(proxy_sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr), PROXY_HANDSHAKE_TIMEOUT_MS)) {
         closesocket(client_sock); closesocket(proxy_sock); return 0;
     }
     EnableKeepAlive(proxy_sock);
@@ -423,6 +711,11 @@ DWORD WINAPI connection_handler(LPVOID arg)
         closesocket(client_sock); closesocket(proxy_sock); return 0;
     }
 
+    // Tunnel is up: idle-tolerant from here on (browsers keep connections
+    // open for minutes without traffic).
+    setsockopt(proxy_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&no_timeout, sizeof(no_timeout));
+    setsockopt(proxy_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&no_timeout, sizeof(no_timeout));
+
     TRANSFER_CONFIG *c1 = malloc(sizeof(TRANSFER_CONFIG));
     TRANSFER_CONFIG *c2 = malloc(sizeof(TRANSFER_CONFIG));
     if (!c1 || !c2) { closesocket(client_sock); closesocket(proxy_sock); if(c1)free(c1); if(c2)free(c2); return 0; }
@@ -430,13 +723,29 @@ DWORD WINAPI connection_handler(LPVOID arg)
     c1->from_socket = client_sock; c1->to_socket = proxy_sock;
     c2->from_socket = proxy_sock; c2->to_socket = client_sock;
 
-    HANDLE t1 = CreateThread(NULL, 1, transfer_handler, c1, 0, NULL);
-    if (!t1) { closesocket(client_sock); closesocket(proxy_sock); free(c1); free(c2); return 0; }
-    
+    // [Added] Register the pair so Stop() can shutdown() these sockets and
+    // unblock both transfer directions. Registration is refused once Stop has
+    // begun - bail out instead of leaking a thread that outlives the shutdown.
+    if (!register_connection_sockets(client_sock, proxy_sock)) {
+        closesocket(client_sock); closesocket(proxy_sock); free(c1); free(c2); return 0;
+    }
+
+    // [Fixed] dwStackSize=1 was a mistake (rounded up to page granularity);
+    // 0 = use the system default stack size.
+    HANDLE t1 = CreateThread(NULL, 0, transfer_handler, c1, 0, NULL);
+    if (!t1) {
+        unregister_connection_sockets(client_sock, proxy_sock);
+        closesocket(client_sock); closesocket(proxy_sock); free(c1); free(c2); return 0;
+    }
+
     transfer_handler(c2); // Run one direction on this thread
     WaitForSingleObject(t1, INFINITE);
     CloseHandle(t1);
 
+    // Unregister BEFORE closing: once Stop's shutdown-all walk releases the
+    // lock, this pair is already gone and cannot be shutdown() by mistake
+    // after the handle values get recycled.
+    unregister_connection_sockets(client_sock, proxy_sock);
     closesocket(client_sock);
     closesocket(proxy_sock);
     return 0;
@@ -551,8 +860,13 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 UINT8 dest_addr[16];
                 UINT16 dest_port;
                 UINT32 proxy_id;
-                int family;
-                if (get_connection(from_port, &family, dest_addr, &dest_port, &proxy_id, NULL) && family == AF_INET) {
+                // Full-key lookup (app port + true destination IP from the
+                // swapped source address): a socket sending to multiple
+                // destinations must recover the per-destination port/proxy.
+                if (get_connection_udp(from_port, AF_INET, (const UINT8*)&from_addr.sin_addr, &dest_port, &proxy_id)) {
+                    // dest_addr = the true destination (equals the swapped source)
+                    memset(dest_addr, 0, 16);
+                    memcpy(dest_addr, &from_addr.sin_addr, 4);
                     UDP_ASSOCIATION *target_assoc = NULL;
                     EnterCriticalSection(&lock_udp);
                     assoc = udp_associations;
@@ -609,8 +923,9 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 UINT8 dest_addr[16];
                 UINT16 dest_port;
                 UINT32 proxy_id;
-                int family;
-                if (get_connection(from_port, &family, dest_addr, &dest_port, &proxy_id, NULL) && family == AF_INET6) {
+                // Full-key lookup (app port + true destination IP), IPv6 flavor
+                if (get_connection_udp(from_port, AF_INET6, (const UINT8*)&from_addr6.sin6_addr, &dest_port, &proxy_id)) {
+                    memcpy(dest_addr, from_addr6.sin6_addr.s6_addr, 16);
                     UDP_ASSOCIATION *target_assoc = NULL;
                     EnterCriticalSection(&lock_udp);
                     assoc = udp_associations;
@@ -686,7 +1001,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     EnterCriticalSection(&lock_connections);
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
-                        if (conn->family == AF_INET &&
+                        if (conn->is_udp && conn->family == AF_INET &&
                             conn->orig_dest_port == src_port &&
                             memcmp(conn->orig_dest_addr, &src_ip, 4) == 0) {
                             struct sockaddr_in target_addr;
@@ -707,7 +1022,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                             recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
                     }
                 }
-                else if (recv_len > 26 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
+                // SOCKS5 UDP header for IPv6: 4 (RSV/FRAG/ATYP) + 16 (addr) + 2 (port) = 22
+                else if (recv_len > 22 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
                     curr->last_activity = GetTickCount();
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[20]);
                     BOOL matched = FALSE;
@@ -715,7 +1031,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     EnterCriticalSection(&lock_connections);
                     CONNECTION_INFO *conn = connection_list;
                     while (conn != NULL) {
-                        if (conn->family == AF_INET6 &&
+                        if (conn->is_udp && conn->family == AF_INET6 &&
                             conn->orig_dest_port == src_port &&
                             memcmp(conn->orig_dest_addr, &recv_buf[4], 16) == 0) {
                             if (udp_relay_socket6 != INVALID_SOCKET) {
@@ -724,7 +1040,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                                 target_addr6.sin6_family = AF_INET6;
                                 memcpy(&target_addr6.sin6_addr, conn->src_addr, 16);
                                 target_addr6.sin6_port = htons(conn->src_port);
-                                sendto(udp_relay_socket6, (char*)&recv_buf[26], recv_len - 26, 0,
+                                sendto(udp_relay_socket6, (char*)&recv_buf[22], recv_len - 22, 0,
                                     (struct sockaddr *)&target_addr6, sizeof(target_addr6));
                             }
                             matched = TRUE;

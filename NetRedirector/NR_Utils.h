@@ -7,8 +7,14 @@
 // Networking & Strings
 UINT32 parse_ipv4(const char *ip);
 UINT32 resolve_hostname(const char *hostname);
+UINT32 resolve_rule_host(const char *host);   // [Added] DNS-cached hostname resolution for domain rules
+UINT32 resolve_rule_host_cached(const char *host); // [Added] cache-only lookup for the packet-thread match path
+void force_resolve_rule_host(const char *host);    // [Added] unconditional resolve+store for the background refresher
+void refresh_rule_dns(const char *hosts_field);    // [Added] pre-resolve all domain patterns in one rule's hosts field
+void clear_dns_cache(void);                   // [Added] Clear the DNS resolution cache
 const char* extract_filename(const char* path);
 void EnableKeepAlive(SOCKET s);
+BOOL connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, DWORD timeout_ms);   // [Added] bounded connect for proxy dial-outs
 void base64_encode(const char* input, char* output, size_t output_size);
 
 // Process ID & Name Resolution

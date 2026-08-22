@@ -98,6 +98,22 @@ class NetRedirectorWrapper:
             print("[Warning] NetRedirector_AddRuleByPID not found in DLL. PID rules will not work.")
             self._has_pid_support = False
 
+        # --- [新增] 能力探測一次 (GUI 不得再散落 hasattr 檢查) ---
+        self._has_add_rule_with_proxy = hasattr(self.lib, 'NetRedirector_AddRuleWithProxy')
+        if self._has_add_rule_with_proxy:
+            self.lib.NetRedirector_AddRuleWithProxy.argtypes = [c_char_p, c_char_p, c_char_p, c_int, c_int, c_uint32]
+            self.lib.NetRedirector_AddRuleWithProxy.restype = c_uint32
+
+        self._has_edit_rule_with_proxy = hasattr(self.lib, 'NetRedirector_EditRuleWithProxy')
+        if self._has_edit_rule_with_proxy:
+            self.lib.NetRedirector_EditRuleWithProxy.argtypes = [c_uint32, c_char_p, c_char_p, c_char_p, c_int, c_int, c_uint32]
+            self.lib.NetRedirector_EditRuleWithProxy.restype = c_bool
+
+        self._has_delete_rule = hasattr(self.lib, 'NetRedirector_DeleteRule')
+        if self._has_delete_rule:
+            self.lib.NetRedirector_DeleteRule.argtypes = [c_uint32]
+            self.lib.NetRedirector_DeleteRule.restype = c_bool
+
         # 保持對 callback 的引用，防止 Python 垃圾回收機制(GC)將其清除導致 C 端崩潰
         self._log_cb_ref = None
         self._conn_cb_ref = None
@@ -162,6 +178,48 @@ class NetRedirectorWrapper:
             protocol,
             action
         )
+
+    # --- [新增] 高階統一入口:GUI 一律使用以下方法,不得直接呼叫 self.lib ---
+    # 集中處理「PID vs 名稱規則」「協議字串轉換」「DLL 能力 fallback」,
+    # 這些邏輯原本在 load_config / save_rule_action / reapply_all_rules 三處重複。
+
+    @staticmethod
+    def _protocol_from_str(proto_str):
+        if proto_str == "TCP": return RuleProtocol.TCP
+        if proto_str == "UDP": return RuleProtocol.UDP
+        return RuleProtocol.BOTH
+
+    def add_rule_ex(self, rule_type, target, hosts="*", ports="*", proto_str="BOTH", action=0, proxy_id=0):
+        """新增規則 (統一入口)。rule_type: 'PID' 或 'Name'。回傳規則 ID,0 = 失敗。"""
+        protocol = self._protocol_from_str(proto_str)
+        if rule_type == 'PID':
+            # [Fixed] isascii 檔掉全形數字 ('１２３') 與上標數字 ('²'):
+            # str.isdigit() 對它們為 True, 但 int() 可能抛 ValueError
+            t = str(target)
+            if not (t.isascii() and t.isdigit()):
+                return 0
+            return self.add_rule_by_pid(int(t), hosts, ports, protocol, action, int(proxy_id))
+        if self._has_add_rule_with_proxy:
+            return self.lib.NetRedirector_AddRuleWithProxy(
+                str(target).encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'),
+                protocol, action, int(proxy_id))
+        return self.add_rule(str(target), hosts, ports, protocol, action)
+
+    def edit_rule_ex(self, rule_id, target, hosts="*", ports="*", proto_str="BOTH", action=0, proxy_id=0):
+        """原地更新「名稱規則」(保留相同 ID)。回傳 True = 成功。
+        PID 規則或舊版 DLL 不支援時回傳 False,呼叫端自行決定刪除重建。"""
+        if not self._has_edit_rule_with_proxy or rule_id == 0:
+            return False
+        protocol = self._protocol_from_str(proto_str)
+        return bool(self.lib.NetRedirector_EditRuleWithProxy(
+            rule_id, str(target).encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'),
+            protocol, action, int(proxy_id)))
+
+    def delete_rule(self, rule_id):
+        """刪除規則。回傳 True = 刪除成功;DLL 缺此匯出或刪除失敗回傳 False。"""
+        if self._has_delete_rule:
+            return bool(self.lib.NetRedirector_DeleteRule(rule_id))
+        return False
     
     def set_default_proxy(self, ip, port, ptype=ProxyType.SOCKS5, username="", password=""):
         return self.lib.NetRedirector_SetProxyConfig(

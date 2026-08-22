@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Không thể khởi động trình điều khiển. Hãy kiểm tra quyền quản trị viên hoặc tệp trình điều khiển.",
     "權限不足": "Không đủ quyền",
     "請以管理員身分執行！": "Vui lòng chạy với quyền quản trị viên!",
-    "Ping 目標:": "Mục tiêu Ping:"
+    "Ping 目標:": "Mục tiêu Ping:",
+    "Time": "Thời gian",
+    "Process": "Tiến trình",
+    "PID": "PID",
+    "Destination": "Đích",
+    "Info": "Thông tin",
+    "Process Name": "Tên tiến trình",
+    "Hosts:": "Host:",
+    "Ports:": "Cổng:",
+    "Proto:": "Giao thức:",
+    "未指定 (Fallback to Direct)": "Chưa chỉ định (kết nối trực tiếp)"
 }

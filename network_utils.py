@@ -50,6 +50,7 @@ except AttributeError:
 
 # --- 常數定義 ---
 AF_INET = 2
+AF_INET6 = 23  # Windows 上的 AF_INET6 值
 GAA_FLAG_SKIP_ANYCAST = 0x0002
 GAA_FLAG_SKIP_MULTICAST = 0x0004
 GAA_FLAG_SKIP_DNS_SERVER = 0x0008
@@ -155,6 +156,7 @@ def get_system_interfaces():
                 continue
 
             ipv4 = None
+            ipv6 = None
             p_unicast = adapter.FirstUnicastAddress
             
             while p_unicast:
@@ -169,12 +171,23 @@ def get_system_interfaces():
                     if not ip_str.startswith("169.254"):
                         ipv4 = ip_str
                         break
+                elif sockaddr_ptr and sockaddr_ptr.contents.sa_family == AF_INET6:
+                    # [新增] 同時收集 IPv6 位址 (sin6_addr 位於 sockaddr_in6 結構偏移 8)
+                    addr_ptr = cast(ctypes.addressof(sockaddr_ptr.contents) + 8, POINTER(c_ubyte * 16))
+                    try:
+                        ipv6_str = socket.inet_ntop(socket.AF_INET6, bytes(addr_ptr.contents))
+                    except OSError:
+                        ipv6_str = None
+                    # 跳過 fe80:: link-local；其餘 (全域/ULA/Teredo 等) 保留
+                    if ipv6_str and not ipv6_str.startswith("fe80::"):
+                        ipv6 = ipv6_str
                         
                 p_unicast = unicast.Next
 
             if ipv4:
                 interfaces[name] = {
                     'ipv4': ipv4,
+                    'ipv6': ipv6,
                     'connected': (adapter.OperStatus == IF_OPER_STATUS_UP),
                     'is_vpn': check_is_vpn(name) or check_is_vpn(desc)
                 }

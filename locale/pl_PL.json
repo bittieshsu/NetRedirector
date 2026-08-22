@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Nie można uruchomić sterownika. Sprawdź uprawnienia administratora lub plik sterownika.",
     "權限不足": "Niewystarczające uprawnienia",
     "請以管理員身分執行！": "Uruchom jako administrator!",
-    "Ping 目標:": "Cel Ping:"
+    "Ping 目標:": "Cel Ping:",
+    "Time": "Czas",
+    "Process": "Proces",
+    "PID": "PID",
+    "Destination": "Cel",
+    "Info": "Info",
+    "Process Name": "Nazwa procesu",
+    "Hosts:": "Hosty:",
+    "Ports:": "Porty:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Nieokreślony (połączenie bezpośrednie)"
 }

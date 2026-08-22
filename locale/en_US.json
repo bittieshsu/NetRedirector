@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Failed to start driver. Check admin privileges or driver file.",
     "權限不足": "Insufficient Privileges",
     "請以管理員身分執行！": "Please run as Administrator!",
-    "Ping 目標:": "Ping Target:"
+    "Ping 目標:": "Ping Target:",
+    "Time": "Time",
+    "Process": "Process",
+    "PID": "PID",
+    "Destination": "Destination",
+    "Info": "Info",
+    "Process Name": "Process Name",
+    "Hosts:": "Hosts:",
+    "Ports:": "Ports:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Unspecified (Fallback to Direct)"
 }

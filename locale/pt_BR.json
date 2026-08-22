@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Não foi possível iniciar o driver. Verifique as permissões de administrador ou o arquivo do driver.",
     "權限不足": "Privilégios insuficientes",
     "請以管理員身分執行！": "Execute como administrador!",
-    "Ping 目標:": "Alvo de Ping:"
+    "Ping 目標:": "Alvo de Ping:",
+    "Time": "Hora",
+    "Process": "Processo",
+    "PID": "PID",
+    "Destination": "Destino",
+    "Info": "Info",
+    "Process Name": "Nome do processo",
+    "Hosts:": "Hosts:",
+    "Ports:": "Portas:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Não especificado (conexão direta)"
 }

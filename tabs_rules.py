@@ -33,9 +33,11 @@ class RulesTabMixin:
         
         row1 = QHBoxLayout()
         self.bg_rule_type = QButtonGroup()
-        self.rb_name = QRadioButton("Process Name")
+        self.rb_name = QRadioButton("")
+        self._reg("text", self.rb_name, "Process Name")   # [i18n] 表單標籤
         self.rb_name.setChecked(True)
         self.rb_pid = QRadioButton("PID")
+        self._reg("text", self.rb_pid, "PID")
         self.bg_rule_type.addButton(self.rb_name, 0)
         self.bg_rule_type.addButton(self.rb_pid, 1)
         self.ent_target = QLineEdit()
@@ -60,11 +62,17 @@ class RulesTabMixin:
         self.combo_proto = QComboBox()
         self.combo_proto.addItems(["BOTH", "TCP", "UDP"])
         self.combo_proto.setFixedWidth(80)
-        row2.addWidget(QLabel("Hosts:"))
+        lbl_hosts = QLabel("")
+        self._reg("text", lbl_hosts, "Hosts:")   # [i18n] 表單標籤
+        row2.addWidget(lbl_hosts)
         row2.addWidget(self.ent_hosts)
-        row2.addWidget(QLabel("Ports:"))
+        lbl_ports = QLabel("")
+        self._reg("text", lbl_ports, "Ports:")
+        row2.addWidget(lbl_ports)
         row2.addWidget(self.ent_ports)
-        row2.addWidget(QLabel("Proto:"))
+        lbl_proto = QLabel("")
+        self._reg("text", lbl_proto, "Proto:")
+        row2.addWidget(lbl_proto)
         row2.addWidget(self.combo_proto)
         row2.addStretch()
         form_layout.addLayout(row2)
@@ -163,6 +171,21 @@ class RulesTabMixin:
         self.combo_action.setCurrentIndex(0)
         self.update_form_titles()
 
+    def _proxy_stable_name(self, proxy_id):
+        """從 combo 的 itemData (代理 ID) 反推穩定識別, 加命名空間前綴:
+        自訂代理 → "custom:名稱", Hub → "hub:端口"。前綴避免「自訂代理名稱
+        恰為端口數字」時劫走 Hub 規則;與顯示文字 (可被翻譯) 脫鉤。
+        舊版 config 的無前綴值由 _resolve_proxy 向下相容。"""
+        if not proxy_id:
+            return ""
+        for p in self.custom_proxies:
+            if p['id'] == proxy_id:
+                return f"custom:{p['name']}"
+        for port, pid in self.hub_proxy_map.items():
+            if pid == proxy_id:
+                return f"hub:{port}"
+        return ""
+
     def save_rule_action(self):
         # [Fixed] 正規化全形星號 (U+FF0A) 為半形，避免中文輸入法產生的規則永不匹配
         target = rule_utils.normalize_rule_target(self.ent_target.text())
@@ -170,16 +193,17 @@ class RulesTabMixin:
         hosts = rule_utils.normalize_rule_pattern(self.ent_hosts.text())
         ports = rule_utils.normalize_rule_pattern(self.ent_ports.text())
         proto_str = self.combo_proto.currentText()
-        protocol = RuleProtocol.BOTH
-        if proto_str == "TCP": protocol = RuleProtocol.TCP
-        elif proto_str == "UDP": protocol = RuleProtocol.UDP
-
         is_pid = self.rb_pid.isChecked()
+        if is_pid and not (target.isascii() and target.isdigit()):
+            # [Fixed] isascii 檔掉全形數字 ('１２３') 與上標數字 ('²') —
+            # isdigit() 對它們為 True 但 int() 可能抛 ValueError
+            QMessageBox.warning(self, self.t("錯誤"), self.t("PID 需為數字"))
+            return
         action_idx = self.combo_action.currentIndex()
         action_text = self.combo_action.currentText()
-        pid_proxy = self.combo_proxy.currentData() or 0
-        pid_proxy = int(pid_proxy)
+        pid_proxy = int(self.combo_proxy.currentData() or 0)
         proxy_text = self.combo_proxy.currentText()
+        proxy_name = self._proxy_stable_name(pid_proxy)
         was_edit = self.editing_rule_id is not None
 
         # [改進] 編輯規則時優先「原地更新」(EditRuleWithProxy 保留相同 ID)，
@@ -189,44 +213,22 @@ class RulesTabMixin:
         if was_edit:
             old_rule = next((r for r in self.rules if r['id'] == self.editing_rule_id), None)
             old_is_pid = bool(old_rule and old_rule.get('type') == 'PID')
-            edit_fn = getattr(self.bridge.lib, 'NetRedirector_EditRuleWithProxy', None)
 
-            if edit_fn is not None and not is_pid and not old_is_pid:
-                ok = edit_fn(
-                    self.editing_rule_id,
-                    target.encode('utf-8'),
-                    hosts.encode('utf-8'),
-                    ports.encode('utf-8'),
-                    protocol,
-                    action_idx,
-                    pid_proxy,
-                )
-                if ok:
+            if not is_pid and not old_is_pid:
+                if self.bridge.edit_rule_ex(self.editing_rule_id, target, hosts, ports, proto_str, action_idx, pid_proxy):
                     rid = self.editing_rule_id  # ID 不變，原地生效
                 else:
                     # 原地更新失敗 → 回退為刪除+重建
-                    self.bridge.lib.NetRedirector_DeleteRule(self.editing_rule_id)
+                    self.bridge.delete_rule(self.editing_rule_id)
                     self.rules = [r for r in self.rules if r['id'] != self.editing_rule_id]
             else:
-                if hasattr(self.bridge.lib, 'NetRedirector_DeleteRule'):
-                    self.bridge.lib.NetRedirector_DeleteRule(self.editing_rule_id)
+                self.bridge.delete_rule(self.editing_rule_id)
                 self.rules = [r for r in self.rules if r['id'] != self.editing_rule_id]
                 logging.info(f"正在更新規則 ID {self.editing_rule_id} -> 先行刪除")
 
         if rid == 0:
-            if is_pid:
-                if not target.isdigit():
-                    QMessageBox.warning(self, self.t("錯誤"), self.t("PID 需為數字"))
-                    return
-                rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, pid_proxy)
-            else:
-                if hasattr(self.bridge.lib, 'NetRedirector_AddRuleWithProxy'):
-                     rid = self.bridge.lib.NetRedirector_AddRuleWithProxy(
-                        target.encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'), protocol, action_idx, pid_proxy
-                    )
-                else:
-                    rid = self.bridge.add_rule(target, hosts, ports, protocol, action_idx)
-        
+            rid = self.bridge.add_rule_ex('PID' if is_pid else 'Name', target, hosts, ports, proto_str, action_idx, pid_proxy)
+
         if rid > 0:
             new_rule = {
                 'id': rid,
@@ -237,7 +239,9 @@ class RulesTabMixin:
                 'proto': proto_str,
                 'action': action_text,
                 'action_key': action_idx,
-                'proxy': proxy_text
+                'proxy': proxy_text,
+                'proxy_name': proxy_name,
+                'proxy_id': pid_proxy   # [Fixed] 最後已知 ID: 供刪除代理時重刷規則
             }
             if was_edit and rid == self.editing_rule_id:
                 # 原地更新：取代對應項目，保持 ID 不變
@@ -254,7 +258,7 @@ class RulesTabMixin:
         row = self.table_rules.currentRow()
         if row < 0: return
         rid = int(self.table_rules.item(row, 0).text())
-        self.bridge.lib.NetRedirector_DeleteRule(rid)
+        self.bridge.delete_rule(rid)
         self.rules = [r for r in self.rules if r['id'] != rid]
         self.refresh_rules_table()
 

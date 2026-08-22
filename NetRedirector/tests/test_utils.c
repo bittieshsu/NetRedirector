@@ -1,10 +1,15 @@
-﻿// --- TEMPORARY-ISH test: NR_Utils 純函式 (字串/位址/比對) ---
+// --- TEMPORARY-ISH test: NR_Utils 純函式 (字串/位址/比對) ---
 #include "test_framework.h"
 #include "NR_Utils.h"
 
 int main(void)
 {
     init_locks();
+
+    // getaddrinfo() (used by resolve_rule_host / resolve_hostname for real
+    // hostnames) requires Winsock to be initialized.
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
 
     printf("== parse_ipv4 ==\n");
     CHECK(parse_ipv4("192.168.1.1") == 0x0101A8C0, "192.168.1.1 -> 0x0101A8C0");
@@ -53,6 +58,25 @@ int main(void)
     CHECK(match_ip_pattern("8.8.8.8", 0x08080808) == TRUE, "exact match");
     CHECK(match_ip_pattern("1.2.*.4", 0x04050201) == TRUE, "octet wildcard match");
     CHECK(match_ip_pattern("1.2.3.4", 0x08080808) == FALSE, "mismatch");
+
+    printf("== match_ip_pattern (domain rules) ==\n");
+    // [Modified] 封包執行緒的比對路徑現在只讀快取 (絕不呼叫 getaddrinfo):
+    // 先用 resolve_rule_host / refresh_rule_dns 把快取填好再比對。
+    CHECK(resolve_rule_host("localhost") == 0x0100007F, "resolve_rule_host('localhost') resolves");
+    CHECK(resolve_rule_host("localhost") == 0x0100007F, "resolve_rule_host cached (2nd call)");
+    CHECK(match_ip_pattern("localhost", 0x0100007F) == TRUE, "primed 'localhost' matches 127.0.0.1");
+    CHECK(match_ip_pattern("*.localhost", 0x0100007F) == TRUE, "'*.localhost' -> strip '*.' -> same cache key");
+    CHECK(match_ip_pattern("localhost", 0x08080808) == FALSE, "'localhost' != 8.8.8.8");
+    CHECK(match_ip_pattern("*.8.8.8.8", 0x08080808) == TRUE, "'*.8.8.8.8' still octet wildcard (IP-like)");
+    CHECK(resolve_rule_host("no-such-host-zzz.invalid") == 0, "unresolvable domain -> resolve fails");
+    CHECK(match_ip_pattern("no-such-host-zzz.invalid", 0x08080808) == FALSE, "cached failure -> no match");
+
+    clear_dns_cache();
+    CHECK(match_ip_pattern("localhost", 0x0100007F) == FALSE, "cache miss -> no match (match path never resolves)");
+    CHECK(resolve_rule_host_cached("localhost") == 0, "resolve_rule_host_cached after clear -> miss");
+    refresh_rule_dns("*.localhost; 8.8.8.8; *");   // 只應解析 localhost (其餘為 IP/萬用)
+    CHECK(match_ip_pattern("localhost", 0x0100007F) == TRUE, "refresh_rule_dns re-primes the cache");
+    CHECK(resolve_rule_host_cached("localhost") == 0x0100007F, "force-resolve stored the entry");
 
     printf("== match_port_pattern ==\n");
     CHECK(match_port_pattern("*", 12345) == TRUE, "'*' matches");

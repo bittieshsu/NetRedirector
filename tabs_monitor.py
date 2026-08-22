@@ -31,7 +31,7 @@ class MonitorTabMixin:
         cols = ["Time", "Process", "PID", "Destination", "Info"]
         self.tree_traffic = QTableWidget()
         self.tree_traffic.setColumnCount(len(cols))
-        self.tree_traffic.setHorizontalHeaderLabels(cols)
+        self._reg("headers", self.tree_traffic, cols)   # [i18n] 表頭也走語系檔
         self.tree_traffic.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.tree_traffic.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_traffic.customContextMenuRequested.connect(self.show_traffic_menu)
@@ -91,17 +91,62 @@ class MonitorTabMixin:
         else: self.rb_name.setChecked(True)
 
 # [新增] 強制重刷規則到 DLL (解決啟動後規則不生效的問題)
+    def _resolve_proxy(self, rule):
+        """把規則的代理參照解析成 (proxy_id, 顯示文字)。
+
+        優先用穩定識別 proxy_name ("custom:名稱" / "hub:端口", 新格式;
+        舊版無前綴值向下相容 — custom 先、hub 後);再退回比對顯示字串。
+        代理已被刪除時回傳 (0, 原字串), 讓呼叫端決定後續 (直連/轉換)。
+        """
+        proxy_name = rule.get('proxy_name', '')
+        if proxy_name:
+            if proxy_name.startswith('custom:'):
+                want = proxy_name[7:]
+                for p in self.custom_proxies:
+                    if p['name'] == want:
+                        return p['id'], f"[Custom] {p['name']}"
+            elif proxy_name.startswith('hub:'):
+                want = proxy_name[4:]
+                for port, pid in self.hub_proxy_map.items():
+                    if str(port) == want:
+                        return pid, f"[Hub] Local Port {port}"
+            else:
+                # 舊版無前綴: 沿用舊行為 (custom 名稱先比, 再比 hub 端口)
+                for p in self.custom_proxies:
+                    if p['name'] == proxy_name:
+                        return p['id'], f"[Custom] {p['name']}"
+                for port, pid in self.hub_proxy_map.items():
+                    if str(port) == proxy_name:
+                        return pid, f"[Hub] Local Port {port}"
+        proxy_text = rule.get('proxy', '')
+        idx = self.combo_proxy.findText(proxy_text)
+        if idx >= 0:
+            return int(self.combo_proxy.itemData(idx) or 0), proxy_text
+        return 0, proxy_text
+
     def _rule_proxy_id(self, rule):
-        combo_idx = self.combo_proxy.findText(rule['proxy'])
-        if combo_idx >= 0:
-            return int(self.combo_proxy.itemData(combo_idx))
-        return 0
+        """規則引用的代理 ID。
+
+        快路徑: 記錄的最後已知 proxy_id 仍然有效 (該代理存在且 ID 相同)
+        就直接用 — 特別是「代理已刪除」情境, 名稱解析已落空, 但重刷邏輯
+        需要靠這個舊 ID 找出受影響的規則。
+        """
+        last = rule.get('proxy_id')
+        if last:
+            for p in self.custom_proxies:
+                if p['id'] == last:
+                    return last
+            for _port, pid in self.hub_proxy_map.items():
+                if pid == last:
+                    return last
+        return self._resolve_proxy(rule)[0]
 
     def reapply_all_rules(self, only_proxy_id=None):
         if not self.rules:
             return
 
-        # 若指定 only_proxy_id，只重刷引用該代理的規則（例如編輯代理後 ID 變更時）
+        # 若指定 only_proxy_id，只重刷引用該代理的規則（例如刪除代理後；
+        # 此時名稱解析已失效, 靠 rule 內記錄的最後已知 proxy_id 找出目標）
         if only_proxy_id is not None:
             target_rules = [r for r in self.rules if self._rule_proxy_id(r) == only_proxy_id]
         else:
@@ -110,66 +155,48 @@ class MonitorTabMixin:
             return
 
         self.append_log("正在重新套用所有規則以確保生效...")
-        
+
         # 為了避免在迭代時修改列表導致問題，我們建立一個暫存的新列表
         refreshed_rules = []
-        
+
         for r in self.rules:
             if r not in target_rules:
                 refreshed_rules.append(r)
                 continue
-            
+
             old_id = r['id']
-            
+
             # 1. 先嘗試刪除舊的 (如果存在)
             # 注意：如果 DLL 在 Start 時清空了內部列表，這步可能無效但無害
-            if hasattr(self.bridge.lib, 'NetRedirector_DeleteRule'):
-                try:
-                    self.bridge.lib.NetRedirector_DeleteRule(old_id)
-                except:
-                    pass
+            self.bridge.delete_rule(old_id)
 
-            # 2. 準備參數重新加入
-            target = r['target']
-            hosts = r.get('hosts', '*')
-            ports = r.get('ports', '*')
-            
-            # 還原 Protocol 枚舉
-            proto_str = r.get('proto', 'BOTH')
-            protocol = RuleProtocol.BOTH
-            if proto_str == "TCP": protocol = RuleProtocol.TCP
-            elif proto_str == "UDP": protocol = RuleProtocol.UDP
+            # 2. 重新解析 Proxy ID (ID 可能在重啟/代理重刷後變更)
+            proxy_id, _display = self._resolve_proxy(r)
 
-            # 還原 Action 與 Proxy
-            # 注意：我們需要重新查找 Proxy ID，因為如果 Proxy 也重刷了，ID 可能會變
-            # 但在此修正案中，我們假設 Proxy Config 在 Start 前載入是有效的 (通常 Proxy Config 不依賴驅動 Handle)
-            # 如果 Proxy 也失效，這裡需要類似邏輯處理 Proxy，但通常只有 Rule 需要。
-            
-            action_idx = self._rule_action_idx(r)
-            
-            # 嘗試從 UI 文字找回 Proxy ID (因為 ID 可能在重啟程式後變更)
-            # [修正] 若代理已被刪除/重新加入，這裡會解析到最新的 ID，讓新帳密立即生效
-            proxy_id = self._rule_proxy_id(r)
+            # [Fixed] 引用的代理已不存在: 核心對「PROXY 動作 + proxy_id=0」
+            # 的行為是直接斷線 (黑洞), 因此把規則轉為直連並明確告知,
+            # 而不是讓它指向失效 ID 或以 PROXY+0 重灌
+            if proxy_id == 0 and r.get('proxy_id') and self._rule_action_idx(r) == 0:
+                r['action_key'] = 1
+                r['action'] = 'DIRECT (直連)'
+                r['proxy_name'] = ''
+                r['proxy'] = self.t("未指定 (Fallback to Direct)")
+                self.append_log(f"規則 '{r['target']}' 引用的代理已不存在，已轉為直連")
 
-            # 3. 呼叫 DLL 加入規則 (這會觸發 UpdateFilter)
-            new_rid = 0
-            if r['type'] == 'PID':
-                new_rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, int(proxy_id))
-            else:
-                if hasattr(self.bridge.lib, 'NetRedirector_AddRuleWithProxy'):
-                    new_rid = self.bridge.lib.NetRedirector_AddRuleWithProxy(
-                        target.encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'), protocol, action_idx, int(proxy_id)
-                    )
-                else:
-                    new_rid = self.bridge.add_rule(target, hosts, ports, protocol, action_idx)
+            r['proxy_id'] = proxy_id
+
+            # 3. 呼叫 DLL 加入規則 (統一入口,這會觸發 UpdateFilter)
+            new_rid = self.bridge.add_rule_ex(
+                r['type'], r['target'], r.get('hosts', '*'), r.get('ports', '*'),
+                r.get('proto', 'BOTH'), self._rule_action_idx(r), int(proxy_id))
 
             # 4. 更新規則資料中的 ID
             if new_rid > 0:
                 r['id'] = new_rid
                 refreshed_rules.append(r)
-                logging.debug(f"規則 '{target}' 已重刷，新 ID: {new_rid}")
+                logging.debug(f"規則 '{r['target']}' 已重刷，新 ID: {new_rid}")
             else:
-                self.append_log(f"[錯誤] 無法重刷規則: {target}")
+                self.append_log(f"[錯誤] 無法重刷規則: {r['target']}")
                 # 即使失敗也保留舊資料，避免介面清空
                 refreshed_rules.append(r)
 

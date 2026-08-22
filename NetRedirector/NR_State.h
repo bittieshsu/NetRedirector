@@ -12,9 +12,14 @@ extern UDP_ASSOCIATION *udp_associations;
 // proxy_configs is already extern in NR_Common.h
 
 // === Connection Tracking ===
-void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action);
-BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action);
-BOOL is_connection_tracked(UINT16 src_port);
+// TCP entries: keyed by src_port. UDP entries: keyed by (src_port + family +
+// orig destination) so one app socket can talk to multiple destinations.
+void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action, BOOL is_udp);
+BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action);       // TCP lookup
+BOOL is_connection_tracked(UINT16 src_port);                                    // TCP lookup
+BOOL get_connection_udp(UINT16 src_port, int family, const UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id);   // UDP full-key lookup
+BOOL is_connection_tracked_udp(UINT16 src_port, int family, const UINT8 *dest_addr);                                 // UDP full-key lookup
+BOOL get_udp_dest_port_for_app(UINT16 src_port, UINT16 *dest_port);             // UDP relay->app response rewrite
 void remove_connection(UINT16 src_port);
 void clear_connections(); // New helper
 
@@ -22,6 +27,7 @@ void clear_connections(); // New helper
 BOOL is_connection_already_logged(DWORD pid, int family, const UINT8 *dest_addr, UINT16 dest_port, RuleAction action);
 void add_logged_connection(DWORD pid, int family, const UINT8 *dest_addr, UINT16 dest_port, RuleAction action);
 void clear_logged_connections();
+void prune_logged_connections(DWORD now_ms, DWORD ttl_ms);
 
 // === Proxy Config Management ===
 PROXY_CONFIG* get_proxy_by_id(UINT32 proxy_id);

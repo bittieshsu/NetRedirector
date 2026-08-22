@@ -32,3 +32,12 @@ NetRedirector2-v*-win64.zip
 # Nuitka crash reports / misc junk
 nuitka-crash-report.xml
 query
+
+# 使用者本機設定 (含個人代理組態與 DPAPI 加密密碼,不得進版控或發佈包)
+# 範本請見 config.example.json
+config.json
+config.json.tmp
+config.json.corrupt.bak
+
+# pytest
+.pytest_cache/

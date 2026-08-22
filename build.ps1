@@ -107,21 +107,35 @@ if (-not $NoDll) {
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
     Write-Host "  執行 cl: $($dllSrc -join ' ')" -ForegroundColor Gray
-    $process = Start-Process -FilePath $batPath -WorkingDirectory $dllDir -NoNewWindow -Wait -PassThru
+    # [Fixed] 改用 cmd /c 同步執行: Start-Process -Wait 在部分環境會在子程序
+    # 結束後仍不返回 (編譯已完成但腳本永久卡住), cmd /c 由 PowerShell 直接
+    # 等待、結束碼經 $LASTEXITCODE 取得, 行為穩定且輸出即時。
+    Push-Location $dllDir
+    try {
+        & cmd.exe /c $batPath
+        $dllExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
     Remove-Item $batPath -Force -ErrorAction SilentlyContinue
 
-    if ($process.ExitCode -ne 0) {
-        Write-Error "DLL 編譯失敗 (exit code: $($process.ExitCode))"
+    if ($dllExitCode -ne 0) {
+        Write-Error "DLL 編譯失敗 (exit code: $dllExitCode)"
         exit 1
     }
 
-    # 複製 DLL 到專案根目錄 (若被執行中的應用程式鎖定，提示後不中斷)
+    # 複製 DLL 到專案根目錄 (若被執行中的應用程式鎖定，提示後處理)
     try {
         Copy-Item "$dllDir\NetRedirector.dll" "NetRedirector.dll" -Force -ErrorAction Stop
         Write-Host "  DLL 編譯成功！已複製到 NetRedirector.dll" -ForegroundColor Green
     } catch {
-        Write-Warning "  DLL 已編譯，但無法覆寫根目錄 NetRedirector.dll (檔案被佔用，應用程式可能正在執行)。"
-        Write-Warning "  請關閉 NetRedirector 應用程式後重新執行本腳本，或手動複製: Copy-Item NetRedirector\NetRedirector.dll NetRedirector.dll -Force"
+        Write-Warning "  根目錄 NetRedirector.dll 被佔用，無法覆寫 (應用程式可能正在執行)。"
+        if ($Standalone -or $Onefile) {
+            # [Fixed] 打包模式下必須中止: 繼續會把「過期 DLL」打進發佈包,
+            # 建置顯示成功但修復沒進包, 極難察覺
+            Write-Error "已中止打包 (根目錄 DLL 無法更新)。請關閉 NetRedirector 應用程式後重新執行。"
+            exit 1
+        }
     }
 }
 
@@ -135,41 +149,80 @@ if (-not ($Standalone -or $Onefile)) {
 
 Write-Host "=== Nuitka 打包 ===" -ForegroundColor Cyan
 
+# [Added] 殘留的 WinDivert 驅動服務會鎖住 .sys/.dll 檔 (核心載入中無法覆寫),
+# 導致 Nuitka 複製執行期檔案時 PermissionError。應用程式沒在跑時自動停掉;
+# 停不掉或應用程式在跑, 給出明確指示後中止。
+$wdSvc = Get-Service -Name "WinDivert" -ErrorAction SilentlyContinue
+if ($wdSvc -and $wdSvc.Status -eq "Running") {
+    $appProc = Get-Process -Name "IntegratedApp" -ErrorAction SilentlyContinue
+    if (-not $appProc) {
+        Write-Host "  偵測到殘留的 WinDivert 驅動服務 (執行中), 嘗試停止..." -ForegroundColor Yellow
+        & sc.exe stop WinDivert | Out-Null
+        Start-Sleep -Seconds 2
+        $wdSvc.Refresh()
+        if ($wdSvc.Status -eq "Running") {
+            Write-Error "無法停止 WinDivert 驅動服務, .sys 被鎖定無法打包。請以管理員執行: sc.exe stop WinDivert 後重試。"
+            exit 1
+        }
+        Write-Host "  驅動服務已停止。" -ForegroundColor Gray
+    } else {
+        Write-Error "NetRedirector 應用程式執行中 (IntegratedApp.exe), 驅動檔案被鎖定。請先關閉應用程式再打包。"
+        exit 1
+    }
+}
+
 # 確認入口腳本存在
 if (-not (Test-Path $EntryPoint)) {
     Write-Error "找不到入口腳本: $EntryPoint"
     exit 1
 }
 
+# [Fixed] 優先使用專案 .venv 的 Python: 打包相依 (Nuitka/PySide6) 只裝在 venv,
+# 從未啟用 venv 的 PowerShell 直接執行時, PATH 上的系統 python 沒有 nuitka 會失敗
+$pythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+if (-not (Test-Path $pythonExe)) { $pythonExe = "python" }
+Write-Host "  使用 Python: $pythonExe" -ForegroundColor Gray
+
+& $pythonExe -m nuitka --version >$null 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "找不到 Nuitka。請先執行: $pythonExe -m pip install -r requirements-dev.txt"
+    exit 1
+}
+
 # 建構 Nuitka 命令
+# [Fixed] 使用 splatting (& $pythonExe @nuitkaArgs): Windows PowerShell 5.1 的
+# 「& $陣列變數」不會展開成指令+參數, 會把整個陣列當成單一指令名稱而失敗
+# (PowerShell 7 才支援前者, 但不能假設使用者裝了 pwsh 7)。
 $mode = if ($Onefile) { "--onefile" } else { "--standalone" }
-$nuitkaCmd = @(
-    "python", "-m", "nuitka",
+$nuitkaArgs = @(
+    "-m", "nuitka",
     "$mode",
     "--enable-plugin=pyside6",
     "--include-data-dir=locale=locale"
 )
 
 if (-not $ConsoleMode) {
-    $nuitkaCmd += "--windows-console-mode=disable"
+    $nuitkaArgs += "--windows-console-mode=disable"
 }
 
-# 包含執行時期支援檔案 (DLL / 驅動 / 設定檔)
-$runtimeFiles = @("NetRedirector.dll", "WinDivert.dll", "WinDivert64.sys", "config.json")
+# 包含執行時期支援檔案 (DLL / 驅動)
+# 注意: 不可打包 config.json — 那是使用者本機設定 (含個人代理與加密密碼),
+#       打包進發佈 artifact 會外流開發者私人組態。應用程式缺檔時會以空白設定啟動。
+$runtimeFiles = @("NetRedirector.dll", "WinDivert.dll", "WinDivert64.sys")
 foreach ($f in $runtimeFiles) {
     if (Test-Path $f) {
-        $nuitkaCmd += "--include-data-files=$f=$f"
+        $nuitkaArgs += "--include-data-files=$f=$f"
     }
 }
 
-$nuitkaCmd += "--remove-output"
-$nuitkaCmd += $EntryPoint
+$nuitkaArgs += "--remove-output"
+$nuitkaArgs += $EntryPoint
 
-Write-Host "  執行: $($nuitkaCmd -join ' ')" -ForegroundColor Gray
+Write-Host "  執行: $pythonExe $($nuitkaArgs -join ' ')" -ForegroundColor Gray
 Write-Host "" -ForegroundColor Gray
 
 $global:lastExitCode = 0
-& $nuitkaCmd
+& $pythonExe @nuitkaArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Nuitka 打包失敗 (exit code: $LASTEXITCODE)"
     exit 1

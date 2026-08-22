@@ -27,6 +27,7 @@ class RouteManager:
                     self.interfaces[name] = {'active_conns': 0}
                 
                 self.interfaces[name]['ip'] = data['ipv4']
+                self.interfaces[name]['ipv6'] = data.get('ipv6')  # [新增] 同步 IPv6 位址 (無則 None)
                 self.interfaces[name]['latency'] = data['latency']
                 self.interfaces[name]['connected'] = data['connected']
             
@@ -40,6 +41,7 @@ class RouteManager:
                     if self.interfaces[name]['active_conns'] > 0:
                         self.interfaces[name]['connected'] = False
                         self.interfaces[name]['ip'] = None # 防止新的連線分配到這
+                        self.interfaces[name]['ipv6'] = None # [新增] 同步清空 IPv6，避免殘留
                         logging.info(f"介面 {name} 已斷線，等待連線歸零後移除")
                     else:
                         del self.interfaces[name]
@@ -155,6 +157,9 @@ class SocksProxy(StreamRequestHandler):
         if atyp == ATYP_IPV4:
             data = self.recv_all(4)
             target_addr = socket.inet_ntoa(data) if data else None
+        elif atyp == 0x04:
+            data = self.recv_all(16)
+            target_addr = socket.inet_ntop(socket.AF_INET6, data) if data else None
         elif atyp == 0x03:
             len_byte = self.recv_all(1)
             addr_len = ord(len_byte) if len_byte else 0
@@ -175,6 +180,9 @@ class SocksProxy(StreamRequestHandler):
     def handle_connect(self, addr, port):
         server_port = self.server.server_address[1]
         
+        # [新增] IPv6 目標支援 (ATYP 0x04)：依位址格式決定 socket family
+        family = socket.AF_INET6 if ':' in addr else socket.AF_INET
+        
         # 用於記錄本次請求中失敗過的介面
         failed_interfaces = set()
         
@@ -194,7 +202,7 @@ class SocksProxy(StreamRequestHandler):
 
             logging.info(f"嘗試經由 {iface_name} ({bind_ip}) 連線至 {addr}:{port}...")
             
-            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote = socket.socket(family, socket.SOCK_STREAM)
             current_iface_name = iface_name
 
             try:
@@ -203,7 +211,13 @@ class SocksProxy(StreamRequestHandler):
                 
                 # 關鍵：綁定出口 IP
                 # 如果 VPN 剛斷，這裡 bind 可能會報錯 (OSError: [WinError 10049])
-                remote.bind((bind_ip, 0))
+                if family == socket.AF_INET6:
+                    # [新增] IPv6 目標：目前不支援綁定特定介面的 IPv6 位址，
+                    # 使用 :: (任何介面) 綁定。若需介面級 IPv6 綁定，需讓
+                    # RouteManager 同時維護各介面的 IPv6 位址。
+                    remote.bind(("::", 0))
+                else:
+                    remote.bind((bind_ip, 0))
                 
                 # 設定短超時，快速偵測壞掉的路由
                 # 建議設短一點 (例如 5秒)，讓切換更順暢

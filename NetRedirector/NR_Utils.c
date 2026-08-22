@@ -158,6 +158,154 @@ UINT32 resolve_hostname(const char *hostname)
     return resolved_ip;
 }
 
+// === DNS Resolution Cache (for domain-name rules) ===
+//
+// Hosts field now supports domain names ("google.com" / "*.google.com"). The
+// packet engine only has the destination IP, so the rule's hostname must be
+// resolved to an IP first. A cache prevents getaddrinfo() on every new
+// connection:
+//   1. Cache hit + not expired   -> return cached IP (O(1))
+//   2. miss / expired            -> getaddrinfo() + round-robin store
+// TTL expiry triggers re-resolution; DNS changes take effect within 1 minute
+// ("periodic re-resolution"). Resolution failures (ip == 0) are cached too,
+// so an unresolvable domain does not hammer the resolver.
+// Shares lock_pid_cache with the PID caches. Cleared by clear_dns_cache() on
+// NetRedirector_Stop.
+
+#define DNS_CACHE_SIZE 64
+#define DNS_CACHE_TTL_MS 60000   // 1 minute
+
+typedef struct {
+    DWORD timestamp;
+    char domain[256];
+    UINT32 ip;           // resolved IP (network byte order); 0 = failure
+} DNS_CACHE_ENTRY;
+
+static DNS_CACHE_ENTRY g_dns_cache[DNS_CACHE_SIZE];
+static UINT32 g_dns_cache_next_slot = 0;   // round-robin replacement
+
+UINT32 resolve_rule_host(const char *host)
+{
+    if (host == NULL || host[0] == '\0') return 0;
+
+    DWORD now = GetTickCount();
+
+    // 1. Cache lookup (TTL-based expiry, mirrors pid_result_cache_lookup)
+    EnterCriticalSection(&lock_pid_cache);
+    for (UINT32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        DNS_CACHE_ENTRY *e = &g_dns_cache[i];
+        if (e->domain[0] == '\0') continue;
+        if (strcmp(e->domain, host) != 0) continue;
+        if ((now - e->timestamp) > DNS_CACHE_TTL_MS) continue;  // expired -> treat as miss
+        UINT32 ip = e->ip;
+        LeaveCriticalSection(&lock_pid_cache);
+        return ip;
+    }
+    LeaveCriticalSection(&lock_pid_cache);
+
+    // 2. Miss: resolve through the OS resolver (resolve_hostname also handles
+    //    the case where the "host" is actually a literal IP), then cache it.
+    UINT32 ip = resolve_hostname(host);
+
+    EnterCriticalSection(&lock_pid_cache);
+    DNS_CACHE_ENTRY *slot = &g_dns_cache[g_dns_cache_next_slot++ % DNS_CACHE_SIZE];
+    slot->timestamp = now;
+    strncpy(slot->domain, host, sizeof(slot->domain) - 1);
+    slot->domain[sizeof(slot->domain) - 1] = '\0';
+    slot->ip = ip;
+    LeaveCriticalSection(&lock_pid_cache);
+
+    return ip;
+}
+
+// [Added] Cache-only lookup for the packet-thread match path. getaddrinfo()
+// can block for seconds (no timeout control); calling it from a packet
+// processor while it holds lock_rules would stall every other packet thread
+// and the rule APIs, and with the WinDivert queue time at 2000 ms this means
+// machine-wide packet loss whenever DNS is slow. The match path therefore
+// only reads the cache (stale entries are used rather than dropping the rule
+// - stale-while-revalidate); the background refresher thread keeps the cache
+// warm via force_resolve_rule_host().
+UINT32 resolve_rule_host_cached(const char *host)
+{
+    if (host == NULL || host[0] == '\0') return 0;
+
+    EnterCriticalSection(&lock_pid_cache);
+    for (UINT32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        DNS_CACHE_ENTRY *e = &g_dns_cache[i];
+        if (e->domain[0] == '\0') continue;
+        if (strcmp(e->domain, host) != 0) continue;
+        UINT32 ip = e->ip;
+        LeaveCriticalSection(&lock_pid_cache);
+        return ip;
+    }
+    LeaveCriticalSection(&lock_pid_cache);
+    return 0;
+}
+
+// [Added] Unconditional resolve + store for the background refresher. Unlike
+// resolve_rule_host this never reads the cache first, so periodic refreshes
+// actually re-resolve and DNS changes propagate within one refresh cycle.
+void force_resolve_rule_host(const char *host)
+{
+    if (host == NULL || host[0] == '\0') return;
+
+    UINT32 ip = resolve_hostname(host);
+
+    EnterCriticalSection(&lock_pid_cache);
+    // Refresh in place when the domain already has a slot (keeps the cache
+    // dense instead of round-robin-evicting ourselves every cycle).
+    DNS_CACHE_ENTRY *slot = NULL;
+    for (UINT32 i = 0; i < DNS_CACHE_SIZE; i++) {
+        if (g_dns_cache[i].domain[0] != '\0' && strcmp(g_dns_cache[i].domain, host) == 0) {
+            slot = &g_dns_cache[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        slot = &g_dns_cache[g_dns_cache_next_slot++ % DNS_CACHE_SIZE];
+        strncpy(slot->domain, host, sizeof(slot->domain) - 1);
+        slot->domain[sizeof(slot->domain) - 1] = '\0';
+    }
+    slot->timestamp = GetTickCount();
+    slot->ip = ip;
+    LeaveCriticalSection(&lock_pid_cache);
+}
+
+void clear_dns_cache(void)
+{
+    EnterCriticalSection(&lock_pid_cache);
+    memset(g_dns_cache, 0, sizeof(g_dns_cache));
+    g_dns_cache_next_slot = 0;
+    LeaveCriticalSection(&lock_pid_cache);
+}
+
+// [Added] Pre-resolve every domain pattern inside one rule's hosts field
+// ("a.com;8.8.8.8;*.b.com" -> force-resolve a.com and b.com). Called by the
+// background DNS refresher thread only - never from a packet thread. Skips
+// wildcards and IP-octet patterns, mirrors the "*." stripping done by
+// match_ip_pattern so both sides resolve the identical host string.
+void refresh_rule_dns(const char *hosts_field)
+{
+    if (hosts_field == NULL || hosts_field[0] == '\0' || is_wildcard_str(hosts_field)) return;
+
+    size_t len = strlen(hosts_field) + 1;
+    char *copy = malloc(len);
+    if (copy == NULL) return;
+    strncpy(copy, hosts_field, len);
+
+    char *token = strtok(copy, ";");
+    while (token != NULL) {
+        while (*token == ' ' || *token == '\t') token++;
+        if (token[0] != '\0' && !is_wildcard_str(token) && !is_ip_like_pattern(token)) {
+            if (token[0] == '*' && token[1] == '.') token += 2;
+            if (token[0] != '\0') force_resolve_rule_host(token);
+        }
+        token = strtok(NULL, ";");
+    }
+    free(copy);
+}
+
 // [Preserved] Helper function
 const char* extract_filename(const char* path)
 {
@@ -179,6 +327,43 @@ void EnableKeepAlive(SOCKET s) {
     alive_in.keepaliveinterval = 3000;
     DWORD dwBytesRet = 0;
     WSAIoctl(s, SIO_KEEPALIVE_VALS, &alive_in, sizeof(alive_in), NULL, 0, &dwBytesRet, NULL, NULL);
+}
+
+// [Added] Bounded connect(): switches the socket to non-blocking, starts the
+// connect, waits up to timeout_ms via select(), then restores blocking mode.
+// A plain blocking connect() stalls ~21 s (TCP SYN retries) per attempt on a
+// dead proxy; with thread-per-connection those stalled threads pile up.
+// Returns TRUE when connected, FALSE on failure/timeout (socket left in
+// blocking mode either way; caller decides whether to close it).
+BOOL connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, DWORD timeout_ms)
+{
+    u_long non_blocking = 1;
+    u_long blocking = 0;
+    if (ioctlsocket(s, FIONBIO, &non_blocking) == SOCKET_ERROR) return FALSE;
+
+    BOOL connected = FALSE;
+    int rc = connect(s, addr, addrlen);
+    if (rc == 0) {
+        connected = TRUE;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set write_fds, except_fds;
+        FD_ZERO(&write_fds); FD_SET(s, &write_fds);
+        FD_ZERO(&except_fds); FD_SET(s, &except_fds);
+        struct timeval tv = { (long)(timeout_ms / 1000), (long)((timeout_ms % 1000) * 1000) };
+        if (select(0, NULL, &write_fds, &except_fds, &tv) > 0) {
+            if (FD_ISSET(s, &except_fds)) {
+                connected = FALSE;
+            } else {
+                int so_error = 0;
+                int optlen = sizeof(so_error);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_error, &optlen);
+                connected = (so_error == 0);
+            }
+        }
+    }
+
+    ioctlsocket(s, FIONBIO, &blocking);
+    return connected;
 }
 
 void base64_encode(const char* input, char* output, size_t output_size) {
@@ -518,8 +703,41 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
 }
 
 // [Preserved] IP/Port Pattern matching logic
+// [Modified] Domain-name rules: when the pattern is not a plain dotted IPv4
+// (or per-octet-'*') form, treat it as a hostname, resolve it to an IP (with
+// the DNS cache in resolve_rule_host) and compare with the packet destination.
+static BOOL is_ip_like_pattern(const char *pattern)
+{
+    if (pattern == NULL || pattern[0] == '\0') return FALSE;
+    const char *p = pattern;
+    if (p[0] == '*' && p[1] == '.') p += 2;   // ignore leading "*.", e.g. "*.8.8.8.8" -> "8.8.8.8"
+    int parts = 1;
+    for (const char *q = p; *q != '\0'; q++) {
+        char c = *q;
+        if (c == '.') { parts++; continue; }
+        if (c == '*' || (c >= '0' && c <= '9')) continue;
+        return FALSE;   // contains a non-IP character (letters etc.) -> domain
+    }
+    return parts == 4;  // exactly 4 dot-separated parts -> keep the IP octet logic
+}
+
 BOOL match_ip_pattern(const char *pattern, UINT32 ip) {
     if (is_wildcard_str(pattern)) return TRUE;
+
+    // [Added] Domain rules: "google.com" / "*.google.com". Strip a leading
+    // "*." prefix before resolving ("*.google.com" -> "google.com"); the rule
+    // matches when the resolved IP equals the packet destination IP.
+    // [Modified] Uses the cache-only lookup: the packet thread must never
+    // block in getaddrinfo(). A cache miss simply means "not resolved (yet)"
+    // -> no match; the background refresher fills the cache shortly after a
+    // rule is added/edited.
+    if (!is_ip_like_pattern(pattern)) {
+        const char *host = pattern;
+        if (host[0] == '*' && host[1] == '.') host += 2;   // strip ".*" prefix
+        UINT32 resolved = resolve_rule_host_cached(host);
+        return (resolved != 0 && resolved == ip);
+    }
+
     unsigned char ip_octets[4];
     ip_octets[0] = (ip >> 0) & 0xFF; ip_octets[1] = (ip >> 8) & 0xFF;
     ip_octets[2] = (ip >> 16) & 0xFF; ip_octets[3] = (ip >> 24) & 0xFF;

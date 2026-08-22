@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Treiber konnte nicht gestartet werden. Überprüfen Sie die Administratorrechte oder die Treiberdatei.",
     "權限不足": "Unzureichende Berechtigungen",
     "請以管理員身分執行！": "Bitte als Administrator ausführen!",
-    "Ping 目標:": "Ping-Ziel:"
+    "Ping 目標:": "Ping-Ziel:",
+    "Time": "Zeit",
+    "Process": "Prozess",
+    "PID": "PID",
+    "Destination": "Ziel",
+    "Info": "Info",
+    "Process Name": "Prozessname",
+    "Hosts:": "Hosts:",
+    "Ports:": "Ports:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Nicht angegeben (Direktverbindung)"
 }

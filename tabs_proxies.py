@@ -129,7 +129,8 @@ class ProxiesTabMixin:
             self.combo_proxy.addItem(f"[Custom] {p['name']}", p['id'])
             has_real_proxies = True
         if not has_real_proxies:
-            self.combo_proxy.addItem("未指定 (Fallback to Direct)", 0)
+            # [i18n] 此文字僅供顯示;規則持久化靠 proxy_name,不受翻譯影響
+            self.combo_proxy.addItem(self.t("未指定 (Fallback to Direct)"), 0)
         idx = self.combo_proxy.findData(current_data)
         if idx >= 0: self.combo_proxy.setCurrentIndex(idx)
         elif self.combo_proxy.count() > 0: self.combo_proxy.setCurrentIndex(0)
@@ -154,6 +155,7 @@ class ProxiesTabMixin:
         if old_proxy_id is not None:
             edit_fn = getattr(self.bridge.lib, 'NetRedirector_EditProxyConfig', None)
             if edit_fn is not None:
+                old_name = next((p['name'] for p in self.custom_proxies if p['id'] == old_proxy_id), None)
                 ok = edit_fn(
                     old_proxy_id,
                     ptype,
@@ -168,6 +170,18 @@ class ProxiesTabMixin:
                     for p in self.custom_proxies:
                         if p['id'] == old_proxy_id:
                             p.update({'name': name, 'type': ptype_str, 'ip': ip, 'port': port, 'user': user, 'pass': pwd})
+                    # [Fixed] 改名時同步置換引用此代理的規則 (新舊前綴與舊版
+                    # 無前綴都要比對): 否則存檔後規則仍指向舊名稱, 下次啟動
+                    # 代理解析落空 → 規則靜默退回直連
+                    if old_name is not None and old_name != name:
+                        new_ref = f"custom:{name}"
+                        old_refs = (f"custom:{old_name}", old_name)
+                        for r in self.rules:
+                            if r.get('proxy_name') in old_refs:
+                                r['proxy_name'] = new_ref
+                                r['proxy'] = f"[Custom] {name}"
+                        self.refresh_rules_table()
+                        self.append_log(f"代理更名 {old_name} → {name}，已同步更新引用它的規則")
                     self.refresh_custom_proxy_table()
                     self.refresh_proxy_combobox()
                     self.cancel_proxy_edit()

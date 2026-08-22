@@ -44,27 +44,59 @@ def build_config_data(lang, ping_target, hubs, custom_proxies, rules):
             "action": r['action'],
             "action_key": r.get('action_key'),
             "proxy_text": r['proxy'],
+            # 穩定識別 (自訂代理名稱或 Hub 端口字串):還原時優先以此反查,
+            # 不受顯示文字翻譯/改版影響;舊版設定檔無此欄位時回退 proxy_text
+            "proxy_name": r.get('proxy_name', ''),
         })
 
     return config_data
 
 
 def save_config_file(path, data):
-    """寫入設定檔。成功回傳 None，失敗回傳錯誤訊息字串。"""
+    """寫入設定檔 (原子性:先寫暫存檔再取代,避免寫入中途當機留下半截檔案)。
+
+    成功回傳 None,失敗回傳錯誤訊息字串。
+    """
+    tmp_path = path + ".tmp"
     try:
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
         return None
     except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         return str(e)
 
 
 def load_config_file(path):
-    """讀取設定檔。檔案不存在或解析失敗回傳 None。"""
+    """讀取設定檔。
+
+    - 檔案不存在回傳 None。
+    - 內容解析失敗 (非 JSON / 編碼錯誤) 時把氈損檔案改名保留為
+      ``<path>.corrupt.bak`` 再回傳 None, 讓後續存檔寫入新檔時不會把
+      使用者僅存的資料直接覆蓋掉。
+    - 讀取失敗 (OSError: 檔案被防毒/備份軟體短暫鎖住、權限問題) 只回傳
+      None, 不動檔案 - 檔案本身可能完好, 誤判成氈損會把好檔搬走。
+    """
     if not os.path.exists(path):
         return None
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        backup_path = path + ".corrupt.bak"
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+            os.replace(path, backup_path)
+        except OSError:
+            pass
+        return None
+    except OSError:
         return None

@@ -14,7 +14,8 @@ int recv_n(SOCKET s, unsigned char *buf, int n)
 
 int socks5_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UINT16 dest_port, const PROXY_CONFIG* proxy_config)
 {
-    unsigned char buf[512];
+    // Auth sub-negotiation needs 3 + 255 (user) + 255 (pass) = 513 bytes max
+    unsigned char buf[600];
     int len;
     BOOL use_auth = (proxy_config != NULL && proxy_config->username[0] != '\0');
 
@@ -38,7 +39,8 @@ int socks5_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UIN
         if (!use_auth) return -1;
         size_t user_len = strlen(proxy_config->username);
         size_t pass_len = strlen(proxy_config->password);
-        if (user_len > 255 || pass_len > 255) return -1;
+        if (user_len > 255 || pass_len > 255 ||
+            3 + user_len + pass_len > sizeof(buf)) return -1;
 
         buf[0] = 0x01;
         buf[1] = (unsigned char)user_len;
@@ -111,7 +113,7 @@ int http_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UINT1
     }
 
     if (use_auth) {
-        char credentials[512];
+        char credentials[600];  // 255 (user) + ':' + 255 (pass) + NUL = 512+ needed
         char encoded[1024];
         snprintf(credentials, sizeof(credentials), "%s:%s", proxy_config->username, proxy_config->password);
         base64_encode(credentials, encoded, sizeof(encoded));
@@ -149,7 +151,8 @@ int http_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UINT1
 
 int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG* proxy_config)
 {
-    unsigned char buf[512];
+    // Auth sub-negotiation needs 3 + 255 (user) + 255 (pass) = 513 bytes max
+    unsigned char buf[600];
     BOOL use_auth = (proxy_config != NULL && proxy_config->username[0] != '\0');
 
     buf[0] = SOCKS5_VERSION;
@@ -167,6 +170,8 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
         if (!use_auth) return -1;
         size_t user_len = strlen(proxy_config->username);
         size_t pass_len = strlen(proxy_config->password);
+        if (user_len > 255 || pass_len > 255 ||
+            3 + user_len + pass_len > sizeof(buf)) return -1;
         buf[0] = 0x01;
         buf[1] = (unsigned char)user_len;
         memcpy(&buf[2], proxy_config->username, user_len);
@@ -202,7 +207,11 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     SOCKET tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_sock == INVALID_SOCKET) return NULL;
 
-    DWORD timeout = 0;
+    // [Fixed] Was timeout = 0 (infinite): a dead SOCKS5 proxy parked the relay
+    // thread forever in the handshake recv(). 10 s bounds the whole dial +
+    // handshake; the control socket is only select()'d for readability later,
+    // so the timeout cannot drop an established association.
+    DWORD timeout = 10000;
     setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 
@@ -211,14 +220,15 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     socks_addr.sin_family = AF_INET;
     socks_addr.sin_addr.s_addr = resolve_hostname(proxy_config->proxy_ip);
     socks_addr.sin_port = htons(proxy_config->proxy_port);
-    
+
     // �p�G�ѪR���� (0)�A������^
     if (socks_addr.sin_addr.s_addr == 0) {
         closesocket(tcp_sock);
         return NULL;
     }
 
-    if (connect(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR) {
+    // [Fixed] Bounded connect (blocking connect burns ~21 s on SYN retries)
+    if (!connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 10000)) {
         closesocket(tcp_sock);
         return NULL;
     }

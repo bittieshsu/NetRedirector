@@ -15,20 +15,39 @@ UINT32 g_next_proxy_id = 0;
 
 // === Connection Tracking ===
 // (protected by lock_connections)
+//
+// Keying: TCP entries are keyed by src_port alone (one connection per socket).
+// UDP entries are keyed by (src_port + family + original destination): a single
+// UDP socket commonly sends to several destinations (DNS resolver rotation,
+// QUIC, game server lists), and each destination must keep its own tracked
+// port/proxy mapping or packets for the second destination would be relayed to
+// the first one's server.
 
-void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action)
+void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UINT8 *dest_addr, UINT16 dest_port, UINT32 proxy_id, RuleAction action, BOOL is_udp)
 {
     EnterCriticalSection(&lock_connections);
 
     CONNECTION_INFO *existing = connection_list;
     while (existing != NULL) {
+        BOOL same_key = FALSE;
         if (existing->src_port == src_port) {
+            if (is_udp) {
+                int n = (family == AF_INET) ? 4 : 16;
+                same_key = existing->is_udp && existing->family == family &&
+                           dest_addr != NULL &&
+                           memcmp(existing->orig_dest_addr, dest_addr, n) == 0;
+            } else {
+                same_key = !existing->is_udp;
+            }
+        }
+        if (same_key) {
             existing->family = family;
             if (src_addr) memcpy(existing->src_addr, src_addr, 16);
             if (dest_addr) memcpy(existing->orig_dest_addr, dest_addr, 16);
             existing->orig_dest_port = dest_port;
             existing->proxy_id = proxy_id;
             existing->action = action;
+            existing->is_udp = is_udp;
             existing->last_activity = GetTickCount();
             LeaveCriticalSection(&lock_connections);
             return;
@@ -51,12 +70,16 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
     conn->orig_dest_port = dest_port;
     conn->proxy_id = proxy_id;
     conn->action = action;
+    conn->is_udp = is_udp;
     conn->last_activity = GetTickCount();
     conn->next = connection_list;
     connection_list = conn;
     LeaveCriticalSection(&lock_connections);
 }
 
+// [Modified] TCP lookup: key = (src_port + family + local source address).
+// Callers pass the packet's app-side endpoint (outbound: src addr/port;
+// returning: dst addr/port). src_addr length follows family (4/16 bytes).
 BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id, RuleAction *action)
 {
     BOOL found = FALSE;
@@ -66,14 +89,16 @@ BOOL get_connection(UINT16 src_port, int *family, UINT8 *dest_addr, UINT16 *dest
 
     while (conn != NULL)
     {
-        if (conn->src_port == src_port)
+        // TCP semantics: same-port UDP entries (different sockets can share a
+        // port number) never satisfy a TCP lookup.
+        if (conn->src_port == src_port && !conn->is_udp)
         {
             if (family) *family = conn->family;
             if (dest_addr) memcpy(dest_addr, conn->orig_dest_addr, 16);
             if (dest_port) *dest_port = conn->orig_dest_port;
             if (proxy_id) *proxy_id = conn->proxy_id;
             if (action) *action = conn->action;
-            
+
             conn->last_activity = GetTickCount();
             found = TRUE;
 
@@ -100,11 +125,8 @@ BOOL is_connection_tracked(UINT16 src_port)
     CONNECTION_INFO *conn = connection_list;
     CONNECTION_INFO *prev = NULL;
     while (conn != NULL) {
-        if (conn->src_port == src_port) {
+        if (conn->src_port == src_port && !conn->is_udp) {
             tracked = TRUE;
-            // Move to front: this is on the per-packet hot path for UDP relay
-            // traffic; keeping frequently-used sockets near the head makes the
-            // common case O(1) instead of O(n).
             if (prev != NULL) {
                 prev->next = conn->next;
                 conn->next = connection_list;
@@ -119,16 +141,104 @@ BOOL is_connection_tracked(UINT16 src_port)
     return tracked;
 }
 
+// [Added] UDP-keyed lookups: key = (src_port + family + original destination).
+// Used by the packet processor's UDP branch and by the UDP relay, which knows
+// the true destination IP from the swapped source address of the re-injected
+// packet.
+BOOL get_connection_udp(UINT16 src_port, int family, const UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id)
+{
+    BOOL found = FALSE;
+    if (dest_addr == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_connections);
+    CONNECTION_INFO *conn = connection_list;
+    CONNECTION_INFO *prev = NULL;
+    while (conn != NULL) {
+        if (conn->is_udp && conn->src_port == src_port && conn->family == family &&
+            memcmp(conn->orig_dest_addr, dest_addr, n) == 0)
+        {
+            if (dest_port) *dest_port = conn->orig_dest_port;
+            if (proxy_id) *proxy_id = conn->proxy_id;
+            conn->last_activity = GetTickCount();
+            found = TRUE;
+            if (prev != NULL) {
+                prev->next = conn->next;
+                conn->next = connection_list;
+                connection_list = conn;
+            }
+            break;
+        }
+        prev = conn;
+        conn = conn->next;
+    }
+    LeaveCriticalSection(&lock_connections);
+    return found;
+}
+
+BOOL is_connection_tracked_udp(UINT16 src_port, int family, const UINT8 *dest_addr)
+{
+    BOOL tracked = FALSE;
+    if (dest_addr == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_connections);
+    CONNECTION_INFO *conn = connection_list;
+    CONNECTION_INFO *prev = NULL;
+    while (conn != NULL) {
+        if (conn->is_udp && conn->src_port == src_port && conn->family == family &&
+            memcmp(conn->orig_dest_addr, dest_addr, n) == 0)
+        {
+            tracked = TRUE;
+            if (prev != NULL) {
+                prev->next = conn->next;
+                conn->next = connection_list;
+                connection_list = conn;
+            }
+            break;
+        }
+        prev = conn;
+        conn = conn->next;
+    }
+    LeaveCriticalSection(&lock_connections);
+    return tracked;
+}
+
+// [Added] For rewriting relay->app UDP responses: recovers an original
+// destination port for the app port. With multiple destinations behind one
+// socket this returns the most recently used entry's port - when two
+// destinations share the same service port (DNS 53, QUIC 443) this is exact;
+// mixed ports on one socket are a rare residual limitation of the
+// relay-port-rewrite design.
+BOOL get_udp_dest_port_for_app(UINT16 src_port, UINT16 *dest_port)
+{
+    BOOL found = FALSE;
+    EnterCriticalSection(&lock_connections);
+    CONNECTION_INFO *conn = connection_list;
+    while (conn != NULL) {
+        if (conn->is_udp && conn->src_port == src_port) {
+            if (dest_port) *dest_port = conn->orig_dest_port;
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    LeaveCriticalSection(&lock_connections);
+    return found;
+}
+
 void remove_connection(UINT16 src_port)
 {
     EnterCriticalSection(&lock_connections);
     CONNECTION_INFO **conn_ptr = &connection_list;
     while (*conn_ptr != NULL)
     {
-        if ((*conn_ptr)->src_port == src_port)
+        // TCP-only: callers are the TCP FIN/RST paths; never evict a UDP
+        // entry that happens to share the port number.
+        if ((*conn_ptr)->src_port == src_port && !(*conn_ptr)->is_udp)
         {
             CONNECTION_INFO *to_free = *conn_ptr;
-            *conn_ptr = (*conn_ptr)->next;
+            *conn_ptr = to_free->next;
             free(to_free);
             break;
         }
@@ -151,6 +261,59 @@ void clear_connections()
 
 // === Logged Connections ===
 // (protected by lock_logged)
+
+// Hard cap on the dedup list. Pruning is TTL-driven; this cap is a safety net
+// so a burst of new unique connections between cleanup cycles can never grow
+// the list without bound (which would also make the O(n) lookup slower).
+#define LOGGED_CONNECTIONS_MAX 1024
+
+// Remove the oldest (tail) entries until the list is within the cap.
+// Caller must hold lock_logged.
+static void trim_logged_connections(void)
+{
+    UINT32 count = 0;
+    LOGGED_CONNECTION *logged = logged_connections;
+    while (logged != NULL) {
+        count++;
+        logged = logged->next;
+    }
+
+    while (count > LOGGED_CONNECTIONS_MAX) {
+        LOGGED_CONNECTION *prev = NULL;
+        LOGGED_CONNECTION *curr = logged_connections;
+        while (curr->next != NULL) {
+            prev = curr;
+            curr = curr->next;
+        }
+        // curr is the tail (oldest entry)
+        if (prev != NULL) {
+            prev->next = NULL;
+        } else {
+            logged_connections = NULL;
+        }
+        free(curr);
+        count--;
+    }
+}
+
+// Remove entries older than ttl_ms. Unsigned subtraction handles the
+// GetTickCount() wraparound case automatically: (now - ts) is correct
+// modulo 2^32, so (now - ts) > ttl is a safe age test.
+void prune_logged_connections(DWORD now_ms, DWORD ttl_ms)
+{
+    EnterCriticalSection(&lock_logged);
+    LOGGED_CONNECTION **logged_ptr = &logged_connections;
+    while (*logged_ptr != NULL) {
+        LOGGED_CONNECTION *logged = *logged_ptr;
+        if ((now_ms - logged->timestamp) > ttl_ms) {
+            *logged_ptr = logged->next;
+            free(logged);
+        } else {
+            logged_ptr = &logged->next;
+        }
+    }
+    LeaveCriticalSection(&lock_logged);
+}
 
 BOOL is_connection_already_logged(DWORD pid, int family, const UINT8 *dest_addr, UINT16 dest_port, RuleAction action)
 {
@@ -185,8 +348,10 @@ void add_logged_connection(DWORD pid, int family, const UINT8 *dest_addr, UINT16
         memcpy(logged->dest_addr, dest_addr, 16);
         logged->dest_port = dest_port;
         logged->action = action;
+        logged->timestamp = GetTickCount();
         logged->next = logged_connections;
         logged_connections = logged;
+        trim_logged_connections();
     }
     LeaveCriticalSection(&lock_logged);
 }
@@ -253,7 +418,7 @@ void clear_udp_associations()
     while (udp_associations != NULL)
     {
         UDP_ASSOCIATION *to_free = udp_associations;
-        udp_associations = udp_associations->next;
+        udp_associations = to_free->next;
         closesocket(to_free->control_socket);
         closesocket(to_free->udp_socket);
         free(to_free);

@@ -54,10 +54,15 @@ static DWORD WINAPI conn_ops(LPVOID arg)
 {
     long base = (long)(LONG_PTR)arg;
     for (int i = 0; i < 1500; i++) {
-        UINT16 port = (UINT16)((base * 997 + i) % 20000 + 1024);
+        // [Fixed] 每執行緒使用不重疊的 port 區段 (base*20000 + 1024 + i):
+        // 舊公式 (base*997+i)%20000+1024 會跨執行緒碰撞, 碰撞時
+        // 「本執行緒 add → 他執行緒 remove → 本執行緒 is_tracked」
+        // 是本質上的競態, 與鎖的正確性無關 (間歇性失敗)。
+        // 不重疊區段仍對同一把鎖施壓, 但語意上每個 port 只有一個擁有者。
+        UINT16 port = (UINT16)(base * 20000 + 1024 + i);
         UINT8 src[16] = {127, 0, 0, 1};
         UINT8 dst[16] = {8, 8, 8, 8};
-        add_connection(port, AF_INET, src, dst, 443, 1, RULE_ACTION_PROXY);
+        add_connection(port, AF_INET, src, dst, 443, 1, RULE_ACTION_PROXY, FALSE);
         if (!is_connection_tracked(port)) { InterlockedIncrement(&g_failures); }
         remove_connection(port);
         InterlockedIncrement(&g_rounds);

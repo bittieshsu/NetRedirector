@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Kan de driver niet starten. Controleer de beheerdersrechten of het stuurprogrammabestand.",
     "權限不足": "Onvoldoende bevoegdheden",
     "請以管理員身分執行！": "Voer uit als beheerder!",
-    "Ping 目標:": "Ping-doel:"
+    "Ping 目標:": "Ping-doel:",
+    "Time": "Tijd",
+    "Process": "Proces",
+    "PID": "PID",
+    "Destination": "Bestemming",
+    "Info": "Info",
+    "Process Name": "Procesnaam",
+    "Hosts:": "Hosts:",
+    "Ports:": "Poorten:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Niet opgegeven (directe verbinding)"
 }

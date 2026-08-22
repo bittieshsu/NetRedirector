@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Tidak dapat memulai driver. Periksa hak administrator atau file driver.",
     "權限不足": "Hak tidak cukup",
     "請以管理員身分執行！": "Jalankan sebagai administrator!",
-    "Ping 目標:": "Target Ping:"
+    "Ping 目標:": "Target Ping:",
+    "Time": "Waktu",
+    "Process": "Proses",
+    "PID": "PID",
+    "Destination": "Tujuan",
+    "Info": "Info",
+    "Process Name": "Nama proses",
+    "Hosts:": "Host:",
+    "Ports:": "Port:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Tidak ditentukan (langsung)"
 }

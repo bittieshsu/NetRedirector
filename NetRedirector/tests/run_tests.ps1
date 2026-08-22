@@ -56,9 +56,12 @@ foreach ($tf in $testFiles) {
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
     Write-Host "`n=== 編譯 $base ===" -ForegroundColor Cyan
-    $p = Start-Process -FilePath $batPath -WorkingDirectory $RootDir -NoNewWindow -Wait -PassThru
+    # [Fixed] 改用 cmd /c 同步執行 (Start-Process -Wait 在部分環境會永久卡住);
+    # bat 內已自行 cd /d 到 $DllDir, 結束碼經 $LASTEXITCODE 取得。
+    & cmd.exe /c $batPath
+    $compileExit = $LASTEXITCODE
     Remove-Item $batPath -Force -ErrorAction SilentlyContinue
-    if ($p.ExitCode -ne 0) {
+    if ($compileExit -ne 0) {
         Write-Host "  [編譯失敗] $base" -ForegroundColor Red
         $failed += "$base (compile)"
         continue

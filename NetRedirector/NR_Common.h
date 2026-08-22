@@ -84,6 +84,7 @@ typedef struct CONNECTION_INFO {
     UINT16 orig_dest_port;
     UINT32 proxy_id;
     RuleAction action;
+    BOOL is_udp;              // TRUE: UDP timeout applies, FALSE: TCP timeout
     DWORD last_activity;
     struct CONNECTION_INFO *next;
 } CONNECTION_INFO;
@@ -119,10 +120,16 @@ typedef struct LOGGED_CONNECTION {
     UINT8 dest_addr[16];
     UINT16 dest_port;
     RuleAction action;
+    DWORD timestamp;          // GetTickCount() at insert time, for TTL pruning
     struct LOGGED_CONNECTION *next;
 } LOGGED_CONNECTION;
 
 // === Shared Global Variables (Extern) ===
+
+// Signalled by NetRedirector_Stop() so sleeping worker threads (cleanup thread)
+// wake immediately and observe running == FALSE instead of staying inside a
+// long Sleep() that could outlive DeleteCriticalSection.
+extern HANDLE g_stop_event;
 
 // Per-structure locks (replaces the former single global lock_cs so that
 // packet threads touching the connection list no longer contend with rule /

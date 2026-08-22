@@ -45,6 +45,20 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         try:
             self.bridge = NetRedirectorWrapper(dll_path)
         except Exception as e:
+            # 依錯誤型別提供更精準的提示 (FileNotFoundError 是 OSError 子類，需先判斷)
+            if isinstance(e, FileNotFoundError):
+                detail = "找不到 NetRedirector.dll"
+            elif isinstance(e, OSError):
+                detail = "載入 DLL 失敗，可能缺少 WinDivert.dll 或 vcruntime140.dll"
+            else:
+                detail = str(e)
+            QMessageBox.critical(
+                None, "初始化失敗",
+                f"無法載入 NetRedirector.dll：{detail}\n\n請確認：\n"
+                "1. NetRedirector.dll、WinDivert.dll、WinDivert64.sys 在同目錄\n"
+                "2. 以系統管理員身分執行"
+            )
+            logging.exception("Failed to load NetRedirector DLL")
             sys.exit(1)
 
         # 核心數據結構
@@ -207,8 +221,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
     # [模組化] 讀取設定 (檔案 I/O 移至 config_store)
     def load_config(self):
+        # [Fixed] 先記錄檔案是否存在: 讀取前存在但解析失敗 → 這次真的氈損
+        # (已被改名為 .bak);檔案本來就不存在但殘留舊 .bak → 不誤發警告
+        had_file = os.path.exists(self.CONFIG_FILE)
         data = config_store.load_config_file(self.CONFIG_FILE)
         if data is None:
+            if had_file:
+                self.append_log(
+                    "警告: config.json 毀損無法解析,原始內容已備份為 config.json.corrupt.bak,"
+                    "可手動修復後還原。本次以空白設定啟動。")
             return
 
         try:
@@ -270,57 +291,42 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             # 3. 還原 Rules
             saved_rules = data.get("rules", [])
             for r in saved_rules:
-                # 嘗試根據 proxy_text 找回對應的 新ID
-                proxy_text = r['proxy_text']
-                proxy_id = 0 # 預設 Direct/Unspecified
-
-                # 在 combo box 尋找對應的 ID
-                idx = self.combo_proxy.findText(proxy_text)
-                if idx >= 0:
-                    proxy_id = self.combo_proxy.itemData(idx)
-
-                # 協議轉換
-                protocol = RuleProtocol.BOTH
-                if r['proto'] == "TCP": protocol = RuleProtocol.TCP
-                elif r['proto'] == "UDP": protocol = RuleProtocol.UDP
-
                 # 動作轉換
                 action_key = r.get('action_key')
                 if action_key is None:
                     action_key = 0
-                    if "DIRECT" in r['action']: action_key = 1
-                    elif "BLOCK" in r['action']: action_key = 2
-                action_idx = action_key
+                    if "DIRECT" in r.get('action', ''): action_key = 1
+                    elif "BLOCK" in r.get('action', ''): action_key = 2
 
-                # 呼叫 DLL
-                rid = 0
                 # [Fixed] 正規化設定檔中可能存在的全形星號 (U+FF0A)
                 target = rule_utils.normalize_rule_target(r['target'])
                 hosts = rule_utils.normalize_rule_pattern(r.get('hosts'))
                 ports = rule_utils.normalize_rule_pattern(r.get('ports'))
 
-                if r['type'] == 'PID':
-                    if target.isdigit():
-                        rid = self.bridge.add_rule_by_pid(int(target), hosts, ports, protocol, action_idx, int(proxy_id))
-                else:
-                    if hasattr(self.bridge.lib, 'NetRedirector_AddRuleWithProxy'):
-                        rid = self.bridge.lib.NetRedirector_AddRuleWithProxy(
-                            target.encode('utf-8'), hosts.encode('utf-8'), ports.encode('utf-8'), protocol, action_idx, int(proxy_id)
-                        )
-                    else:
-                        rid = self.bridge.add_rule(target, hosts, ports, protocol, action_idx)
+                # 代理解析:優先穩定識別 proxy_name,回退舊版 proxy_text 顯示字串
+                pending = {'proxy_name': r.get('proxy_name', ''), 'proxy': r.get('proxy_text', '')}
+                proxy_id, proxy_text = self._resolve_proxy(pending)
+
+                # 呼叫 DLL (統一入口:處理 PID/名稱、協議轉換、能力 fallback)
+                rid = self.bridge.add_rule_ex(
+                    r.get('type', 'Name'), target, hosts, ports,
+                    r.get('proto', 'BOTH'), action_key, int(proxy_id))
 
                 if rid > 0:
+                    # [Fixed] 全部用 .get() 帶預設: 手工編輯的 config 缺鍵時,
+                    # 單條壞規則只會被跳過/降級, 不會中斷其後所有規則的還原
                     self.rules.append({
                         'id': rid,
-                        'type': r['type'],
+                        'type': r.get('type', 'Name'),
                         'target': target,
                         'hosts': hosts,
                         'ports': ports,
-                        'proto': r['proto'],
-                        'action': r['action'],
+                        'proto': r.get('proto', 'BOTH'),
+                        'action': r.get('action', ''),
                         'action_key': action_key,
-                        'proxy': proxy_text # 保持原本的顯示文字
+                        'proxy': proxy_text,   # 顯示文字 (可能隨語系變動)
+                        'proxy_name': pending['proxy_name'],  # 穩定識別 (持久化用)
+                        'proxy_id': int(proxy_id)   # [Fixed] 最後已知 ID (刪代理重刷用)
                     })
 
             self.refresh_rules_table()
@@ -449,7 +455,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
 if __name__ == '__main__':
     try: is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except: is_admin = False
+    except Exception: is_admin = False
     
     app = QApplication(sys.argv)
     if not is_admin:

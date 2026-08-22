@@ -84,5 +84,15 @@
     "無法啟動驅動，請確認管理員權限或驅動檔案是否存在。": "Sürücü başlatılamadı. Yönetici haklarını veya sürücü dosyasını kontrol edin.",
     "權限不足": "Yetersiz ayrıcalık",
     "請以管理員身分執行！": "Lütfen yönetici olarak çalıştırın!",
-    "Ping 目標:": "Ping Hedefi:"
+    "Ping 目標:": "Ping Hedefi:",
+    "Time": "Zaman",
+    "Process": "Süreç",
+    "PID": "PID",
+    "Destination": "Hedef",
+    "Info": "Bilgi",
+    "Process Name": "Süreç adı",
+    "Hosts:": "Hostlar:",
+    "Ports:": "Portlar:",
+    "Proto:": "Proto:",
+    "未指定 (Fallback to Direct)": "Belirtilmedi (doğrudan bağlantı)"
 }

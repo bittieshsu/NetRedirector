@@ -108,7 +108,15 @@ class HubTabMixin:
         port = int(item.text().split()[0])
         proxy_core.server_controller.stop_port(port)
         if port in self.port_config: del self.port_config[port]
-        if port in self.hub_proxy_map: del self.hub_proxy_map[port]
+        # [Fixed] 同步刪除 DLL 中的 Hub 代理設定，避免殘留幽靈代理
+        # (sync_hub_proxy 曾對每個 Hub 端口呼叫 add_proxy 註冊代理)
+        pid = self.hub_proxy_map.pop(port, None)
+        if pid and hasattr(self.bridge.lib, 'NetRedirector_DeleteProxyConfig'):
+            try:
+                self.bridge.lib.NetRedirector_DeleteProxyConfig(pid)
+                self.append_log(f"已移除 Hub 端口 {port} 的 DLL 代理設定 (ID: {pid})")
+            except Exception as e:
+                self.append_log(f"移除 Hub 端口代理設定失敗: {e}")
         self.list_hub_ports.takeItem(self.list_hub_ports.row(item))
         self.selected_hub_port = None
         self.refresh_hub_table()
