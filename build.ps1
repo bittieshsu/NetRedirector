@@ -197,6 +197,9 @@ $mode = if ($Onefile) { "--onefile" } else { "--standalone" }
 $nuitkaArgs = @(
     "-m", "nuitka",
     "$mode",
+    # [Fixed] CI/全新環境: standalone 需要 Dependency Walker, Nuitka 的互動式
+    # 下載提示在非互動環境會自動答 "no" 而 FATAL; 此旗標讓它自動下載
+    "--assume-yes-for-downloads",
     "--enable-plugin=pyside6",
     "--include-data-dir=locale=locale"
 )
