@@ -104,14 +104,30 @@ def check_update(current_version):
 ### 4.2 下載 + 校驗 + 解壓
 
 ```python
-def stage_update(url, name, checksum_url):
+def stage_update(url, name, checksum_url, progress_cb=None, cancel_event=None):
     expected = parse_sha256(checksum_url, name)   # 從 SHA256SUMS 解析出本資產的雜湊
-    tmp = download(url)
+    download_file(url, tmp, progress_cb=progress_cb, cancel_event=cancel_event)
     if not verify_sha256(tmp, expected):
         raise RuntimeError("SHA256 校驗失敗，中止")
     extract(tmp, dist_dir + ".new")               # 解壓到旁路目錄
     # 解壓前做 zip-slip 防護：確認每個條目的目標路徑都在 new_dir 內
 ```
+
+**下載採多線程分段（`download_file`）**，因為 GitHub release 資產在部分網路
+環境單線只有數十 KB/s，34 MB 要十幾分鐘，看起來像卡死：
+
+1. 先以 `Range: bytes=0-0` 探測檔案大小與是否支援分段，並記下轉址後的簽名
+   CDN URL（讓所有分段共用，省去每段重走一次 302）。
+2. 切成多段並行下載（預設 8 條連線，依檔案大小調整段數，上限 16 段）。
+3. **進度回報**：`progress_cb` 每 0.5 秒收到 `{downloaded, total, speed, threads}`，
+   UI 以 `QProgressDialog` 顯示並提供取消。
+4. **停滯偵測**：30 秒視窗內收到不足 128 KB 即判定該段卡住，中斷後重試
+   （每段最多 4 次），避免慢速滴流無限等待。
+5. **後備路徑**：伺服器不支援 Range 或分段失敗時，自動退回單線串流重試。
+6. 每次啟動更新前清掉 `%TEMP%\netredir_update_*.zip` 殘檔（舊版每次重試都留一個）。
+
+> 逾時要用**讀取逾時**而非總時間：慢速但持續有資料的連線不會觸發 per-read
+> 逾時，必須靠停滯偵測（視窗內位元組數）才能判斷「卡住」。
 
 ### 4.3 原子替換 + 重啟
 

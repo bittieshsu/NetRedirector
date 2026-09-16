@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QPushButton, QLabel, QGroupBox, QSpinBox, QTextEdit, 
                              QListWidget, QSplitter, QMessageBox, QHeaderView,
                              QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
-                             QSystemTrayIcon, QCheckBox, QFrame, QWidgetAction)
+                             QSystemTrayIcon, QCheckBox, QFrame, QWidgetAction,
+                             QProgressDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread, QPoint
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
@@ -42,6 +43,16 @@ import updater  # [自動更新] 檢查/下載/替換邏輯
 from version import APP_VERSION  # [自動更新] 單一版本來源
 
 
+def _fmt_bytes(n):
+    """把位元組數格式化成易讀字串 (更新進度顯示用)。"""
+    value = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return ("{:.0f} {}" if unit == "B" else "{:.1f} {}").format(value, unit)
+        value /= 1024
+    return "{:.1f} TB".format(value)
+
+
 class UpdateWorker(QThread):
     """背景檢查更新 (呼叫 GitHub API，避免阻塞 UI)。"""
     result = Signal(object)  # dict(有更新) | None(最新) | Exception(錯誤)
@@ -59,16 +70,23 @@ class UpdateWorker(QThread):
 
 class StageWorker(QThread):
     """背景下載並驗證更新 (回傳新版本目錄路徑)。"""
-    result = Signal(object)  # str(new_dir) | Exception
+    result = Signal(object)    # str(new_dir) | Exception
+    progress = Signal(object)  # dict(downloaded, total, speed, threads)
 
     def __init__(self, info):
         super().__init__()
         self.info = info
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        """要求中止下載 (由 UI 的取消鈕呼叫)。"""
+        self._cancel_event.set()
 
     def run(self):
         try:
             path = updater.stage_update(
-                self.info["url"], self.info["asset_name"], self.info["checksum_url"])
+                self.info["url"], self.info["asset_name"], self.info["checksum_url"],
+                progress_cb=self.progress.emit, cancel_event=self._cancel_event)
             self.result.emit(path)
         except Exception as e:
             self.result.emit(e)
@@ -806,12 +824,49 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             return
         self.act_check_update.setEnabled(False)
         self.append_log(self.t("正在下載更新..."))
+        # 多線程下載可能仍要數分鐘，顯示進度與取消鈕讓使用者知道不是卡住
+        self._update_dialog = QProgressDialog(
+            self.t("正在下載更新..."), self.t("取消"), 0, 100, self)
+        self._update_dialog.setWindowTitle(self.t("檢查更新"))
+        self._update_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._update_dialog.setMinimumDuration(0)
+        self._update_dialog.setAutoClose(False)
+        self._update_dialog.setAutoReset(False)
+        self._update_dialog.setValue(0)
+        self._update_dialog.canceled.connect(self._cancel_stage)
+        self._update_dialog.show()
         self.stage_worker = StageWorker(info)
+        self.stage_worker.progress.connect(self._on_stage_progress)
         self.stage_worker.result.connect(self._on_stage_result)
         self.stage_worker.start()
 
+    def _on_stage_progress(self, info):
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is None or not info:
+            return
+        total = int(info.get("total") or 0)
+        done = int(info.get("downloaded") or 0)
+        pct = int(done * 100 / total) if total > 0 else 0
+        dlg.setValue(min(100, pct))
+        dlg.setLabelText(self.t(
+            "已下載 {done} / {total}（{pct}%）　速度 {speed}/s　連線 {threads}").format(
+                done=_fmt_bytes(done), total=_fmt_bytes(total), pct=pct,
+                speed=_fmt_bytes(int(info.get("speed") or 0)),
+                threads=int(info.get("threads") or 1)))
+
+    def _cancel_stage(self):
+        if self.stage_worker is not None and self.stage_worker.isRunning():
+            self.stage_worker.cancel()
+
     def _on_stage_result(self, result):
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is not None:
+            dlg.close()
+            self._update_dialog = None
         self.act_check_update.setEnabled(True)
+        if isinstance(result, updater.UpdateCancelled):
+            self.append_log(self.t("已取消更新下載。"))
+            return
         if isinstance(result, Exception):
             msg = f"{self.t('檢查更新失敗:')} {result}"
             self.append_log(msg)

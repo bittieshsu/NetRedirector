@@ -187,5 +187,7 @@
     "💡 提示：雙擊代理列可編輯，或按右鍵開啟選單": "💡 Astuce : double-cliquez sur un proxy pour le modifier, ou clic droit pour le menu",
     "自動管理介面計量": "Gérer automatiquement les métriques d'interface",
     "勾選後自動將 SoftEther 虛擬網卡計量設高、實體網卡設低，避免 VPN 搶走預設路由。": "Une fois activé, les adaptateurs virtuels SoftEther reçoivent une métrique élevée et l'adaptateur physique une métrique basse, afin que le VPN ne prenne pas la route par défaut.",
-    "自動連線": "Connexion automatique"
+    "自動連線": "Connexion automatique",
+    "已下載 {done} / {total}（{pct}%）　速度 {speed}/s　連線 {threads}": "Téléchargé {done} / {total} ({pct}%)　Vitesse {speed}/s　Connexions {threads}",
+    "已取消更新下載。": "Téléchargement de la mise à jour annulé."
 }

@@ -187,5 +187,7 @@
     "💡 提示：雙擊代理列可編輯，或按右鍵開啟選單": "💡 Tip: double-click a proxy row to edit, or right-click for the menu",
     "自動管理介面計量": "Manage interface metrics automatically",
     "勾選後自動將 SoftEther 虛擬網卡計量設高、實體網卡設低，避免 VPN 搶走預設路由。": "When enabled, SoftEther virtual adapters get a high metric and the physical adapter a low one, so the VPN cannot take over the default route.",
-    "自動連線": "Auto Connect"
+    "自動連線": "Auto Connect",
+    "已下載 {done} / {total}（{pct}%）　速度 {speed}/s　連線 {threads}": "Downloaded {done} / {total} ({pct}%)　Speed {speed}/s　Connections {threads}",
+    "已取消更新下載。": "Update download cancelled."
 }

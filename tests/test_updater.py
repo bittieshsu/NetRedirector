@@ -2,8 +2,13 @@
 """updater 純邏輯單元測試 — 版本比對 / SHA256 校驗 (不觸及網路)。"""
 
 import hashlib
+import http.server
 import os
+import re
 import sys
+import threading
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,4 +86,108 @@ def test_apply_script_relaunch_uses_processstartinfo():
     assert "-UseShellExecute" not in script   # 防止誤用不存在的參數
     assert "System.Diagnostics.ProcessStartInfo" in script
     assert "$psi.UseShellExecute = $false" in script
+
+
+# ------------------------------------------------------------------ #
+# 多線程分段下載 (對本機 HTTP 伺服器測試，不連外網)
+# ------------------------------------------------------------------ #
+class _RangeHandler(http.server.BaseHTTPRequestHandler):
+    """極簡測試伺服器：可選擇是否支援 HTTP Range。"""
+
+    payload = b""
+    supports_range = True
+
+    def do_GET(self):
+        data = type(self).payload
+        rng = self.headers.get("Range")
+        if rng and type(self).supports_range:
+            m = re.match(r"bytes=(\d+)-(\d*)", rng)
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else len(data) - 1
+            end = min(end, len(data) - 1)
+            chunk = data[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             "bytes {}-{}/{}".format(start, end, len(data)))
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):  # 靜音
+        pass
+
+
+def _serve(payload, supports_range=True):
+    handler = type("_H", (_RangeHandler,),
+                   {"payload": payload, "supports_range": supports_range})
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/file.bin".format(httpd.server_address[1])
+    return httpd, url
+
+
+def test_probe_download_reports_total_and_range():
+    data = os.urandom(4096)
+    httpd, url = _serve(data)
+    try:
+        _final, total, supports = updater._probe_download(url)
+        assert supports is True
+        assert total == len(data)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_file_multipart(tmp_path):
+    data = os.urandom(5 * 1024 * 1024)   # 大於 MIN_MULTIPART_SIZE，會走分段
+    httpd, url = _serve(data)
+    try:
+        dest = tmp_path / "out.bin"
+        events = []
+        updater.download_file(url, str(dest), progress_cb=events.append, threads=4)
+        assert dest.read_bytes() == data
+        assert events, "應至少回報一次進度"
+        assert events[-1]["downloaded"] == len(data)
+        assert events[-1]["total"] == len(data)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_file_falls_back_to_single_when_no_range(tmp_path):
+    data = os.urandom(5 * 1024 * 1024)
+    httpd, url = _serve(data, supports_range=False)
+    try:
+        dest = tmp_path / "out.bin"
+        updater.download_file(url, str(dest), threads=4)
+        assert dest.read_bytes() == data
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_file_cancel_raises(tmp_path):
+    data = os.urandom(5 * 1024 * 1024)
+    httpd, url = _serve(data)
+    try:
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(updater.UpdateCancelled):
+            updater.download_file(url, str(tmp_path / "out.bin"), cancel_event=cancel)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_cleanup_stale_downloads_removes_leftovers(monkeypatch, tmp_path):
+    stale = tmp_path / "netredir_update_abc.zip"
+    stale.write_bytes(b"partial")
+    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
+    updater._cleanup_stale_downloads()
+    assert not stale.exists()
 

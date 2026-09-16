@@ -6,23 +6,50 @@
 2. stage_update()     → 下載 zip + SHA256 清單 → 校驗 → 解壓到 <dist>.new。
 3. apply_and_restart() → 寫入背景替換腳本並啟動，主程式隨後自行關閉。
 
+下載採多線程分段 (HTTP Range)：GitHub release 資產在部分網路環境單線只有
+數十 KB/s，切成多段並行可大幅縮短時間。同時回報進度、偵測停滯並重試；
+伺服器不支援 Range 時自動退回單線串流。GitHub 的資產是簽名 URL，探測時
+取得轉址後的最終 URL 供所有分段共用，省去每段重走一次 302。
+
 安全要求：下載的更新檔必須通過 SHA-256 校驗才會解壓、替換，否則中止。
 """
 
+import glob
 import hashlib
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 
 import requests
 
 from version import UPDATE_API_URL
 
-_TIMEOUT_CHECK = 15      # 檢查更新 (API) 逾時秒數
-_TIMEOUT_DOWNLOAD = 180  # 下載更新檔逾時秒數
+_TIMEOUT_CHECK = 15       # 檢查更新 (API) 逾時秒數
+_TIMEOUT_CONNECT = 15     # 建立連線逾時秒數
+_TIMEOUT_READ = 60        # 單次讀取逾時秒數 (超過此時間沒收到資料視為斷線)
+_TIMEOUT_DOWNLOAD = 180   # SHA256 清單等下載的逾時秒數
+
+# --- 多線程分段下載參數 ---
+DOWNLOAD_THREADS = 8                  # 預設並行連線數
+TARGET_BLOCK_SIZE = 4 * 1024 * 1024   # 目標分段大小 (依檔案大小決定段數)
+MAX_BLOCKS = 16                       # 分段數上限
+MIN_MULTIPART_SIZE = 4 * 1024 * 1024  # 小於此大小不值得分段，直接單線
+CHUNK_SIZE = 256 * 1024               # 每次讀取的位元組數
+STALL_WINDOW = 30                     # 停滯偵測視窗 (秒)
+STALL_MIN_BYTES = 128 * 1024          # 視窗內至少需收到的位元組，否則視為停滯
+MAX_BLOCK_RETRIES = 4                 # 單一分段最大重試次數
+USER_AGENT = "NetRedirector-Updater"
+
+
+class UpdateCancelled(Exception):
+    """使用者取消了更新下載。"""
 
 
 def parse_semver(tag):
@@ -125,8 +152,6 @@ def is_frozen():
     return False
 
 
-
-
 def _frozen_exe_path():
     """取得打包後真正的執行檔路徑。
 
@@ -148,11 +173,329 @@ def current_dist_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD):
+# ------------------------------------------------------------------ #
+# 下載 (多線程分段 + 進度回報 + 停滯偵測)
+# ------------------------------------------------------------------ #
+def _cleanup_stale_downloads():
+    """清掉先前中斷留下的下載殘檔 (舊版每次重試都留一個在 %TEMP%)。"""
+    pattern = os.path.join(tempfile.gettempdir(), "netredir_update_*.zip")
+    for path in glob.glob(pattern):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _probe_download(url, timeout=_TIMEOUT_CHECK):
+    """以 ``Range: bytes=0-0`` 探測檔案大小與是否支援分段下載。
+
+    回傳 ``(final_url, total_size, supports_range)``。total_size 可能為 0
+    (伺服器未提供長度)。final_url 是跟隨轉址後的最終網址 (GitHub 的簽名
+    CDN URL)，供後續所有分段共用，省去每段重走一次 302。
+    """
+    headers = {
+        "Range": "bytes=0-0",
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "identity",
+    }
+    r = requests.get(url, headers=headers, timeout=(_TIMEOUT_CONNECT, timeout),
+                     stream=True, allow_redirects=True)
+    try:
+        r.raise_for_status()
+        final_url = r.url or url
+        if r.status_code == 206:
+            total = 0
+            m = re.search(r"/(\d+)\s*$", r.headers.get("content-range", ""))
+            if m:
+                total = int(m.group(1))
+            if not total:
+                total = int(r.headers.get("content-length", 0) or 0)
+            return final_url, total, True
+        return final_url, int(r.headers.get("content-length", 0) or 0), False
+    finally:
+        r.close()
+
+
+class _ProgressReporter(threading.Thread):
+    """每 0.5 秒算一次速度並回報進度 (避免 worker 每讀一塊就發訊號)。"""
+
+    def __init__(self, callback, total, get_downloaded, get_threads, interval=0.5):
+        super().__init__(daemon=True)
+        self._cb = callback
+        self._total = total
+        self._get_downloaded = get_downloaded
+        self._get_threads = get_threads
+        self._interval = interval
+        self._stop = threading.Event()
+        self._last_bytes = 0
+        self._last_time = None
+
+    def run(self):
+        while not self._stop.wait(self._interval):
+            self.emit()
+
+    def emit(self):
+        if self._cb is None:
+            return
+        now = time.monotonic()
+        cur = self._get_downloaded()
+        if self._last_time is None:
+            self._last_time, self._last_bytes = now, cur
+        dt = now - self._last_time
+        speed = (cur - self._last_bytes) / dt if dt > 0 else 0.0
+        self._last_time, self._last_bytes = now, cur
+        try:
+            self._cb({
+                "downloaded": cur,
+                "total": self._total,
+                "speed": speed,
+                "threads": self._get_threads(),
+            })
+        except Exception:  # noqa: BLE001 — 進度回報不應影響下載
+            pass
+
+    def stop(self):
+        self._stop.set()
+
+
+def _fetch_block(session, url, start, end, dest, block_bytes, idx, lock,
+                 stop, cancel_event):
+    """下載 [start, end] 這段並寫入 dest 的對應偏移。失敗丟例外由 worker 重試。"""
+    headers = {
+        "Range": "bytes={}-{}".format(start, end),
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "identity",
+    }
+    r = session.get(url, headers=headers, stream=True,
+                    timeout=(_TIMEOUT_CONNECT, _TIMEOUT_READ),
+                    allow_redirects=True)
+    try:
+        if r.status_code != 206:
+            raise RuntimeError("HTTP {}".format(r.status_code))
+        pos = start
+        need = end - start + 1
+        win_start = time.monotonic()
+        win_bytes = 0
+        with open(dest, "r+b") as f:
+            f.seek(start)
+            for chunk in r.iter_content(CHUNK_SIZE):
+                if stop.is_set():
+                    raise UpdateCancelled()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UpdateCancelled()
+                if not chunk:
+                    continue
+                if pos + len(chunk) > end + 1:
+                    chunk = chunk[:end + 1 - pos]
+                f.write(chunk)
+                pos += len(chunk)
+                win_bytes += len(chunk)
+                with lock:
+                    block_bytes[idx] += len(chunk)
+                if pos > end:
+                    break
+                now = time.monotonic()
+                if now - win_start >= STALL_WINDOW:
+                    if win_bytes < STALL_MIN_BYTES:
+                        raise RuntimeError(
+                            "停滯: {} bytes/{:.0f}s".format(win_bytes, now - win_start))
+                    win_start, win_bytes = now, 0
+        if pos - start < need:
+            raise RuntimeError("區段不完整: {}/{}".format(pos - start, need))
+    finally:
+        r.close()
+
+
+def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_event):
+    """把檔案切成多段並行下載到 dest (dest 會先配置成 total 大小)。"""
+    block_size = max(TARGET_BLOCK_SIZE, (total + MAX_BLOCKS - 1) // MAX_BLOCKS)
+    bounds = []
+    start = 0
+    while start < total and len(bounds) < MAX_BLOCKS:
+        end = min(start + block_size, total) - 1
+        bounds.append((start, end))
+        start = end + 1
+    if not bounds:
+        bounds = [(0, total - 1)]
+    n = len(bounds)
+
+    with open(dest, "wb") as f:
+        f.truncate(total)
+
+    work = queue.Queue()
+    for i in range(n):
+        work.put(i)
+
+    lock = threading.Lock()
+    block_bytes = [0] * n
+    active = [0]
+    stop = threading.Event()
+    failures = []
+
+    def downloaded():
+        with lock:
+            return sum(block_bytes)
+
+    def active_count():
+        with lock:
+            return active[0]
+
+    reporter = _ProgressReporter(progress_cb, total, downloaded, active_count)
+    reporter.start()
+
+    def worker():
+        session = requests.Session()
+        try:
+            while not stop.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    stop.set()
+                    return
+                try:
+                    idx = work.get_nowait()
+                except queue.Empty:
+                    return
+                b_start, b_end = bounds[idx]
+                with lock:
+                    active[0] += 1
+                try:
+                    attempt = 0
+                    while True:
+                        attempt += 1
+                        try:
+                            _fetch_block(session, final_url, b_start, b_end, dest,
+                                         block_bytes, idx, lock, stop, cancel_event)
+                            break
+                        except UpdateCancelled:
+                            stop.set()
+                            return
+                        except Exception as e:  # noqa: BLE001
+                            if cancel_event is not None and cancel_event.is_set():
+                                stop.set()
+                                return
+                            if attempt >= MAX_BLOCK_RETRIES:
+                                failures.append(
+                                    "區段 {}-{} 失敗: {}".format(b_start, b_end, e))
+                                stop.set()
+                                return
+                            # 重試前把該段已計入的位元組歸零，進度才不會虛胖
+                            with lock:
+                                block_bytes[idx] = 0
+                            time.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
+                finally:
+                    with lock:
+                        active[0] -= 1
+        finally:
+            session.close()
+
+    workers = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    reporter.emit()
+    reporter.stop()
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise UpdateCancelled()
+    if failures:
+        raise RuntimeError(failures[0])
+    if os.path.getsize(dest) != total or downloaded() < total:
+        raise RuntimeError(
+            "下載不完整: {}/{} 位元組".format(downloaded(), total))
+
+
+def _download_single(final_url, dest, total_hint, progress_cb, cancel_event):
+    """單線串流下載 (伺服器不支援 Range，或分段失敗時的後備路徑)。"""
+    headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+    r = requests.get(final_url, headers=headers, stream=True,
+                     timeout=(_TIMEOUT_CONNECT, _TIMEOUT_READ),
+                     allow_redirects=True)
+    try:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0) or 0) or total_hint
+        done = 0
+        last_t = time.monotonic()
+        last_b = 0
+        win_start = time.monotonic()
+        win_bytes = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(CHUNK_SIZE):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UpdateCancelled()
+                if not chunk:
+                    continue
+                f.write(chunk)
+                done += len(chunk)
+                win_bytes += len(chunk)
+                now = time.monotonic()
+                if progress_cb is not None and now - last_t >= 0.5:
+                    speed = (done - last_b) / (now - last_t) if now > last_t else 0.0
+                    try:
+                        progress_cb({"downloaded": done, "total": total,
+                                     "speed": speed, "threads": 1})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    last_t, last_b = now, done
+                if now - win_start >= STALL_WINDOW:
+                    if win_bytes < STALL_MIN_BYTES:
+                        raise RuntimeError(
+                            "停滯: {} bytes/{:.0f}s".format(win_bytes, now - win_start))
+                    win_start, win_bytes = now, 0
+        if total and done < total:
+            raise RuntimeError("下載不完整: {}/{} 位元組".format(done, total))
+    finally:
+        r.close()
+
+
+def download_file(url, dest, progress_cb=None, cancel_event=None,
+                  threads=DOWNLOAD_THREADS):
+    """下載 url 到 dest，具備多線程分段、進度回報、停滯偵測與取消。
+
+    ``progress_cb`` 會收到 dict: ``{"downloaded", "total", "speed", "threads"}``；
+    ``cancel_event`` 為 ``threading.Event``，設起後會盡快中止並拋出
+    :class:`UpdateCancelled`。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise UpdateCancelled()
+
+    final_url, total, supports_range = _probe_download(url)
+
+    if supports_range and total >= MIN_MULTIPART_SIZE:
+        try:
+            _download_multipart(final_url, dest, total, max(1, int(threads)),
+                                progress_cb, cancel_event)
+            return
+        except UpdateCancelled:
+            raise
+        except Exception:  # noqa: BLE001 — 分段失敗退回單線再試
+            if cancel_event is not None and cancel_event.is_set():
+                raise UpdateCancelled()
+
+    last_error = None
+    for attempt in range(1, MAX_BLOCK_RETRIES + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise UpdateCancelled()
+        try:
+            _download_single(final_url, dest, total, progress_cb, cancel_event)
+            return
+        except UpdateCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if attempt < MAX_BLOCK_RETRIES:
+                time.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
+    raise RuntimeError("下載失敗: {}".format(last_error))
+
+
+def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD,
+                 progress_cb=None, cancel_event=None, threads=DOWNLOAD_THREADS):
     """下載並驗證更新，解壓到 <dist>.new，回傳新目錄路徑。
 
     任何一步失敗都拋例外；下載的暫存檔會在 finally 中清理。
     """
+    _cleanup_stale_downloads()
+
     # 1. 先取 SHA256 清單 (小檔)，解析出本資產的期望雜湊
     r = requests.get(checksum_url, timeout=timeout)
     r.raise_for_status()
@@ -164,12 +507,8 @@ def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD)
     fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="netredir_update_")
     os.close(fd)
     try:
-        r = requests.get(asset_url, timeout=timeout, stream=True)
-        r.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
+        download_file(asset_url, tmp_path, progress_cb=progress_cb,
+                      cancel_event=cancel_event, threads=threads)
 
         # 3. 校驗 (不符即中止，避免執行被竄改的二進位檔)
         if not verify_sha256(tmp_path, expected):

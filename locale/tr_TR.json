@@ -187,5 +187,7 @@
     "💡 提示：雙擊代理列可編輯，或按右鍵開啟選單": "💡 İpucu: düzenlemek için bir proxy'ye çift tıklayın veya menü için sağ tıklayın",
     "自動管理介面計量": "Arayüz metriklerini otomatik yönet",
     "勾選後自動將 SoftEther 虛擬網卡計量設高、實體網卡設低，避免 VPN 搶走預設路由。": "Etkinleştirildiğinde SoftEther sanal bağdaştırıcılarına yüksek, fiziksel bağdaştırıcıya düşük metrik verilir; böylece VPN varsayılan rotayı almaz.",
-    "自動連線": "Otomatik bağlan"
+    "自動連線": "Otomatik bağlan",
+    "已下載 {done} / {total}（{pct}%）　速度 {speed}/s　連線 {threads}": "İndirilen {done} / {total} ({pct}%)　Hız {speed}/s　Bağlantı {threads}",
+    "已取消更新下載。": "Güncelleme indirmesi iptal edildi."
 }

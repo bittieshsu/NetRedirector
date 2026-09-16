@@ -187,5 +187,7 @@
     "💡 提示：雙擊代理列可編輯，或按右鍵開啟選單": "💡 Tips: klik dua kali proxy untuk mengedit, atau klik kanan untuk menu",
     "自動管理介面計量": "Kelola metrik antarmuka secara otomatis",
     "勾選後自動將 SoftEther 虛擬網卡計量設高、實體網卡設低，避免 VPN 搶走預設路由。": "Saat aktif, adaptor virtual SoftEther mendapat metrik tinggi dan adaptor fisik metrik rendah, agar VPN tidak mengambil rute default.",
-    "自動連線": "Sambung otomatis"
+    "自動連線": "Sambung otomatis",
+    "已下載 {done} / {total}（{pct}%）　速度 {speed}/s　連線 {threads}": "Terunduh {done} / {total} ({pct}%)　Kecepatan {speed}/s　Koneksi {threads}",
+    "已取消更新下載。": "Unduhan pembaruan dibatalkan."
 }
