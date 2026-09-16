@@ -14,8 +14,10 @@
 安全要求：下載的更新檔必須通過 SHA-256 校驗才會解壓、替換，否則中止。
 """
 
+import collections
 import glob
 import hashlib
+import json
 import os
 import queue
 import re
@@ -26,6 +28,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from urllib.parse import quote
 
 import requests
 
@@ -38,14 +41,25 @@ _TIMEOUT_DOWNLOAD = 180   # SHA256 清單等下載的逾時秒數
 
 # --- 多線程分段下載參數 ---
 DOWNLOAD_THREADS = 8                  # 預設並行連線數
-TARGET_BLOCK_SIZE = 4 * 1024 * 1024   # 目標分段大小 (依檔案大小決定段數)
-MAX_BLOCKS = 16                       # 分段數上限
+TARGET_BLOCK_SIZE = 1 * 1024 * 1024   # 目標分段大小 (依檔案大小決定段數)
+MAX_BLOCKS = 32                       # 分段數上限
 MIN_MULTIPART_SIZE = 4 * 1024 * 1024  # 小於此大小不值得分段，直接單線
 CHUNK_SIZE = 256 * 1024               # 每次讀取的位元組數
 STALL_WINDOW = 30                     # 停滯偵測視窗 (秒)
 STALL_MIN_BYTES = 128 * 1024          # 視窗內至少需收到的位元組，否則視為停滯
 MAX_BLOCK_RETRIES = 4                 # 單一分段最大重試次數
+# GitHub release CDN 常以「突發」方式送資料：短時間內灌一批、然後停頓。
+# 用 0.5 秒瞬時速度估算時，幾乎每個停頓窗都會顯示 0 B/s（實測 32.7 MB 的
+# 下載出現 183/243 個 0 速度樣本），看起來像不斷歸零。改用數秒滑動視窗
+# 取平均，才反映真實吞吐。
+SPEED_WINDOW = 3.0                    # 速度平滑視窗 (秒)
 USER_AGENT = "NetRedirector-Updater"
+
+# --- 代理 / 智能分流 ---
+PROXY_CONFIG_FILENAME = "config.json" # 代理清單來源 (與主程式共用)
+PROXY_PROBE_BYTES = 256 * 1024        # 量測各路徑吞吐時抓的位元組數
+PROXY_PROBE_TIMEOUT = 6               # 單一路徑量測逾時 (秒)
+PROXY_PROBE_TOTAL_TIMEOUT = 8         # 全部路徑量測的總逾時 (秒)
 
 
 class UpdateCancelled(Exception):
@@ -174,6 +188,182 @@ def current_dist_dir():
 
 
 # ------------------------------------------------------------------ #
+# 路徑選擇 (直連 vs 設定的代理) — 智能分流 + 防呆
+# ------------------------------------------------------------------ #
+def _config_search_paths():
+    """回傳可能存放 config.json 的路徑 (依序、去重)。
+
+    主程式以相對路徑開啟 "config.json" (cwd)，打包後 cwd 未必等於執行檔
+    目錄，故三個位置都找：執行檔目錄、目前工作目錄、原始碼目錄。
+    """
+    candidates = []
+    try:
+        candidates.append(os.path.join(current_dist_dir(), PROXY_CONFIG_FILENAME))
+    except Exception:  # noqa: BLE001
+        pass
+    candidates.append(os.path.abspath(PROXY_CONFIG_FILENAME))
+    candidates.append(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), PROXY_CONFIG_FILENAME))
+    seen = []
+    for p in candidates:
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _proxy_map(proxy_url):
+    """把單一代理 URL 轉成 requests 的 proxies dict；無代理回 None。"""
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def _proxy_url_from_entry(entry):
+    """把 config.json 的一筆代理轉成 requests 用的 URL；不適用則回 None。
+
+    SOCKS5 用 ``socks5h`` (由代理端解析 DNS)，避免本機 DNS 被轉址規則
+    或 RPZ 影響。密碼以 DPAPI 解密，解密失敗視為無密碼 (可能設定的來源
+    是別台機器)。型別不支援、欄位缺失一律回 None，由呼叫端略過。
+    """
+    try:
+        ptype = str(entry.get("type", "SOCKS5")).upper()
+        if ptype not in ("SOCKS5", "HTTP"):
+            return None
+        host = str(entry.get("ip", "") or "").strip()
+        port = int(entry.get("port") or 0)
+        if not host or not port:
+            return None
+        user = entry.get("user") or ""
+        pwd = entry.get("pass") or ""
+        if pwd:
+            try:
+                import secure_config  # 延後載入：保持本模組可獨立測試
+                pwd = secure_config.decrypt_password(pwd)
+            except Exception:  # noqa: BLE001
+                pwd = ""
+        scheme = "socks5h" if ptype == "SOCKS5" else "http"
+        if user or pwd:
+            auth = "{}:{}".format(quote(str(user), safe=""), quote(str(pwd), safe=""))
+            return "{}://{}@{}:{}".format(scheme, auth, host, port)
+        return "{}://{}:{}".format(scheme, host, port)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_proxy_urls(config_paths=None):
+    """從 config.json 讀出可用代理，回傳 ``[{"name", "url"}]``。
+
+    任何問題 (檔案不存在、JSON 破損、欄位不合法、密碼解不開) 都只是略過
+    該筆；整體失敗時回傳空清單 —— 更新流程絕不因設定檔問題而中斷。
+    """
+    for path in (config_paths or _config_search_paths()):
+        data = None
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = None
+        if not isinstance(data, dict):
+            continue
+        out = []
+        for entry in (data.get("proxies") or []):
+            if not isinstance(entry, dict):
+                continue
+            url = _proxy_url_from_entry(entry)
+            if url:
+                out.append({"name": entry.get("name") or url, "url": url})
+        if out:
+            return out
+    return []
+
+
+def _measure_path(url, proxy_url, probe_bytes=PROXY_PROBE_BYTES,
+                  timeout=PROXY_PROBE_TIMEOUT):
+    """量測一條路徑的吞吐 (bytes/s)；失敗或無資料回 None。
+
+    用一次小範圍 Range 請求實測，而不是只量 ping —— CDN 與代理的「連得上」
+    和「跑得快」經常是兩回事，只量延遲會挑到很慢的線。
+    """
+    headers = {
+        "Range": "bytes=0-{}".format(probe_bytes - 1),
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "identity",
+    }
+    try:
+        t0 = time.monotonic()
+        r = requests.get(url, headers=headers, stream=True,
+                         proxies=_proxy_map(proxy_url),
+                         timeout=(_TIMEOUT_CONNECT, timeout),
+                         allow_redirects=True)
+        try:
+            if r.status_code not in (200, 206):
+                return None
+            got = 0
+            for chunk in r.iter_content(CHUNK_SIZE):
+                if not chunk:
+                    continue
+                got += len(chunk)
+                if got >= probe_bytes:
+                    break
+            dt = time.monotonic() - t0
+            if got <= 0 or dt <= 0:
+                return None
+            return got / dt
+        finally:
+            r.close()
+    except Exception:  # noqa: BLE001 — 代理掛掉/不支援 SOCKS 都只代表這條不可用
+        return None
+
+
+def _rank_download_paths(url, use_proxy=True):
+    """並行量測直連與各代理，回傳由快到慢的 ``[(proxy_url, speed, label)]``。
+
+    防呆保證：
+    - 沒有設定代理時直接回 ``[(None, 0.0, "直連")]``，不增加任何延遲。
+    - 個別路徑量測失敗 (連不上、不支援、逾時) 只會少一個候選。
+    - 直連永遠保留且保底排在最後，代理全掛時行為與原本完全相同。
+    """
+    proxies = []
+    if use_proxy:
+        try:
+            proxies = load_proxy_urls()
+        except Exception:  # noqa: BLE001
+            proxies = []
+    if not proxies:
+        return [(None, 0.0, "直連")]
+
+    candidates = [(p["url"], p["name"]) for p in proxies]
+    candidates.append((None, "直連"))
+
+    results = {}
+    lock = threading.Lock()
+
+    def probe(proxy_url, label):
+        speed = _measure_path(url, proxy_url)
+        if speed is not None:
+            with lock:
+                results[proxy_url] = (speed, label)
+
+    threads = [threading.Thread(target=probe, args=(u, n), daemon=True)
+               for u, n in candidates]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + PROXY_PROBE_TOTAL_TIMEOUT
+    for t in threads:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    with lock:
+        ranked = [(u, s, n) for u, (s, n) in results.items()]
+    ranked.sort(key=lambda item: -item[1])
+    if not ranked:
+        return [(None, 0.0, "直連")]
+    if not any(u is None for u, _, _ in ranked):
+        ranked.append((None, 0.0, "直連"))
+    return ranked
+
+
+# ------------------------------------------------------------------ #
 # 下載 (多線程分段 + 進度回報 + 停滯偵測)
 # ------------------------------------------------------------------ #
 def _cleanup_stale_downloads():
@@ -186,7 +376,7 @@ def _cleanup_stale_downloads():
             pass
 
 
-def _probe_download(url, timeout=_TIMEOUT_CHECK):
+def _probe_download(url, timeout=_TIMEOUT_CHECK, proxy_url=None):
     """以 ``Range: bytes=0-0`` 探測檔案大小與是否支援分段下載。
 
     回傳 ``(final_url, total_size, supports_range)``。total_size 可能為 0
@@ -199,7 +389,8 @@ def _probe_download(url, timeout=_TIMEOUT_CHECK):
         "Accept-Encoding": "identity",
     }
     r = requests.get(url, headers=headers, timeout=(_TIMEOUT_CONNECT, timeout),
-                     stream=True, allow_redirects=True)
+                     stream=True, allow_redirects=True,
+                     proxies=_proxy_map(proxy_url))
     try:
         r.raise_for_status()
         final_url = r.url or url
@@ -227,8 +418,7 @@ class _ProgressReporter(threading.Thread):
         self._get_threads = get_threads
         self._interval = interval
         self._stop = threading.Event()
-        self._last_bytes = 0
-        self._last_time = None
+        self._history = collections.deque()   # (t, bytes) 供滑動視窗計算速度
 
     def run(self):
         while not self._stop.wait(self._interval):
@@ -239,11 +429,13 @@ class _ProgressReporter(threading.Thread):
             return
         now = time.monotonic()
         cur = self._get_downloaded()
-        if self._last_time is None:
-            self._last_time, self._last_bytes = now, cur
-        dt = now - self._last_time
-        speed = (cur - self._last_bytes) / dt if dt > 0 else 0.0
-        self._last_time, self._last_bytes = now, cur
+        self._history.append((now, cur))
+        while len(self._history) > 1 and now - self._history[0][0] > SPEED_WINDOW:
+            self._history.popleft()
+        t0, b0 = self._history[0]
+        dt = now - t0
+        # 以滑動視窗平均取代瞬時速度；夾在 0 以上避免區段重試造成負值
+        speed = max(0.0, (cur - b0) / dt) if dt > 0 else 0.0
         try:
             self._cb({
                 "downloaded": cur,
@@ -306,7 +498,8 @@ def _fetch_block(session, url, start, end, dest, block_bytes, idx, lock,
         r.close()
 
 
-def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_event):
+def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_event,
+                        proxy_url=None):
     """把檔案切成多段並行下載到 dest (dest 會先配置成 total 大小)。"""
     block_size = max(TARGET_BLOCK_SIZE, (total + MAX_BLOCKS - 1) // MAX_BLOCKS)
     bounds = []
@@ -345,6 +538,8 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
 
     def worker():
         session = requests.Session()
+        if proxy_url:
+            session.proxies.update(_proxy_map(proxy_url))
         try:
             while not stop.is_set():
                 if cancel_event is not None and cancel_event.is_set():
@@ -405,12 +600,13 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
             "下載不完整: {}/{} 位元組".format(downloaded(), total))
 
 
-def _download_single(final_url, dest, total_hint, progress_cb, cancel_event):
+def _download_single(final_url, dest, total_hint, progress_cb, cancel_event,
+                     proxy_url=None):
     """單線串流下載 (伺服器不支援 Range，或分段失敗時的後備路徑)。"""
     headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
     r = requests.get(final_url, headers=headers, stream=True,
                      timeout=(_TIMEOUT_CONNECT, _TIMEOUT_READ),
-                     allow_redirects=True)
+                     allow_redirects=True, proxies=_proxy_map(proxy_url))
     try:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0) or 0) or total_hint
@@ -448,23 +644,14 @@ def _download_single(final_url, dest, total_hint, progress_cb, cancel_event):
         r.close()
 
 
-def download_file(url, dest, progress_cb=None, cancel_event=None,
-                  threads=DOWNLOAD_THREADS):
-    """下載 url 到 dest，具備多線程分段、進度回報、停滯偵測與取消。
-
-    ``progress_cb`` 會收到 dict: ``{"downloaded", "total", "speed", "threads"}``；
-    ``cancel_event`` 為 ``threading.Event``，設起後會盡快中止並拋出
-    :class:`UpdateCancelled`。
-    """
-    if cancel_event is not None and cancel_event.is_set():
-        raise UpdateCancelled()
-
-    final_url, total, supports_range = _probe_download(url)
+def _download_over_path(url, dest, proxy_url, threads, progress_cb, cancel_event):
+    """用指定路徑 (proxy_url 為 None 表示直連) 完成一次下載。"""
+    final_url, total, supports_range = _probe_download(url, proxy_url=proxy_url)
 
     if supports_range and total >= MIN_MULTIPART_SIZE:
         try:
             _download_multipart(final_url, dest, total, max(1, int(threads)),
-                                progress_cb, cancel_event)
+                                progress_cb, cancel_event, proxy_url=proxy_url)
             return
         except UpdateCancelled:
             raise
@@ -477,7 +664,8 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
         if cancel_event is not None and cancel_event.is_set():
             raise UpdateCancelled()
         try:
-            _download_single(final_url, dest, total, progress_cb, cancel_event)
+            _download_single(final_url, dest, total, progress_cb, cancel_event,
+                             proxy_url=proxy_url)
             return
         except UpdateCancelled:
             raise
@@ -488,8 +676,52 @@ def download_file(url, dest, progress_cb=None, cancel_event=None,
     raise RuntimeError("下載失敗: {}".format(last_error))
 
 
+def download_file(url, dest, progress_cb=None, cancel_event=None,
+                  threads=DOWNLOAD_THREADS, use_proxy=True, log_cb=None):
+    """下載 url 到 dest，具備多線程分段、進度回報、停滯偵測與取消。
+
+    會先實測「直連 + config.json 內設定的代理」各條路徑的吞吐，挑最快的一條
+    下載；該路徑中途失敗時自動改用次快的，最後保底直連。找不到代理、或代理
+    全部不可用時，行為與純直連完全相同 (防呆)。
+
+    ``progress_cb`` 會收到 dict: ``{"downloaded", "total", "speed", "threads"}``；
+    ``cancel_event`` 為 ``threading.Event``，設起後會盡快中止並拋出
+    :class:`UpdateCancelled`；``log_cb`` 收到字串訊息，供 UI 顯示選路結果。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise UpdateCancelled()
+
+    ranked = _rank_download_paths(url, use_proxy=use_proxy)
+
+    last_error = None
+    for proxy_url, speed, label in ranked:
+        if cancel_event is not None and cancel_event.is_set():
+            raise UpdateCancelled()
+        if log_cb is not None:
+            try:
+                log_cb("更新下載路徑: {} ({:.2f} MB/s)".format(
+                    label, speed / 1048576))
+            except Exception:  # noqa: BLE001 — 記錄不應影響下載
+                pass
+        try:
+            _download_over_path(url, dest, proxy_url, threads,
+                                progress_cb, cancel_event)
+            return
+        except UpdateCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001 — 換下一條路徑再試
+            last_error = e
+            if log_cb is not None:
+                try:
+                    log_cb("路徑「{}」失敗，改用下一條: {}".format(label, e))
+                except Exception:  # noqa: BLE001
+                    pass
+    raise RuntimeError("下載失敗: {}".format(last_error))
+
+
 def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD,
-                 progress_cb=None, cancel_event=None, threads=DOWNLOAD_THREADS):
+                 progress_cb=None, cancel_event=None, threads=DOWNLOAD_THREADS,
+                 use_proxy=True, log_cb=None):
     """下載並驗證更新，解壓到 <dist>.new，回傳新目錄路徑。
 
     任何一步失敗都拋例外；下載的暫存檔會在 finally 中清理。
@@ -508,7 +740,8 @@ def stage_update(asset_url, asset_name, checksum_url, timeout=_TIMEOUT_DOWNLOAD,
     os.close(fd)
     try:
         download_file(asset_url, tmp_path, progress_cb=progress_cb,
-                      cancel_event=cancel_event, threads=threads)
+                      cancel_event=cancel_event, threads=threads,
+                      use_proxy=use_proxy, log_cb=log_cb)
 
         # 3. 校驗 (不符即中止，避免執行被竄改的二進位檔)
         if not verify_sha256(tmp_path, expected):

@@ -72,6 +72,7 @@ class StageWorker(QThread):
     """背景下載並驗證更新 (回傳新版本目錄路徑)。"""
     result = Signal(object)    # str(new_dir) | Exception
     progress = Signal(object)  # dict(downloaded, total, speed, threads)
+    log = Signal(str)          # 選路/換線等文字訊息
 
     def __init__(self, info):
         super().__init__()
@@ -86,7 +87,8 @@ class StageWorker(QThread):
         try:
             path = updater.stage_update(
                 self.info["url"], self.info["asset_name"], self.info["checksum_url"],
-                progress_cb=self.progress.emit, cancel_event=self._cancel_event)
+                progress_cb=self.progress.emit, cancel_event=self._cancel_event,
+                log_cb=self.log.emit)
             self.result.emit(path)
         except Exception as e:
             self.result.emit(e)
@@ -837,6 +839,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self._update_dialog.show()
         self.stage_worker = StageWorker(info)
         self.stage_worker.progress.connect(self._on_stage_progress)
+        self.stage_worker.log.connect(self.append_log)
         self.stage_worker.result.connect(self._on_stage_result)
         self.stage_worker.start()
 
