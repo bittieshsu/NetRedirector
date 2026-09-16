@@ -22,11 +22,12 @@ def normalize_wildcards(s):
     return s.replace(FULLWIDTH_ASTERISK, ASCII_ASTERISK)
 
 
-def normalize_rule_target(target):
-    """正規化規則目標欄位 (進程名稱或 PID)。空字串回傳空字串。"""
+def normalize_rule_target(target, default=""):
+    """正規化規則目標欄位 (進程名稱或 PID)。空白時回傳 default。"""
     if target is None:
         return None
-    return normalize_wildcards(target.strip())
+    target = normalize_wildcards(target.strip())
+    return target or default
 
 
 def normalize_rule_pattern(field, default="*"):

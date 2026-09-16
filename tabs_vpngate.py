@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """VPN Gate 節點派發分頁 mixin (自 vpngate-auto-assign 融入)
 
-左側: SoftEther 虛擬網卡清單 (狀態/伺服器) + 選取後一鍵上線。
+左側: SoftEther 虛擬網卡清單 (狀態/伺服器) + 自動連線開關與手動連線。
 右側: VPN Gate 節點清單 + 篩選 (排除 public-*、port 443、最低速度、國家)。
 
 跨次啟動累積節點池 (vpn_history): 以 ip 去重、依長期連線經驗計算穩定度，
@@ -32,6 +32,7 @@ import vpngate_config as config
 import vpngate
 import vpn_history
 import softether
+import ui_theme
 
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -147,16 +148,16 @@ class VpnGateTabMixin:
         btn_refresh = QPushButton("")
         self._reg("text", btn_refresh, "重新整理網卡")
         btn_refresh.clicked.connect(self.vpn_refresh_nics)
-        btn_connect = QPushButton("")
-        self._reg("text", btn_connect, "一鍵上線")
-        btn_connect.setStyleSheet("background-color: #4CAF50; color: white;")
-        btn_connect.clicked.connect(self.vpn_connect_all)
+        self.chk_vpn_auto_connect = QCheckBox("")
+        self._reg("text", self.chk_vpn_auto_connect, "自動連線")
+        self.chk_vpn_auto_connect.setChecked(False)
+        self.chk_vpn_auto_connect.toggled.connect(self.on_vpn_auto_connect_toggled)
         btn_connect_selected = QPushButton("")
         self._reg("text", btn_connect_selected, "連線選取節點")
         btn_connect_selected.clicked.connect(self.vpn_connect_selected)
-        nic_btns.addWidget(btn_refresh)
-        nic_btns.addWidget(btn_connect)
+        nic_btns.addWidget(self.chk_vpn_auto_connect)
         nic_btns.addWidget(btn_connect_selected)
+        nic_btns.addWidget(btn_refresh)
         left_layout.addLayout(nic_btns)
 
         left_panel.setLayout(left_layout)
@@ -250,12 +251,18 @@ class VpnGateTabMixin:
         self.vpn_fail_count = {}      # ip -> 本次執行中的連續失敗次數 (排序用)
         self.vpn_session_state = {}   # nic -> {node_ip, ip, started_at, unhealthy_streak}
         self.vpn_assigning = False    # 指派進行中旗標 (避免重疊指派)
+        self.vpn_configured_nics = set()   # 已套用 SoftEther 進階設定的網卡
+        self.vpn_config_lock = threading.Lock()
         self.vpn_timer = QTimer()
         self.vpn_timer.timeout.connect(self._vpn_poll_queue)
         self.vpn_timer.start(100)
         self.vpn_monitor_timer = QTimer()
         self.vpn_monitor_timer.timeout.connect(self._vpn_monitor_tick)
         self.vpn_monitor_timer.start(config.SESSION_POLL_INTERVAL * 1000)
+        # 自動連線:勾選後定期掃描離線網卡並自動派發候選節點
+        self.vpn_auto_timer = QTimer()
+        self.vpn_auto_timer.setInterval(config.AUTO_CONNECT_INTERVAL * 1000)
+        self.vpn_auto_timer.timeout.connect(self._vpn_auto_connect_tick)
 
         # 啟動即載入池子，讓使用者未抓取也能瀏覽累積節點
         self._vpn_rebuild_all_nodes()
@@ -303,6 +310,12 @@ class VpnGateTabMixin:
     def vpn_refresh_nics(self):
         self._vpn_log("重新整理網卡狀態…")
 
+        # 使用者可能剛在 SoftEther VPN Client 建立新虛擬網卡 (計量為「自動」)，
+        # 順勢校正一次計量，確保實體網卡仍是主網路。
+        sync_metrics = getattr(self, "_sync_interface_metrics", None)
+        if callable(sync_metrics):
+            sync_metrics()
+
         def work():
             nics = self.vpn_se.nic_list()
             servers = self.vpn_se.account_servers()
@@ -336,7 +349,8 @@ class VpnGateTabMixin:
                 status_item = QTableWidgetItem()
                 table.setItem(row, 1, status_item)
             status_item.setText(self.t("上線") if online else self.t("離線"))
-            status_item.setForeground(QBrush(QColor("#4CAF50") if online else QColor("#F44336")))
+            status_item.setForeground(QBrush(QColor(
+                ui_theme.COLOR_SUCCESS if online else ui_theme.COLOR_DANGER)))
 
     def _vpn_render_nics(self, rows):
         self.vpn_nic_names = [r[0] for r in rows]
@@ -361,21 +375,64 @@ class VpnGateTabMixin:
                 ips.add(server[0])
         return ips
 
+    # --------------------------------------------------------- 自動連線
+    def _vpn_auto_connect_enabled(self):
+        chk = getattr(self, 'chk_vpn_auto_connect', None)
+        return bool(chk is not None and chk.isChecked())
+
+    def on_vpn_auto_connect_toggled(self, checked):
+        """勾選「自動連線」後立即上線一次,之後定期掃描離線網卡。"""
+        if checked:
+            self._vpn_log("已開啟自動連線：自動連上離線網卡，斷線時改派其他候選節點")
+            timer = getattr(self, 'vpn_auto_timer', None)
+            if timer is not None:
+                timer.start()
+            if not hasattr(self, 'vpn_nic_names'):
+                # 尚未取得網卡清單:先刷新,稍後再嘗試指派
+                self.vpn_refresh_nics()
+                QTimer.singleShot(3000, self._vpn_auto_connect_tick)
+            else:
+                self._vpn_auto_connect_once()
+        else:
+            timer = getattr(self, 'vpn_auto_timer', None)
+            if timer is not None:
+                timer.stop()
+            self._vpn_log("已關閉自動連線")
+
+    def _vpn_auto_connect_tick(self):
+        if not self._vpn_auto_connect_enabled() or self.vpn_assigning:
+            return
+        # 尚未取得網卡清單時先補一次 (啟動後可能還沒按過重新整理)
+        if not hasattr(self, 'vpn_nic_names'):
+            self.vpn_refresh_nics()
+            return
+        self._vpn_auto_connect_once()
+
     def vpn_connect_all(self):
+        self._vpn_start_assign(silent=False)
+
+    def _vpn_auto_connect_once(self):
+        self._vpn_start_assign(silent=True)
+
+    def _vpn_start_assign(self, silent=False):
         if self.vpn_assigning:
-            self._vpn_log("已有指派進行中，略過本次")
+            if not silent:
+                self._vpn_log("已有指派進行中，略過本次")
             return
         nics = list(getattr(self, 'vpn_nic_names', []) or [])
         if not nics:
-            QMessageBox.information(self, self.t("提示"), self.t("尚無虛擬網卡，請先重新整理網卡"))
+            if not silent:
+                QMessageBox.information(self, self.t("提示"), self.t("尚無虛擬網卡，請先重新整理網卡"))
             return
         interfaces = getattr(self, 'current_interfaces', {})
         offline = [n for n in nics if not self._vpn_nic_online(n, interfaces)]
         if not offline:
-            self._vpn_log("所有網卡皆已在線，無需處理")
+            if not silent:
+                self._vpn_log("所有網卡皆已在線，無需處理")
             return
         if not self.vpn_candidates:
-            self._vpn_log("尚未抓取節點或篩選後無節點，請先抓取/套用篩選")
+            if not silent:
+                self._vpn_log("尚未抓取節點或篩選後無節點，請先抓取/套用篩選")
             return
         self.vpn_assigning = True
         self._vpn_run_bg(lambda: self._vpn_assign_nics(offline), done=self._vpn_after_assign)
@@ -568,6 +625,24 @@ class VpnGateTabMixin:
 
         return {"results": results, "outcomes": outcomes}
 
+    def _vpn_configure_account(self, nic):
+        """首次使用某網卡時套用 SoftEther 進階設定 (TCP 連線數/斷線重連)。
+
+        這些設定對應 VPN Client「高級設置」對話框,以 vpncmd 的
+        AccountDetailSet / AccountRetrySet 設定;必須在 account_set 之後呼叫
+        (設定存在帳號上)。預設不自動重連,讓被踢/斷線後的換節點由本程式
+        統一處理,避免 SoftEther 自行連回原伺服器。
+        """
+        with self.vpn_config_lock:
+            if nic in self.vpn_configured_nics:
+                return
+            self.vpn_configured_nics.add(nic)
+        try:
+            self.vpn_se.account_detail_set(nic, max_tcp=config.ACCOUNT_MAX_TCP)
+            self.vpn_se.account_retry_set(nic, num=config.ACCOUNT_RETRY_NUM)
+        except Exception as e:  # noqa: BLE001 — 進階設定失敗不阻斷連線
+            self._vpn_post(self._vpn_log, f"     ! 進階設定套用失敗: {e}")
+
     def _vpn_connect_only(self, nic, node):
         """把 nic 連到 node 並等待 session 建立，不做 IP/tunnel 驗證。
 
@@ -576,6 +651,7 @@ class VpnGateTabMixin:
         self.vpn_se.account_disconnect(nic)
         self.vpn_se.account_set(nic, node.ip, node.port)
         self.vpn_se.account_set_anonymous(nic)
+        self._vpn_configure_account(nic)
         self.vpn_se.account_connect(nic)
         if not _wait_connected(self.vpn_se, nic):
             self._vpn_post(self._vpn_log, "     ! session 未建立")
@@ -691,7 +767,13 @@ class VpnGateTabMixin:
                 st["unhealthy_streak"] = 0
         if kicked:
             vpn_history.save_history(config.VPN_HISTORY_FILE, self.vpn_history)
-            self._vpn_auto_reconnect(kicked)
+            if self._vpn_auto_connect_enabled():
+                self._vpn_auto_reconnect(kicked)
+            else:
+                # 未開啟自動連線:只記錄中斷,不重新派發,並停止追蹤避免反覆告警
+                for nic, _ in kicked:
+                    self.vpn_session_state.pop(nic, None)
+                self._vpn_log("自動連線未開啟，僅記錄中斷")
 
     def _vpn_record_session_end(self, st, now):
         duration = max(0, int(now - st["started_at"]))

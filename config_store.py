@@ -10,19 +10,26 @@ import os
 import secure_config
 
 
-def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies, rules, check_updates=True):
+def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies, rules,
+                      check_updates=True, autostart=True, manage_metric=True):
     """把執行期狀態序列化為 config.json 結構。
 
     - Proxy: 移除動態數據 (latency/ID)，密碼以 DPAPI 加密
     - Rules: 保存 Proxy 的 UI 辨識字串 (例如 "[Custom] MyVPN") 而非動態 ID
     - minimize_to_tray: 關閉視窗時是否縮到系統匣
     - check_updates: 啟動時是否自動檢查更新
+    - autostart: 是否開機（登入）自動啟動；實際狀態存於工作排程器，
+      此欄位只記錄使用者偏好，預設開啟。缺少此欄位的舊設定檔視為預設開啟。
+    - manage_metric: 是否自動校正網路介面計量 (避免 SoftEther 虛擬網卡
+      搶走預設路由)。缺少此欄位的舊設定檔視為預設開啟。
     """
     config_data = {
         "lang": lang,
         "ping_target": ping_target,
         "minimize_to_tray": bool(minimize_to_tray),
         "check_updates": bool(check_updates),
+        "autostart": bool(autostart),
+        "manage_metric": bool(manage_metric),
         "hubs": hubs or {},
         "proxies": [],
         "rules": [],
@@ -40,6 +47,8 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
 
     for r in rules:
         config_data["rules"].append({
+            # 停用中的規則仍要保存，下次啟動才不會遺失 (舊設定檔無此欄位視為啟用)
+            "enabled": bool(r.get('enabled', True)),
             "type": r['type'],
             "target": r['target'],
             "hosts": r.get('hosts', '*'),

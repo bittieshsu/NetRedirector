@@ -2,6 +2,7 @@
 """i18n 語系檔完整性測試 — 所有語系 JSON 有效且鍵集合一致"""
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,3 +60,23 @@ def test_i18n_load_and_lookup():
     assert tr.t("不存在的中文鍵xyz") == "不存在的中文鍵xyz"  # 缺鍵回退原文
     tr.load("zh_TW")
     assert tr.t("Ping 目標:") == "Ping 目標:"
+
+
+# 這些語系不使用漢字；值若含漢字代表新增字串忘了翻譯，或值被留成中文原文。
+# ja_JP / zh_CN / zh_TW 合法使用漢字，故不列入。
+NON_CJK_LANGS = [
+    "en_US", "de_DE", "es_ES", "fr_FR", "id_ID", "it_IT", "ko_KR",
+    "nl_NL", "pl_PL", "pt_BR", "ru_RU", "th_TH", "tr_TR", "vi_VN",
+]
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def test_non_cjk_locales_have_no_leftover_chinese():
+    """非漢字語系的翻譯值不得殘留中文 (含「值等於鍵」的未翻譯佔位)。"""
+    locales = _load_all_locales()
+    for lang in NON_CJK_LANGS:
+        for key, val in locales[lang].items():
+            if key.startswith("_"):
+                continue
+            assert not CJK_RE.search(val), (
+                f"{lang} 的鍵 {key!r} 翻譯仍含中文: {val!r}")

@@ -43,6 +43,13 @@ def test_normalize_rule_target_strips_and_normalizes():
     assert normalize_rule_target("") == ""
 
 
+def test_normalize_rule_target_default():
+    assert normalize_rule_target("") == ""              # 未指定時不套用 fallback
+    assert normalize_rule_target("", default="*") == "*"
+    assert normalize_rule_target("  ", default="*") == "*"
+    assert normalize_rule_target("chrome.exe", default="*") == "chrome.exe"
+
+
 def test_normalize_rule_pattern_defaults():
     assert normalize_rule_pattern("") == "*"
     assert normalize_rule_pattern(None) == "*"

@@ -70,6 +70,15 @@ def test_rules_persist_proxy_name():
     assert data["rules"][1]["proxy_name"] == ""
 
 
+def test_rules_persist_enabled_flag():
+    """停用中的規則也必須保存，且舊規則 (無此欄位) 視為啟用。"""
+    proxies, rules = sample_state()
+    rules[1]["enabled"] = False
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
+    assert data["rules"][0]["enabled"] is True   # 未指定時預設啟用
+    assert data["rules"][1]["enabled"] is False
+
+
 def test_dynamic_fields_removed():
     proxies, rules = sample_state()
     data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
@@ -181,4 +190,34 @@ def test_check_updates_default_and_roundtrip(tmp_path):
     path = os.path.join(tmp_path, "config.json")
     assert config_store.save_config_file(path, data_off) is None
     assert config_store.load_config_file(path)["check_updates"] is False
+
+
+def test_autostart_default_and_roundtrip(tmp_path):
+    """autostart 預設開啟、可關閉，且序列化往返保留。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
+    assert data["autostart"] is True
+
+    data_off = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules, True, False)
+    assert data_off["autostart"] is False
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data_off) is None
+    assert config_store.load_config_file(path)["autostart"] is False
+
+
+def test_manage_metric_default_and_roundtrip(tmp_path):
+    """manage_metric 預設開啟、可關閉，且序列化往返保留。"""
+    proxies, rules = sample_state()
+    data = config_store.build_config_data("zh_TW", "", False, {}, proxies, rules)
+    assert data["manage_metric"] is True
+
+    data_off = config_store.build_config_data(
+        "zh_TW", "", False, {}, proxies, rules, True, True, False)
+    assert data_off["manage_metric"] is False
+
+    path = os.path.join(tmp_path, "config.json")
+    assert config_store.save_config_file(path, data_off) is None
+    assert config_store.load_config_file(path)["manage_metric"] is False
 

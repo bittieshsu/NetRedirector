@@ -23,6 +23,7 @@ import network_utils
 import proxy_core
 import secure_config
 import rule_utils
+import ui_theme
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 
@@ -55,7 +56,7 @@ class HubTabMixin:
         
         self.btn_apply_hub = QPushButton("")
         self._reg("text", self.btn_apply_hub, "啟動/重啟選中端口")
-        self.btn_apply_hub.setStyleSheet("background-color: #4CAF50; color: white;")
+        self.btn_apply_hub.setObjectName("SuccessBtn")
         self.btn_apply_hub.clicked.connect(self.apply_hub_config)
 
         left_layout.addLayout(input_layout)
@@ -185,7 +186,8 @@ class HubTabMixin:
             if item.text().startswith(str(port)):
                 status = self.t("(運行中)") if is_running else self.t("(失敗)")
                 item.setText(f"{port} {status}")
-                item.setForeground(QBrush(QColor("green") if is_running else QColor("red")))
+                item.setForeground(QBrush(QColor(
+                    ui_theme.COLOR_SUCCESS if is_running else ui_theme.COLOR_DANGER)))
                 break
 
     def refresh_hub_table(self):
@@ -212,16 +214,19 @@ class HubTabMixin:
                 data = self.current_interfaces[name]
                 self.table_hub.setItem(row, 2, QTableWidgetItem(data['ipv4']))
                 lat_item = QTableWidgetItem(str(data['latency']) + " ms")
-                if data['latency'] < 100: lat_item.setForeground(QBrush(QColor("#4CAF50")))
-                elif data['latency'] < 300: lat_item.setForeground(QBrush(QColor("#FF9800")))
-                else: lat_item.setForeground(QBrush(QColor("#F44336")))
+                if data['latency'] < 100:
+                    lat_item.setForeground(QBrush(QColor(ui_theme.COLOR_SUCCESS)))
+                elif data['latency'] < 300:
+                    lat_item.setForeground(QBrush(QColor(ui_theme.COLOR_WARN)))
+                else:
+                    lat_item.setForeground(QBrush(QColor(ui_theme.COLOR_DANGER)))
                 self.table_hub.setItem(row, 3, lat_item)
                 active = proxy_core.route_manager.interfaces.get(name, {}).get('active_conns', 0)
                 self.table_hub.setItem(row, 4, QTableWidgetItem(str(active)))
             else:
-                name_item.setForeground(QBrush(QColor("gray")))
+                name_item.setForeground(QBrush(QColor("#64748B")))
                 offline_item = QTableWidgetItem(self.t("離線 (等待重連...)"))
-                offline_item.setForeground(QBrush(QColor("gray")))
+                offline_item.setForeground(QBrush(QColor("#64748B")))
                 self.table_hub.setItem(row, 2, offline_item)
                 self.table_hub.setItem(row, 3, QTableWidgetItem("-"))
                 self.table_hub.setItem(row, 4, QTableWidgetItem("0"))
@@ -247,19 +252,32 @@ class HubTabMixin:
             self.append_log(f"已批次更新端口 {self.selected_hub_port} 的綁定介面")
 
     def on_hub_table_click(self, row, col):
-        if not self.selected_hub_port: return
-        name = self.table_hub.item(row, 1).text()
+        """點整列都能切換綁定，包含點在勾選框外的空白處。
+
+        Qt 只在點到勾選指示器本體時才會自動切換狀態；點到同一格的空白處或
+        其他欄位都不會。因此以 port_config 內的實際綁定狀態為基準來判斷：
+        勾選狀態與它一致代表 Qt 沒有自動切換 (點在框外)，這裡就手動切換；
+        不一致代表 Qt 已經切換過，直接沿用，避免二次翻轉。
+        """
+        if not self.selected_hub_port:
+            return
+        name_item = self.table_hub.item(row, 1)
         chk_item = self.table_hub.item(row, 0)
-        if col == 0:
-            # 點到勾選框時 Qt 已自動切換狀態，直接讀取新狀態
-            checked = (chk_item.checkState() == Qt.CheckState.Checked)
-        else:
-            # 點到其他欄位時改為手動切換勾選，達成「點整列即可勾選」
-            checked = (chk_item.checkState() != Qt.CheckState.Checked)
-            chk_item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-        curr = self.port_config.get(self.selected_hub_port, [])
-        if checked and name not in curr: curr.append(name)
-        elif not checked and name in curr: curr.remove(name)
-        self.port_config[self.selected_hub_port] = curr
-        proxy_core.route_manager.update_port_binding(self.selected_hub_port, curr)
+        if name_item is None or chk_item is None:
+            return
+        name = name_item.text()
+        port = self.selected_hub_port
+        curr = self.port_config.get(port, [])
+        checked = (chk_item.checkState() == Qt.CheckState.Checked)
+        if checked == (name in curr):
+            # 點在指示器外：Qt 不會自動切換，這裡手動補上
+            checked = not checked
+            chk_item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        if checked and name not in curr:
+            curr.append(name)
+        elif not checked and name in curr:
+            curr.remove(name)
+        self.port_config[port] = curr
+        proxy_core.route_manager.update_port_binding(port, curr)
 

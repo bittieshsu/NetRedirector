@@ -154,6 +154,21 @@ class SoftEtherClient:
         self.run("AccountUsernameSet", name, f"/USERNAME:{config.VPNGATE_USERNAME}")
         return self.run("AccountAnonymousSet", name)
 
+    def account_detail_set(self, name: str, max_tcp: int | None = None) -> str:
+        """設定進階通訊設定 (AccountDetailSet);目前只調整 TCP 連線數。"""
+        args = ["AccountDetailSet", name]
+        if max_tcp is not None:
+            args.append(f"/MAXTCP:{int(max_tcp)}")
+        return self.run(*args)
+
+    def account_retry_set(self, name: str, num: int = 0,
+                          interval: int | None = None) -> str:
+        """設定連線失敗/斷線後的重連次數;num=0 表示不自動重連。"""
+        args = ["AccountRetrySet", name, f"/NUM:{int(num)}"]
+        if interval is not None:
+            args.append(f"/INTERVAL:{int(interval)}")
+        return self.run(*args)
+
     def account_connect(self, name: str) -> str:
         return self.run("AccountConnect", name)
 

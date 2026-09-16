@@ -30,7 +30,7 @@
 | 5. VPN Gate 節點派發 (VPN Gate) |
 | :---: |
 | [VPN Gate 界面預覽](docs/images/5.png) |
-| *SoftEther 虛擬網卡管理、VPN Gate 公開節點抓取與一鍵派發連線* |
+| *SoftEther 虛擬網卡管理、VPN Gate 公開節點抓取與自動連線派發* |
 
 ---
 
@@ -69,7 +69,7 @@
 ### 7. VPN Gate 節點自動派發 (VPN Gate 分頁)
 - 抓取 [VPN Gate](https://www.vpngate.net/) 即時公開中繼節點清單，依速度/評分排序。
 - 支援篩選：排除 `public-*` 節點、排除 port 443、最低速度門檻、指定國家。
-- 對 SoftEther 虛擬網卡（`vpncmd.exe`）一鍵自動設定、連線並驗證 tunnel 通網；單一節點失敗自動換下一個候選。
+- 對 SoftEther 虛擬網卡（`vpncmd.exe`）自動設定（含 TCP 連線數與斷線重連等進階選項）、連線並驗證 tunnel 通網；勾選「自動連線」後會持續補上離線網卡，單一節點失敗自動換下一個候選。
 
 ---
 
@@ -123,8 +123,8 @@
 ### 二、 進程攔截規則 (Rules 分頁)
 1. **選擇匹配方式**：勾選「進程名稱」或「PID」。
 2. **填寫目標資訊**：
-   - 範例（進程名稱）：`chrome.exe` 或 `steam.exe`
-   - 範例（PID）：`1234`
+   - 範例（進程名稱）：`chrome.exe` 或 `steam.exe`；**留空為 `*`，代表比對所有進程**
+   - 範例（PID）：`1234`（PID 模式必須填寫數字）
 3. **設定進階條件**：可選填目標主機（如 `*.google.com`）、端口（如 `443`）及傳輸協議（TCP/UDP/ALL）。Hosts 欄位支援 **域名**（`*.google.com` 透過 DNS 嗅探匹配 `mail.google.com` 等任意子網域；`google.com` 只匹配 apex）與 **IP**（如 `192.168.1.1`），多個目標以 `;` 分隔。萬用子網域比對依賴本機**明文 DNS（53 埠）**回應建立 IP→域名對照，DoH/DoT 或 DNS 本身走代理時該規則會退回 apex-only。
 4. **選擇動作與代理**：
    - **代理**：指定透過某個已設定的自訂代理轉發。
@@ -152,7 +152,9 @@
 2. **抓取節點**：點擊「抓取節點」從 [VPN Gate](https://www.vpngate.net/) 即時清單（`http://www.vpngate.net/api/iphone/`）取得公開中繼節點；Port 欄位從 OpenVPN 設定 base64 解碼後的 `remote` 行取出（SoftEther 與 OpenVPN 共用同一 listener）。
 3. **設定篩選條件**：預設排除 `public-*` 節點與 port 443；可調整最低速度門檻（Mbps）及多選指定國家（留空=全部）。
 4. **套用篩選**：依條件過濾，以 `(-score, ping)` 排序候選節點。
-5. **一鍵上線**：自動對所有**離線**網卡依序指派候選節點：`AccountSet`（或 `AccountCreate`）→ 匿名認證（HUB=`VPNGATE`，使用者名稱=`vpn`）→ `AccountConnect` → 輪詢 `AccountStatusGet` 等待會話建立 → 取得網卡 IPv4 → 綁定該 IP 連 `1.1.1.1:443` 驗證 tunnel 通網；單一節點失敗自動斷線換下一個候選，本輪已用 IP 不會重複嘗試。
+5. **自動連線**：勾選後立即對所有**離線**網卡指派候選節點：`AccountSet`（或 `AccountCreate`）→ 匿名認證（HUB=`VPNGATE`，使用者名稱=`vpn`）→ 以 CLI 套用 SoftEther 進階設定（`AccountDetailSet /MAXTCP:3`、`AccountRetrySet /NUM:0`）→ `AccountConnect` → 輪詢 `AccountStatusGet` 等待會話建立 → 取得網卡 IPv4 → 綁定該 IP 連 `1.1.1.1:443` 驗證 tunnel 通網；單一節點失敗自動斷線換下一個候選，本輪已用 IP 不會重複嘗試。之後每隔一段時間自動補上離線網卡，被踢或斷線時直接改派其他候選節點（不連回原伺服器）；取消勾選則不再自動重連。
+
+> **進階設定**：連線設定建立時會以 `vpncmd` 自動套用 SoftEther 的進階選項——**TCP 連線數 3**、**斷開後不自動重連**。這些對應 VPN Client 的「高級設置」，由程式代為設定，不需手動開啟 GUI 調整。
 
 > **注意事項**
 > - 抓取、連線等慢速操作皆在背景執行緒執行，請留意系統日誌進度。
@@ -167,6 +169,7 @@
 ```
 NetRedirector/
 ├── IntegratedApp.py         # 整合版主應用程式 (PySide6 GUI)
+├── startup.py               # 登入自動啟動 (工作排程器登錄，以最高權限執行)
 ├── proxy_core.py            # 本地 SOCKS5 / 端口路由代理核心
 ├── network_utils.py         # 高效網路介面掃描與 Ping 診斷模組
 ├── NetRedirector.py         # WinDivert C 核心 Python 封裝器
@@ -259,7 +262,9 @@ NetRedirector/
    - A: 支援。透過「進程攔截規則」指定遊戲主程式（如 `game.exe`）並套用 SOCKS5 代理即可實現精準遊戲加速。
 4. **Q: VPN Gate 分頁抓不到節點或連線失敗？**
    - A: 抓不到節點時請確認本機可連線至 `www.vpngate.net` 再點擊「抓取節點」（節點清單偶爾會短暫不可用）。連線失敗屬正常流程，工具會自動換節點；若長期無可用節點，可調低「最低速度」門檻或取消「排除 port 443」。請確認已安裝簡體中文版 v4.44 的 SoftEther VPN Client，並已建立虛擬網卡。
-5. **Q: 走代理的連線卡約 21 秒才失敗，curl 顯示 `Failed to connect ... after 21xxx ms` / `Timed out`，但 Monitor 明明顯示該連線為 Proxy？**
+5. **Q: 程式為什麼會出現在「工作排程器」？如何取消開機自動啟動？**
+   - A: NetRedirector 需要管理員權限才能載入 WinDivert 驅動，因此「開機自動啟動」是透過 Windows **工作排程器**建立一個「登入時觸發、以最高權限執行」的工作（名稱 `NetRedirector GameProxyHub`），登入後不需 UAC 提示即可啟動；而非使用登錄檔的 Run 機碼（Run 機碼只能以一般權限啟動，程式會因權限不足而結束）。此選項**預設開啟**，取消勾選主介面上方的「開機時自動啟動」即會移除該工作，不影響其他程式或使用者的啟動項目。
+6. **Q: 走代理的連線卡約 21 秒才失敗，curl 顯示 `Failed to connect ... after 21xxx ms` / `Timed out`，但 Monitor 明明顯示該連線為 Proxy？**
    - A: 這是「連線黑洞」——攔截引擎把封包重寫並以入站（inbound）方式重新注入，Windows 防火牆（或第三方防火牆/防毒）會把它誤判為「外部入站連線到本機轉發口」，在預設封鎖下**靜默丟棄 SYN**，導致連線重試到約 21 秒才逾時。新版 NetRedirector 啟動時已自動替本機轉發口（TCP `33100`、UDP `33200`）加入入站允許規則，停止時自動移除。若仍遇到，請依序確認：① 以**系統管理員身分**執行（自動加規則需要權限）；② 第三方防火牆/防毒是否另有一套規則擋住了 `33100` 入站；③ 手動補規則：`netsh advfirewall firewall add rule name="NetRedirector Relay TCP 33100" dir=in action=allow protocol=TCP localport=33100`（UDP 同理，改用 `protocol=UDP localport=33200`）。
 
 ---

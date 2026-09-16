@@ -23,12 +23,29 @@ TEST_NICS = ["VPN12", "VPN13", "VPN14"]
 # Number of connections to manage in production (VPN2..VPN11)
 PRODUCTION_NIC_COUNT = 10
 
+# 介面計量管理：SoftEther 虛擬網卡建立時 IPv4 計量為「自動」，且 SoftEther
+# 預設會把 VPN 設成預設閘道，多張網卡連線後會與實體網卡搶 0.0.0.0/0 路由。
+# 啟用後在啟動與重新整理網卡時，自動把虛擬網卡計量設為 VPN_INTERFACE_METRIC、
+# 承接預設路由的實體網卡設為 PHYSICAL_INTERFACE_METRIC，確保實體網卡是主網路。
+MANAGE_INTERFACE_METRIC = True
+VPN_INTERFACE_METRIC = 10
+PHYSICAL_INTERFACE_METRIC = 1
+
 # Connection / verification timeouts (seconds)
 CONNECT_TIMEOUT = 10
 STATUS_POLL_INTERVAL = 2
 
-# 一鍵上線的平行連線 worker 數 (同時連幾張網卡)
+# 自動連線/手動派發的平行連線 worker 數 (同時連幾張網卡)
 PARALLEL_ASSIGN_WORKERS = 8
+
+# 自動連線:勾選後每隔此秒數掃描一次離線網卡並自動派發候選節點
+AUTO_CONNECT_INTERVAL = 30
+
+# SoftEther 連線設定的進階選項 (套用於每個 VPN Gate 帳號)
+# MAXTCP: VPN 通訊使用的 TCP 連線數 (1..32)
+ACCOUNT_MAX_TCP = 3
+# 斷線/連線失敗後的自動重連次數;0 = 不自動重連,由本程式改派其他節點
+ACCOUNT_RETRY_NUM = 0
 
 # 批次查 IP：SoftEther 在 session 顯示連線完成後才派發 TAP IP，有短暫延遲，
 # 對還沒拿到 IP 的網卡重新輪詢整個介面清單。

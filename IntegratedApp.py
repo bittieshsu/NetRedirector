@@ -1,23 +1,25 @@
 import sys
 import time
+import threading
 import logging
 import ctypes
 import os
-from datetime import datetime
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QGridLayout,
                              QHBoxLayout, QTableWidget, QTableWidgetItem, 
                              QPushButton, QLabel, QGroupBox, QSpinBox, QTextEdit, 
                              QListWidget, QSplitter, QMessageBox, QHeaderView,
                              QTabWidget, QComboBox, QLineEdit, QRadioButton, QButtonGroup, QMenu,
-                             QSystemTrayIcon, QCheckBox)
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread
+                             QSystemTrayIcon, QCheckBox, QFrame, QWidgetAction)
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QThread, QPoint
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
 from i18n import i18n as tr, SUPPORTED_LANGS
 
 from app_icon import get_app_icon
 import single_instance
+import startup  # [開機自動啟動] Windows 工作排程器登錄
+import ui_theme  # [現代化 UI] 深色主題 QSS / QPalette / 徽章輔助
 
 # 匯入現有的模組
 import network_utils
@@ -25,6 +27,7 @@ import proxy_core
 import secure_config  # [新增] 密碼 DPAPI 加密儲存
 import rule_utils  # [模組化] 規則欄位處理 (全形星號正規化等)
 import config_store  # [模組化] 設定序列化與檔案 I/O
+import interface_metrics  # [介面計量] SoftEther 虛擬網卡 vs 實體網卡計量校正
 from app_helpers import (  # [模組化] GUI 輔助元件 (自本檔抽出)
     check_proxy_connection, SignalLogHandler, NetworkMonitorWorker, RedirectorSignals,
 )
@@ -73,6 +76,7 @@ class StageWorker(QThread):
 
 class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, MonitorTabMixin, VpnGateTabMixin):
     update_proxy_table_signal = Signal() 
+    metric_sync_done = Signal(object)  # 背景校正介面計量的結果 (dict)
     CONFIG_FILE = "config.json"  # [新增] 設定檔路徑
 
     def __init__(self):
@@ -103,16 +107,16 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         except Exception as e:
             # 依錯誤型別提供更精準的提示 (FileNotFoundError 是 OSError 子類，需先判斷)
             if isinstance(e, FileNotFoundError):
-                detail = "找不到 NetRedirector.dll"
+                detail = tr.t("找不到 NetRedirector.dll")
             elif isinstance(e, OSError):
-                detail = "載入 DLL 失敗，可能缺少 WinDivert.dll 或 vcruntime140.dll"
+                detail = tr.t("載入 DLL 失敗，可能缺少 WinDivert.dll 或 vcruntime140.dll")
             else:
                 detail = str(e)
             QMessageBox.critical(
-                None, "初始化失敗",
-                f"無法載入 NetRedirector.dll：{detail}\n\n請確認：\n"
-                "1. NetRedirector.dll、WinDivert.dll、WinDivert64.sys 在同目錄\n"
-                "2. 以系統管理員身分執行"
+                None, tr.t("初始化失敗"),
+                tr.t("無法載入 NetRedirector.dll：{detail}\n\n請確認：\n"
+                     "1. NetRedirector.dll、WinDivert.dll、WinDivert64.sys 在同目錄\n"
+                     "2. 以系統管理員身分執行").format(detail=detail)
             )
             logging.exception("Failed to load NetRedirector DLL")
             sys.exit(1)
@@ -125,8 +129,6 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.current_interfaces = {}
         self.selected_hub_port = None
         self.is_redirector_running = False
-        self.editing_proxy_id = None
-        self.editing_rule_id = None
 
         # 設置 Redirector 回調
         self.redir_signals = RedirectorSignals()
@@ -142,8 +144,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         # UI 初始化
         self.setup_ui()
 
-        # 選單列 (說明 → 檢查更新 / 關於)
-        self._setup_menu_bar()
+        # 右上角「⚙」溢出選單 (設定 + 檢查更新 / 關於；不再使用獨立選單列)
+        self._setup_overflow_menu()
 
         # 系統匣 (需在 setup_ui 之後，chkbox 已存在；且需有 QApplication)
         self._setup_tray()
@@ -165,6 +167,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         logging.getLogger().setLevel(logging.INFO)
 
         self.update_proxy_table_signal.connect(self.refresh_custom_proxy_table)
+        self.metric_sync_done.connect(self._on_metric_sync_done)
 
         # [新增] 載入設定
         QTimer.singleShot(100, self.load_config)
@@ -201,6 +204,13 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             if idx >= 0 and idx < len(keys):
                 combo.setCurrentIndex(idx)
             combo.blockSignals(False)
+            # [Fixed] QComboBox 預設 (AdjustToContentsOnFirstShow) 僅在首次顯示時
+            # 量測寬度，切換語言後較長的譯文會超出而被裁掉 (例: ru "BLOCK
+            # (блокировать)")。改為每次重填後依最長項目重算寬度，並以最小寬度
+            # 鎖住，避免版面重排時又被壓回原尺寸。
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+            combo.updateGeometry()
+            combo.setMinimumWidth(combo.sizeHint().width())
         elif kind == "headers":
             tbl, keys = args
             tbl.setHorizontalHeaderLabels([self.t(k) for k in keys])
@@ -208,6 +218,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             args[0].setTabText(args[1], self.t(args[2]))
         elif kind == "window":
             args[0].setWindowTitle(self.t(args[1]))
+        elif kind == "tooltip":
+            args[0].setToolTip(self.t(args[1]))
 
     def retranslate_ui(self):
         for kind, args in self._i18n_registry:
@@ -215,11 +227,14 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self._set_window_title()
         self.update_service_status()
         self.update_hub_status()
-        self.update_form_titles()
         self.refresh_proxy_combobox()
         self.refresh_rules_table()
         self.refresh_custom_proxy_table()
         self.refresh_hub_table()
+        # [即時監控] 暫停鈕文字與計數徽章不在 _i18n_registry 內，需手動重刷
+        if hasattr(self, 'btn_traffic_pause'):
+            self._sync_traffic_pause_text()
+            self._refresh_traffic_counters()
         idx = self.combo_lang.findData(tr.lang)
         if idx >= 0 and idx != self.combo_lang.currentIndex():
             self.combo_lang.blockSignals(True)
@@ -253,12 +268,37 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     def update_service_status(self):
         running = self.is_redirector_running
         self.btn_master_switch.setText(
-            self.t("停止攔截服務 (Stop)") if running else self.t("啟動攔截服務 (Start Redirector)"))
-        self.btn_master_switch.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;" if running
-            else "background-color: #f44336; color: white; font-weight: bold; padding: 6px;")
-        self.lbl_status.setText(self.t("狀態: 運行中") if running else self.t("狀態: 停止"))
-        self.lbl_status.setStyleSheet("color: green; font-weight: bold;" if running else "color: red; font-weight: bold;")
+            "⏹ " + self.t("停止") if running else "▶ " + self.t("啟動"))
+        ui_theme.set_button_kind(self.btn_master_switch, "DangerBtn" if running else "SuccessBtn")
+        self.lbl_status.setText(
+            "● " + (self.t("攔截狀態: 運行中") if running else self.t("攔截狀態: 停止")))
+        ui_theme.style_badge(
+            self.lbl_status, ui_theme.COLOR_SUCCESS if running else ui_theme.COLOR_DANGER)
+        self.update_dashboard_badges()
+
+    def update_dashboard_badges(self):
+        """更新頂部儀表徽章：核心延遲與活動轉發數。"""
+        # 核心延遲：取所有已連線介面中最低的延遲值
+        latency = None
+        for data in self.current_interfaces.values():
+            if not data.get('connected'):
+                continue
+            value = data.get('latency')
+            if value is None or value >= 9000:
+                continue
+            latency = value if latency is None else min(latency, value)
+        if latency is None:
+            self.lbl_ping_badge.setText(f"⚡ {self.t('核心延遲:')} --")
+            ui_theme.style_badge(self.lbl_ping_badge, "#64748B")
+        else:
+            self.lbl_ping_badge.setText(f"⚡ {self.t('核心延遲:')} {latency} ms")
+            ui_theme.style_badge(self.lbl_ping_badge, ui_theme.COLOR_ACCENT)
+
+        total = sum(
+            int(info.get('active_conns', 0))
+            for info in proxy_core.route_manager.interfaces.values())
+        self.lbl_conns_badge.setText(f"🌐 {self.t('活動轉發:')} {total}")
+        ui_theme.style_badge(self.lbl_conns_badge, ui_theme.COLOR_WARN)
 
     def update_hub_status(self):
         if self.selected_hub_port:
@@ -266,35 +306,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         else:
             self.lbl_hub_status.setText(self.t("未選擇端口"))
 
-    def update_form_titles(self):
-        if self.editing_rule_id is not None:
-            self.group_rule_form.setTitle(self.t("編輯規則 (ID: {rule_id})").format(rule_id=self.editing_rule_id))
-            self.btn_rule_action.setText(self.t("保存修改"))
-            self.btn_rule_action.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
-            self.btn_rule_cancel.show()
-        else:
-            self.group_rule_form.setTitle(self.t("新增攔截規則"))
-            self.btn_rule_action.setText(self.t("新增規則"))
-            self.btn_rule_action.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-            self.btn_rule_cancel.hide()
-        if self.editing_proxy_id is not None:
-            self.group_proxy_form.setTitle(self.t("編輯代理 (ID: {pid})").format(pid=self.editing_proxy_id))
-            self.btn_proxy_save.setText(self.t("保存修改"))
-            self.btn_proxy_save.setStyleSheet("background-color: #FF9800; color: white;")
-            self.btn_proxy_cancel.show()
-        else:
-            self.group_proxy_form.setTitle(self.t("新增外部代理 (SOCKS5/HTTP)"))
-            self.btn_proxy_save.setText(self.t("新增代理"))
-            self.btn_proxy_save.setStyleSheet("background-color: #2196F3; color: white;")
-            self.btn_proxy_cancel.hide()
-
     # [模組化] 儲存設定 (序列化/檔案 I/O 移至 config_store)
     def save_config(self):
         data = config_store.build_config_data(
             tr.lang, self.ping_target,
             self.chk_minimize_to_tray.isChecked() if hasattr(self, 'chk_minimize_to_tray') else False,
             self.port_config, self.custom_proxies, self.rules,
-            self.chk_check_updates.isChecked() if hasattr(self, 'chk_check_updates') else True)
+            self.chk_check_updates.isChecked() if hasattr(self, 'chk_check_updates') else True,
+            self.chk_autostart.isChecked() if hasattr(self, 'chk_autostart') else True,
+            self.chk_manage_metric.isChecked() if hasattr(self, 'chk_manage_metric') else True)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
             self.append_log("設定已儲存至 config.json")
@@ -312,6 +332,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 self.append_log(
                     "警告: config.json 毀損無法解析,原始內容已備份為 config.json.corrupt.bak,"
                     "可手動修復後還原。本次以空白設定啟動。")
+            # 沒有設定檔 (首次啟動) 或無法讀取時，開機自動啟動仍預設開啟
+            self._apply_autostart(True)
+            self._sync_interface_metrics()
             return
 
         try:
@@ -335,6 +358,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.check_updates_on_start = bool(data.get("check_updates", True))
             if hasattr(self, 'chk_check_updates'):
                 self.chk_check_updates.setChecked(self.check_updates_on_start)
+
+            # 還原「開機時自動啟動」(舊設定檔無此欄位時預設開啟)
+            self._apply_autostart(bool(data.get("autostart", True)))
+
+            # 還原「自動管理介面計量」(舊設定檔無此欄位時預設開啟)，並立即校正。
+            # 首次建立 SoftEther 虛擬網卡的使用者不需要再手動設定計量。
+            if hasattr(self, 'chk_manage_metric'):
+                self.chk_manage_metric.setChecked(bool(data.get("manage_metric", True)))
+            self._sync_interface_metrics()
 
             self.append_log("正在還原設定...")
 
@@ -394,20 +426,26 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 hosts = rule_utils.normalize_rule_pattern(r.get('hosts'))
                 ports = rule_utils.normalize_rule_pattern(r.get('ports'))
 
+                # 停用中的規則只還原到清單，不進 DLL (勾選啟用時才注入)
+                enabled = bool(r.get('enabled', True))
+
                 # 代理解析:優先穩定識別 proxy_name,回退舊版 proxy_text 顯示字串
                 pending = {'proxy_name': r.get('proxy_name', ''), 'proxy': r.get('proxy_text', '')}
                 proxy_id, proxy_text = self._resolve_proxy(pending)
 
                 # 呼叫 DLL (統一入口:處理 PID/名稱、協議轉換、能力 fallback)
-                rid = self.bridge.add_rule_ex(
-                    r.get('type', 'Name'), target, hosts, ports,
-                    r.get('proto', 'BOTH'), action_key, int(proxy_id))
+                rid = 0
+                if enabled:
+                    rid = self.bridge.add_rule_ex(
+                        r.get('type', 'Name'), target, hosts, ports,
+                        r.get('proto', 'BOTH'), action_key, int(proxy_id))
 
-                if rid > 0:
+                if rid > 0 or not enabled:
                     # [Fixed] 全部用 .get() 帶預設: 手工編輯的 config 缺鍵時,
                     # 單條壞規則只會被跳過/降級, 不會中斷其後所有規則的還原
                     self.rules.append({
-                        'id': rid,
+                        'id': int(rid),
+                        'enabled': enabled,
                         'type': r.get('type', 'Name'),
                         'target': target,
                         'hosts': hosts,
@@ -429,28 +467,128 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             import traceback
             traceback.print_exc()
 
-    # (原本的 setup_ui 等函式保持不變，省略...)
+    # [開機自動啟動] 依偏好套用 (工作存於工作排程器，設定檔只記偏好)
+    def _apply_autostart(self, enabled):
+        """套用「開機時自動啟動」偏好：需要時才建立/移除工作，並同步勾選框。"""
+        if startup.is_supported():
+            if enabled:
+                # is_enabled() 會確認工作指向的執行檔仍存在；換版本後路徑
+                # 失效時會回報未啟用，這裡順便重寫修正。
+                if not startup.is_enabled() and not startup.enable():
+                    self.append_log(self.t("無法設定開機自動啟動，請稍後再試。"))
+            elif startup.is_enabled():
+                startup.disable()
+        if hasattr(self, 'chk_autostart'):
+            actual = startup.is_enabled()
+            self.chk_autostart.blockSignals(True)
+            self.chk_autostart.setChecked(actual)
+            self.chk_autostart.blockSignals(False)
+
+    def on_autostart_changed(self, checked):
+        """勾選/取消開機自動啟動 (登錄 Windows 工作排程器)。"""
+        if checked:
+            if not startup.enable():
+                QMessageBox.warning(
+                    self, self.t("錯誤"),
+                    self.t("無法設定開機自動啟動，請稍後再試。"))
+                self.chk_autostart.blockSignals(True)
+                self.chk_autostart.setChecked(False)
+                self.chk_autostart.blockSignals(False)
+            else:
+                self.append_log(self.t("已設定開機自動啟動"))
+        else:
+            startup.disable()
+            self.append_log(self.t("已取消開機自動啟動"))
+        self.save_config()
+
+    # --------------------------------------------------------- 介面計量校正
+    def on_manage_metric_changed(self, checked):
+        """勾選後立即校正一次介面計量 (取消勾選則不還原既有設定)。"""
+        if checked:
+            self._sync_interface_metrics(force=True)
+
+    def _sync_interface_metrics(self, force=False):
+        """依設定在背景校正介面計量 (SoftEther 虛擬網卡 vs 實體網卡)。
+
+        計量校正需要執行 PowerShell，會阻塞約 1 秒；放背景執行緒避免卡住
+        UI，完成後以 metric_sync_done 訊號回到 UI 執行緒寫日誌。
+        """
+        if not force:
+            chk = getattr(self, 'chk_manage_metric', None)
+            if chk is not None and not chk.isChecked():
+                return
+
+        def work():
+            try:
+                result = interface_metrics.ensure_metrics()
+            except Exception as e:  # noqa: BLE001 — 校正失敗不應影響主流程
+                result = {"ok": False, "error": str(e)}
+            self.metric_sync_done.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_metric_sync_done(self, result):
+        result = result or {}
+        if not result.get("ok"):
+            if result.get("error"):
+                self.append_log(f"介面計量校正失敗: {result['error']}")
+            return
+        if result.get("no_vpn"):
+            self.append_log("介面計量校正: 尚未建立 SoftEther 虛擬網卡，略過")
+            return
+        parts = []
+        if result.get("vpn"):
+            parts.append(
+                "虛擬網卡 {} 計量={}".format(
+                    ", ".join(result["vpn"]), result.get("vpn_metric")))
+        if result.get("physical"):
+            parts.append(
+                "實體網卡 {} 計量={}".format(
+                    result["physical"], result.get("physical_metric")))
+        if parts:
+            self.append_log("介面計量校正: " + "；".join(parts))
+
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(14, 12, 14, 14)
+        main_layout.setSpacing(12)
 
         # 提前建立日誌控制項：VPN Gate 分頁初始化時 (setup_vpngate_tab) 會
         # 在載入既有節點池後呼叫 vpn_apply_filters → append_log；若等到下方
         # log_group 才建立 txt_log，會在啟動時就先存取不存在的屬性而崩潰。
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
+        self.txt_log.setObjectName("LogView")
 
-        # 頂部控制列
+        # 頂部儀表列：第一列放服務總開關與全域狀態徽章，第二列放次要設定。
+        # 全部擠在同一列時最小寬度達 1600px 以上，遠超過預設的 1024 視窗，
+        # 會強制把視窗撐寬，在較小的螢幕上被裁掉。
+        top_frame = QFrame()
+        top_frame.setObjectName("TopBar")
+        top_outer = QVBoxLayout(top_frame)
+        top_outer.setContentsMargins(12, 8, 12, 8)
+        top_outer.setSpacing(8)
+
         top_bar = QHBoxLayout()
+        top_bar.setSpacing(10)
         self.btn_master_switch = QPushButton("")
         self.btn_master_switch.setCheckable(True)
+        self.btn_master_switch.setMinimumHeight(34)
+        self.btn_master_switch.setMinimumWidth(120)
         self.btn_master_switch.clicked.connect(self.toggle_redirector_service)
         top_bar.addWidget(self.btn_master_switch)
         
         self.lbl_status = QLabel("")
         top_bar.addWidget(self.lbl_status)
+
+        # 全域狀態徽章 (核心延遲 / 活動轉發)
+        self.lbl_ping_badge = QLabel("")
+        top_bar.addWidget(self.lbl_ping_badge)
+
+        self.lbl_conns_badge = QLabel("")
+        top_bar.addWidget(self.lbl_conns_badge)
 
         self.combo_lang = QComboBox()
         self.combo_lang.setFixedWidth(150)
@@ -458,30 +596,83 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.combo_lang.addItem(tr.lang_name(code), code)
         self.combo_lang.currentIndexChanged.connect(self.on_lang_changed)
 
+        # 設定與說明收進右上角一顆「⚙」彈出選單，避免佔用獨立選單列
+        self.btn_menu = QPushButton("⚙")
+        self.btn_menu.setFixedWidth(38)
+        self.btn_menu.clicked.connect(self._show_overflow_menu)
+        self._reg("tooltip", self.btn_menu, "設定")
+
         # [新增] Ping 目標設定 (預設 8.8.8.8，可依地區改為其他目標)
         lbl_ping = QLabel("")
         self._reg("text", lbl_ping, "Ping 目標:")
         self.ent_ping_target = QLineEdit(self.ping_target)
         self.ent_ping_target.setFixedWidth(120)
-        self.ent_ping_target.setToolTip("網路介面延遲偵測的 Ping 目標 (IP 或域名)")
+        self._reg("tooltip", self.ent_ping_target,
+                  "網路介面延遲偵測的 Ping 目標 (IP 或域名)")
         self.ent_ping_target.editingFinished.connect(self.on_ping_target_changed)
 
         self.chk_minimize_to_tray = QCheckBox("")
         self._reg("text", self.chk_minimize_to_tray, "關閉時縮到系統匣")
         self.chk_minimize_to_tray.setChecked(False)
-        self.chk_minimize_to_tray.setToolTip(self.t("勾選後，按關閉會直接縮到系統匣，不詢問"))
+        self._reg("tooltip", self.chk_minimize_to_tray,
+                  "勾選後，按關閉會直接縮到系統匣，不詢問")
 
         self.chk_check_updates = QCheckBox("")
         self._reg("text", self.chk_check_updates, "啟動時自動檢查更新")
         self.chk_check_updates.setChecked(self.check_updates_on_start)
 
+        # [新增] 開機自動啟動 (預設開啟)；實際狀態存於工作排程器，
+        # 於 load_config → _apply_autostart 時同步為真實狀態
+        self.chk_autostart = QCheckBox("")
+        self._reg("text", self.chk_autostart, "開機時自動啟動")
+        self.chk_autostart.setChecked(True)
+        self.chk_autostart.setToolTip(self.t(
+            "登入 Windows 後自動以最高權限啟動本程式（不需 UAC 提示）。僅影響目前使用者。"))
+        self.chk_autostart.toggled.connect(self.on_autostart_changed)
+
+        # [新增] 自動管理介面計量：SoftEther 虛擬網卡建立時 IPv4 計量為「自動」，
+        # 可能與實體網卡搶預設路由；勾選後自動校正 (需管理員權限，本程式已具備)。
+        self.chk_manage_metric = QCheckBox("")
+        self._reg("text", self.chk_manage_metric, "自動管理介面計量")
+        self.chk_manage_metric.setChecked(True)
+        self._reg("tooltip", self.chk_manage_metric,
+                  "勾選後自動將 SoftEther 虛擬網卡計量設高、實體網卡設低，避免 VPN 搶走預設路由。")
+        self.chk_manage_metric.toggled.connect(self.on_manage_metric_changed)
+
         top_bar.addStretch()
-        top_bar.addWidget(lbl_ping)
-        top_bar.addWidget(self.ent_ping_target)
         top_bar.addWidget(self.combo_lang)
-        top_bar.addWidget(self.chk_minimize_to_tray)
-        top_bar.addWidget(self.chk_check_updates)
-        main_layout.addLayout(top_bar)
+        top_bar.addWidget(self.btn_menu)
+        top_outer.addLayout(top_bar)
+
+        # 設定項目改放進「⚙」彈出選單，不再佔用頂部一整列。
+        # 沿用原本的 QLabel / QCheckBox widget，i18n 註冊與存檔邏輯不需更動。
+        self.menu_overflow = QMenu(self)
+
+        ping_row = QWidget()
+        ping_row_layout = QHBoxLayout(ping_row)
+        ping_row_layout.setContentsMargins(10, 4, 12, 4)
+        ping_row_layout.addWidget(lbl_ping)
+        ping_row_layout.addWidget(self.ent_ping_target)
+        ping_row_layout.addStretch()
+        ping_action = QWidgetAction(self.menu_overflow)
+        ping_action.setDefaultWidget(ping_row)
+        self.menu_overflow.addAction(ping_action)
+        self.menu_overflow.addSeparator()
+
+        for chk in (self.chk_minimize_to_tray, self.chk_check_updates, self.chk_autostart,
+                    self.chk_manage_metric):
+            # 包一層容器補上下內距。QMenu::item 的 padding 不作用於
+            # QWidgetAction 的 widget，直接放 QCheckBox 會三個緊貼在一起。
+            chk_row = QWidget()
+            chk_row_layout = QHBoxLayout(chk_row)
+            chk_row_layout.setContentsMargins(10, 6, 12, 6)
+            chk_row_layout.addWidget(chk)
+            chk_row_layout.addStretch()
+            chk_action = QWidgetAction(self.menu_overflow)
+            chk_action.setDefaultWidget(chk_row)
+            self.menu_overflow.addAction(chk_action)
+
+        main_layout.addWidget(top_frame)
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -489,22 +680,22 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.tab_hub = QWidget()
         self.setup_hub_tab()
         self.tabs.addTab(self.tab_hub, "")
-        self._reg("tab", self.tabs, 0, "1. 端口路由管理 (Hub)")
+        self._reg("tab", self.tabs, 0, "1. 端口路由管理")
 
         self.tab_rules = QWidget()
         self.setup_rules_tab()
         self.tabs.addTab(self.tab_rules, "")
-        self._reg("tab", self.tabs, 1, "2. 進程攔截規則 (Rules)")
+        self._reg("tab", self.tabs, 1, "2. 進程攔截規則")
 
         self.tab_proxies = QWidget()
         self.setup_custom_proxy_tab()
         self.tabs.addTab(self.tab_proxies, "")
-        self._reg("tab", self.tabs, 2, "3. 自訂代理管理 (Proxies)")
+        self._reg("tab", self.tabs, 2, "3. 自訂代理管理")
 
         self.tab_monitor = QWidget()
         self.setup_monitor_tab()
         self.tabs.addTab(self.tab_monitor, "")
-        self._reg("tab", self.tabs, 3, "4. 流量監控 (Monitor)")
+        self._reg("tab", self.tabs, 3, "4. 流量監控")
 
         self.tab_vpngate = QWidget()
         self.setup_vpngate_tab()
@@ -523,12 +714,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         self.update_service_status()
         self.update_hub_status()
-        self.update_form_titles()
 
     # (以下為各 Tab 的 setup 函式，與原版相同)
     def on_network_update(self, interfaces):
         self.current_interfaces = interfaces
         proxy_core.route_manager.sync_interfaces(interfaces)
+        self.update_dashboard_badges()
         if self.tabs.currentIndex() == 0:
             self.refresh_hub_table()
         if hasattr(self, 'table_vpn_nics'):
@@ -537,18 +728,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
     def on_traffic_event(self, process, pid, ip, port, info):
         if pid == os.getpid():
             return  # 不顯示本程式自己產生的流量
-        if self.tree_traffic.rowCount() > 500:
-            self.tree_traffic.removeRow(0)
-        row = self.tree_traffic.rowCount()
-        self.tree_traffic.insertRow(row)
-        self.tree_traffic.setItem(row, 0, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
-        self.tree_traffic.setItem(row, 1, QTableWidgetItem(process))
-        self.tree_traffic.setItem(row, 2, QTableWidgetItem(str(pid)))
-        self.tree_traffic.setItem(row, 3, QTableWidgetItem(f"{ip}:{port}"))
-        self.tree_traffic.setItem(row, 4, QTableWidgetItem(info))
-        # 不再逐列 scrollToBottom()：那是 BT 高併發下最貴的一行（強制視圖重算）。
-        # 連線回呼已在 NetRedirector.set_connection_callback 限流（預設 5 次/秒），
-        # 這裡保持輕量即可避免 GUI flood。
+        # 列插入 / 篩選 / 捲動 / 計數集中在 MonitorTabMixin (tabs_monitor.py)
+        self.append_traffic_row(process, pid, ip, port, info)
 
     def on_dll_log(self, msg):
         self.append_log(f"[DLL] {msg}")
@@ -560,22 +741,24 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.txt_log.setTextCursor(c)
 
     # --------------------------------------------------------- 自動更新
-    def _setup_menu_bar(self):
-        """建立選單列：說明 → 檢查更新 / 關於。"""
-        help_menu = self.menuBar().addMenu(self.t("說明"))
+    def _setup_overflow_menu(self):
+        """把「檢查更新 / 關於」併入右上角「⚙」選單 (不再使用獨立選單列)。"""
+        self.menu_overflow.addSeparator()
 
-        self.act_check_update = help_menu.addAction(self.t("檢查更新"))
+        self.act_check_update = self.menu_overflow.addAction(self.t("檢查更新"))
         self.act_check_update.triggered.connect(lambda: self.check_for_updates(silent=False))
 
-        help_menu.addSeparator()
-
-        self.act_about = help_menu.addAction(self.t("關於"))
+        self.act_about = self.menu_overflow.addAction(self.t("關於"))
         self.act_about.triggered.connect(self._show_about)
 
         # 註冊 i18n (切換語言時重譯選單文字)
         self._reg("text", self.act_check_update, "檢查更新")
         self._reg("text", self.act_about, "關於")
-        self._reg("text", help_menu.menuAction(), "說明")
+
+    def _show_overflow_menu(self):
+        """在「⚙」按鈕正下方彈出設定/說明選單。"""
+        self.menu_overflow.exec(
+            self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height())))
 
     def _show_about(self):
         QMessageBox.about(
@@ -654,12 +837,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self._tray_icon = QSystemTrayIcon(self._app_icon, self)
         self._tray_icon.setToolTip(self.t("NetRedirector x GameProxyHub 整合專業版"))
 
-        menu = QMenu()
-        act_show = menu.addAction(self.t("顯示主視窗"))
-        act_show.triggered.connect(self._restore_from_tray)
-        act_quit = menu.addAction(self.t("完全關閉程式"))
-        act_quit.triggered.connect(self._quit_from_tray)
-        self._tray_icon.setContextMenu(menu)
+        self.menu_tray = QMenu()
+        self.act_tray_show = self.menu_tray.addAction(self.t("顯示主視窗"))
+        self.act_tray_show.triggered.connect(self._restore_from_tray)
+        self.act_tray_quit = self.menu_tray.addAction(self.t("完全關閉程式"))
+        self.act_tray_quit.triggered.connect(self._quit_from_tray)
+        # 註冊 i18n，切換語言時系統匣選單才會跟著重譯
+        self._reg("text", self.act_tray_show, "顯示主視窗")
+        self._reg("text", self.act_tray_quit, "完全關閉程式")
+        self._tray_icon.setContextMenu(self.menu_tray)
 
         self._tray_icon.activated.connect(self._on_tray_activated)
         self._tray_icon.show()
@@ -781,6 +967,10 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         event.ignore()
 
 if __name__ == '__main__':
+    # 由工作排程器啟動時工作目錄是 System32，先切到程式所在資料夾，
+    # 否則 NetRedirector.dll / config.json / locale 等相對路徑會找不到。
+    startup.ensure_working_directory()
+
     try: is_admin = ctypes.windll.shell32.IsUserAnAdmin()
     except Exception: is_admin = False
 
@@ -791,6 +981,12 @@ if __name__ == '__main__':
         sys.exit(0)
 
     app = QApplication(sys.argv)
+
+    # [現代化 UI] 全域深色主題。QSS 與 QPalette 必須一起套用：表格左上角、
+    # 捲軸交會角、核取方塊指示器、彈出選單等原生繪製的部分不吃 QSS。
+    ui_theme.apply_dark_palette(app)
+    app.setStyleSheet(ui_theme.build_stylesheet())
+
     # 全域預設圖示 (工作列/Alt-Tab 切換時顯示)
     app.setWindowIcon(get_app_icon())
 
