@@ -63,5 +63,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $notes = Get-Content "docs/release-notes.md" -Raw
           gh release create $env:GITHUB_REF_NAME $env:ZIP SHA256SUMS.txt `
-            --repo $env:GITHUB_REPOSITORY --title $env:GITHUB_REF_NAME --generate-notes
+            --repo $env:GITHUB_REPOSITORY --title $env:GITHUB_REF_NAME --generate-notes --notes $notes

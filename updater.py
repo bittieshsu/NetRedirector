@@ -558,54 +558,131 @@ function L([string]$m) { Add-Content -Path $Log -Value ((Get-Date -Format o) + "
 
 L ("apply start  Dist=[" + $Dist + "] NewDir=[" + $NewDir + "] OldDir=[" + $OldDir + "] Exe=[" + $Exe + "] ExeName=[" + $ExeName + "]")
 
+# delete-on-reboot support: a running kernel driver locks its .sys image, so
+# leftovers are registered with MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) instead.
+$sig = @"
+using System;
+using System.Runtime.InteropServices;
+public static class NRNative {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+}
+"@
+try { Add-Type -TypeDefinition $sig -ErrorAction Stop } catch { }
+$MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+
+function Remove-Path([string]$p) {
+    if (-not (Test-Path $p)) { return $true }
+    for ($i = 0; $i -lt 10; $i++) {
+        Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $p)) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Schedule-DeleteOnReboot([string]$root) {
+    if (-not (Test-Path $root)) { return }
+    $items = @(Get-ChildItem -Path $root -Recurse -Force -ErrorAction SilentlyContinue)
+    foreach ($it in ($items | Sort-Object { $_.FullName.Length } -Descending)) {
+        [NRNative]::MoveFileEx($it.FullName, $null, $MOVEFILE_DELAY_UNTIL_REBOOT) | Out-Null
+    }
+    [NRNative]::MoveFileEx($root, $null, $MOVEFILE_DELAY_UNTIL_REBOOT) | Out-Null
+}
+
+function Stop-WinDivert {
+    $any = $false
+    try {
+        $drivers = @(Get-CimInstance Win32_SystemDriver -ErrorAction Stop |
+            Where-Object { $_.Name -like 'WinDivert*' -and $_.State -eq 'Running' })
+        foreach ($d in $drivers) {
+            & sc.exe stop $d.Name | Out-Null
+            L ("driver stop requested: " + $d.Name)
+            $any = $true
+        }
+    } catch { }
+    if ($any) { Start-Sleep -Seconds 2 }
+    return $any
+}
+
 # 1. wait for the app to fully exit (name without .exe)
 while (Get-Process -Name $ExeName -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
 L "app exited"
 
-# 2. remove leftover old version
-if (Test-Path $OldDir) { Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue }
-L "old cleared"
+# 2. stop the WinDivert kernel driver so its .sys image is unlocked
+Stop-WinDivert | Out-Null
 
-# 3. atomic swap: Dist -> OldDir, NewDir -> Dist (retry for file unlock)
+# 3. clear leftover old dir; if it is still locked, move it aside so it can no
+#    longer block the rename below (a stale ".old" is what caused stuck updates).
+$staleDirs = @()
+$lockedOld = $null
+if (Remove-Path $OldDir) {
+    L "old cleared"
+} else {
+    $lockedOld = $OldDir
+    Schedule-DeleteOnReboot $lockedOld
+    $stale = $OldDir + ".stale." + (Get-Date -Format 'yyyyMMddHHmmss')
+    Rename-Item $OldDir $stale -Force -ErrorAction SilentlyContinue
+    if (Test-Path $stale) {
+        $staleDirs += $stale
+        $lockedOld = $stale
+        L ("old locked; moved aside to [" + $stale + "]")
+    } else {
+        $OldDir = $OldDir + "." + (Get-Date -Format 'yyyyMMddHHmmss')
+        L ("old locked and could not be moved; swap target=[" + $OldDir + "]")
+    }
+}
+
+# 4. swap: Dist -> OldDir, NewDir -> Dist. Success means NewDir is consumed and
+#    Dist exists, NOT merely that some exe is present (the old one always was).
 $ok = $false
 for ($i = 0; $i -lt 15 -and -not $ok; $i++) {
-    if ((Test-Path $Dist) -and (Test-Path $NewDir)) { Rename-Item $Dist $OldDir -Force -ErrorAction SilentlyContinue }
-    if ((Test-Path $NewDir) -and -not (Test-Path $Dist)) { Rename-Item $NewDir $Dist -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $Exe) { $ok = $true } else { Start-Sleep -Seconds 1 }
+    if ((Test-Path $Dist) -and (Test-Path $NewDir) -and -not (Test-Path $OldDir)) {
+        Rename-Item $Dist $OldDir -Force -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $NewDir) -and -not (Test-Path $Dist)) {
+        Rename-Item $NewDir $Dist -Force -ErrorAction SilentlyContinue
+    }
+    if ((-not (Test-Path $NewDir)) -and (Test-Path $Dist) -and (Test-Path $Exe)) {
+        $ok = $true
+    } else {
+        Start-Sleep -Seconds 1
+    }
 }
 L ("swap ok=" + $ok)
 
-# 3.5 preserve runtime data (config, vpn history)
+# 5. preserve runtime data (config, vpn history)
 foreach ($f in @('config.json','vpn_history.json')) {
     $src = Join-Path $OldDir $f
     if ((Test-Path $src) -and (Test-Path $Dist)) { Copy-Item $src (Join-Path $Dist $f) -Force -ErrorAction SilentlyContinue }
 }
 L "config preserved"
 
-# 4. relaunch the app
-if ($ok) {
+# 6. relaunch the app (fall back to the existing install if the swap failed)
+if (Test-Path $Exe) {
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $Exe
         $psi.WorkingDirectory = $Dist
         $psi.UseShellExecute = $false
         [System.Diagnostics.Process]::Start($psi) | Out-Null
-        L "restart OK"
+        L ("restart OK  (swap=" + $ok + ")")
     } catch {
         L ("restart FAIL: " + $_)
     }
 } else {
-    L "restart skipped (swap failed)"
+    L ("restart skipped  (swap=" + $ok + ", exe missing)")
 }
 
-# 5. cleanup old version (sync retry; the new app is already relaunching)
-if (Test-Path $OldDir) {
-    $cleaned = $false
-    for ($i = 0; $i -lt 10 -and -not $cleaned; $i++) {
-        Remove-Item $OldDir -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path $OldDir)) { $cleaned = $true } else { Start-Sleep -Seconds 1 }
+# 7. cleanup old version(s); anything still locked is removed on next reboot
+$cleanupTargets = @($OldDir) + $staleDirs
+if ($lockedOld -and ($cleanupTargets -notcontains $lockedOld)) { $cleanupTargets += $lockedOld }
+foreach ($d in $cleanupTargets) {
+    if ($d -and (Test-Path $d)) {
+        $cleaned = Remove-Path $d
+        if (-not $cleaned) { Schedule-DeleteOnReboot $d }
+        L ("cleanup [" + $d + "] done=" + $cleaned)
     }
-    L ("cleanup done=" + $cleaned)
 }
 
 L "apply done"

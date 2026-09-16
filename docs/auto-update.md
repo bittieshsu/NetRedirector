@@ -287,6 +287,22 @@ with open(err_path, "ab") as err_fd:
 
 > 偵錯技巧：先看替換腳本 log 有沒有 `apply start` 這第一行；若完全沒有，代表腳本根本沒被執行，優先懷疑 creationflag 用錯了。
 
+### 坑 12：殘留的 `WinDivert64.sys` 被核心驅動鎖住，導致連續更新卡在舊版本
+
+- **現象**：連續更新時，更新看似成功、程式也重啟了，版本號卻沒變（停在舊版）。替換腳本 log 每次都出現 `cleanup done=False`，安裝目錄殘留 `IntegratedApp.dist.old\WinDivert64.sys`，手動刪除得到「拒絕存取」。
+- **根因**：
+  1. WinDivert 核心驅動載入後**不會隨主程式結束而卸載**，其 `.sys` 映像檔持續被鎖定。
+  2. 資料夾交換把 `IntegratedApp.dist` 改名為 `.old` 後，被鎖定的檔案路徑隨之變成 `.old\WinDivert64.sys`，清理階段刪不掉，`.old` 因而殘留（只剩這一個檔案）。
+  3. 下一次更新時 `Remove-Item $OldDir` 仍失敗，`Rename-Item $Dist $OldDir` 因目標已存在而失敗；`$Dist` 仍是舊版、`.new` 換不上去。
+  4. 舊的成功判斷 `if (Test-Path $Exe) { $ok = $true }` 只確認「有 exe」，而舊版 exe 一直都在 → 誤判成功 → 重新啟動的其實是舊版本。
+- **解法**：
+  1. 交換前先停止驅動：以 `Get-CimInstance Win32_SystemDriver` 找出 `WinDivert*` 後 `sc.exe stop`，釋放 `.sys` 鎖定。
+  2. 殘留 `.old` 清不掉時改名為 `.old.stale.<時間戳>` 讓位，或改用帶時間戳的交換目標，不讓它阻擋 `Rename-Item`。
+  3. 成功判斷改為「`.new` 已被消耗且 `.dist` 就位」，不可只看 exe 是否存在。
+  4. 仍鎖住的殘留用 `MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT)` 排程下次開機刪除。
+
+> 這是坑 6「同步重試」與坑 7「資料夾交換」的交叉盲點：重試再多次也刪不掉被核心鎖住的檔案，必須先卸載驅動。
+
 ---
 
 ## 六、安全注意事項
