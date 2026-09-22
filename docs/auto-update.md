@@ -356,6 +356,35 @@ with open(err_path, "ab") as err_fd:
 > 只是取樣視窗太短造成的假象；先用 instrument 量「重試次數」，才能把
 > 「顯示問題」與「網路問題」分開，不然會改錯地方。
 
+### 坑 14：更新卡在 96% 不動、速度 0 B/s、連線數不動 —— 阻塞的 read() 無法從外部取消
+
+- **現象**：進度條停在 96%（或任何接近完成處）不再前進，速度顯示 `0 B/s`，
+  連線數停在 1～2 條不動，放著幾分鐘都一樣。
+- **根因**：`_fetch_block` 的停滯偵測寫在 `for chunk in r.iter_content(...)`
+  迴圈**收到資料之後**。當連線完全不再送資料時，執行緒是卡在 `iter_content`
+  這個阻塞呼叫裡，永遠走不到下面那行停滯判斷 —— 也就是說「連續 30 秒沒有
+  位元組」根本不會被偵測到。唯一保底是 socket 讀取逾時，原本設 60 秒，
+  再乘上每段 4 次重試與多個分段，看起來就像永久卡住。
+- **為什麼不能「從另一條執行緒關閉連線」喚醒它**：實測（`urllib3 2.x` +
+  Windows）對同一個 socket 從另一條執行緒呼叫 `shutdown()` / `close()` 或
+  `Response.close()`，**都不會**取消另一條執行緒正在阻塞的 `recv()`；讀取
+  照樣卡到 socket 逾時才返回。這是 Windows 與 POSIX 的差異，網路上的
+  「close 就能解鎖」寫法在此不成立。
+- **解法**：
+  1. 把 `_TIMEOUT_READ` 由 60 秒縮到 20 秒 —— 讓任何阻塞讀取都會自行逾時
+     拋錯，帶動既有的重試邏輯接手。
+  2. 新增 `_StallWatchdog`：監看「整體位元組數是否前進」，連續
+     `NO_PROGRESS_TIMEOUT`（45 秒）毫無成長就設 `stop`，讓 worker 停止重試
+     同一批停滯區段、上層中止並改走下一條路徑，而不是無限重試。
+  3. `_download_multipart` 的 `t.join()` 加上保險上限：`stop` 設起後仍存活
+     的執行緒，最多再等 `STOP_GRACE` 秒就放棄（`STOP_GRACE` 需大於
+     `_TIMEOUT_READ`，讓阻塞讀取有時間自行退出）。
+  4. 單線後備與重試前重新呼叫 `_probe_download`，避免沿用過期的 GitHub
+     簽名 URL 而拿到 403。
+- **效果**：卡住的連線不再無限等待，最慢會在「讀取逾時 + 停滯偵測」的時間內
+  中止並改走其他路徑或回報失敗。回歸測試見 `tests/test_updater.py` 的
+  `test_download_file_aborts_on_stalled_connection`。
+
 ---
 
 ## 六、安全注意事項

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 import pytest
 
@@ -190,4 +191,59 @@ def test_cleanup_stale_downloads_removes_leftovers(monkeypatch, tmp_path):
     monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
     updater._cleanup_stale_downloads()
     assert not stale.exists()
+
+
+class _StallingRangeHandler(http.server.BaseHTTPRequestHandler):
+    """送出 headers 與少量 body 後就停住，模擬 socket 永不返回的卡死連線。"""
+
+    total = 2 * 1024 * 1024
+
+    def do_GET(self):
+        total = type(self).total
+        rng = self.headers.get("Range")
+        m = re.match(r"bytes=(\d+)-(\d*)", rng) if rng else None
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total - 1
+            end = min(end, total - 1)
+        else:
+            start, end = 0, total - 1
+        chunk_len = end - start + 1
+        self.send_response(206 if m else 200)
+        if m:
+            self.send_header("Content-Range",
+                             "bytes {}-{}/{}".format(start, end, total))
+        self.send_header("Content-Length", str(chunk_len))
+        self.end_headers()
+        try:
+            self.wfile.write(b"x" * min(4096, chunk_len))
+            self.wfile.flush()
+        except OSError:
+            return
+        time.sleep(30)     # 卡住：不再送資料，也不關閉連線
+
+    def log_message(self, *args):  # 靜音
+        pass
+
+
+def test_download_file_aborts_on_stalled_connection(monkeypatch, tmp_path):
+    """連線送出少量資料後停滯時，watchdog 必須關閉連線中止，而非無限卡住。"""
+    monkeypatch.setattr(updater, "NO_PROGRESS_TIMEOUT", 1)
+    monkeypatch.setattr(updater, "_TIMEOUT_READ", 2)
+    monkeypatch.setattr(updater, "STOP_GRACE", 3)
+    monkeypatch.setattr(updater, "MIN_MULTIPART_SIZE", 1)
+    monkeypatch.setattr(updater, "MAX_BLOCK_RETRIES", 1)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StallingRangeHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/stall.bin".format(httpd.server_address[1])
+    started = time.monotonic()
+    try:
+        with pytest.raises(Exception):
+            updater.download_file(url, str(tmp_path / "out.bin"),
+                                  threads=2, use_proxy=False)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert time.monotonic() - started < 30, "停滯時應迅速中止，不應卡住"
 

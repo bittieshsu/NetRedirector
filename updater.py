@@ -36,7 +36,9 @@ from version import UPDATE_API_URL
 
 _TIMEOUT_CHECK = 15       # 檢查更新 (API) 逾時秒數
 _TIMEOUT_CONNECT = 15     # 建立連線逾時秒數
-_TIMEOUT_READ = 60        # 單次讀取逾時秒數 (超過此時間沒收到資料視為斷線)
+_TIMEOUT_READ = 20        # 單次讀取逾時秒數 (超過此時間沒收到資料視為斷線)。
+                          # Windows 無法從其他執行緒取消阻塞中的 recv，卡住的
+                          # 讀取只能靠這個逾時自行返回，因此不宜設得太大。
 _TIMEOUT_DOWNLOAD = 180   # SHA256 清單等下載的逾時秒數
 
 # --- 多線程分段下載參數 ---
@@ -48,6 +50,9 @@ CHUNK_SIZE = 256 * 1024               # 每次讀取的位元組數
 STALL_WINDOW = 30                     # 停滯偵測視窗 (秒)
 STALL_MIN_BYTES = 128 * 1024          # 視窗內至少需收到的位元組，否則視為停滯
 MAX_BLOCK_RETRIES = 4                 # 單一分段最大重試次數
+NO_PROGRESS_TIMEOUT = 45              # 整體位元組數連續無成長達此秒數 → 放棄本次下載
+STOP_GRACE = 25                       # stop 設起後仍存活的下載執行緒，最多再等此秒數
+                                      # (需大於 _TIMEOUT_READ，讓阻塞讀取自行逾時退出)
 # GitHub release CDN 常以「突發」方式送資料：短時間內灌一批、然後停頓。
 # 用 0.5 秒瞬時速度估算時，幾乎每個停頓窗都會顯示 0 B/s（實測 32.7 MB 的
 # 下載出現 183/243 個 0 速度樣本），看起來像不斷歸零。改用數秒滑動視窗
@@ -450,6 +455,46 @@ class _ProgressReporter(threading.Thread):
         self._stop.set()
 
 
+class _StallWatchdog(threading.Thread):
+    """主動停滯偵測：位元組數連續 timeout 秒沒有前進，就設 stop 放棄本次下載。
+
+    為什麼不是「從另一條執行緒關閉連線喚醒讀取」：Windows 上對同一個 socket
+    呼叫 shutdown()/close() 並不會取消另一條執行緒正在阻塞的 recv()，讀取仍會
+    卡到 socket 逾時才返回（已實測）。因此讓下載有界的是兩件事：
+    1) ``_TIMEOUT_READ`` 縮到數十秒 —— 任何阻塞讀取都會自行逾時拋錯，帶動既有
+       的重試邏輯接手；
+    2) 這個 watchdog 偵測「整體毫無前進」，設 stop 讓 worker 停止重試同一批
+       停滯區段，上層據此中止並改走下一條路徑（或回報失敗），而不是無限重試。
+    """
+
+    def __init__(self, get_downloaded, is_active, stop, timeout=None,
+                 interval=2.0):
+        super().__init__(daemon=True)
+        self._get_downloaded = get_downloaded
+        self._is_active = is_active
+        self._stop = stop
+        self._timeout = NO_PROGRESS_TIMEOUT if timeout is None else timeout
+        self._interval = interval
+
+    def run(self):
+        last_bytes = self._get_downloaded()
+        last_change = time.monotonic()
+        while not self._stop.wait(self._interval):
+            cur = self._get_downloaded()
+            if cur > last_bytes:
+                last_bytes, last_change = cur, time.monotonic()
+                continue
+            if not self._is_active():
+                last_change = time.monotonic()
+                continue
+            if time.monotonic() - last_change >= self._timeout:
+                self._stop.set()
+                return
+
+    def stop(self):
+        self._stop.set()
+
+
 def _fetch_block(session, url, start, end, dest, block_bytes, idx, lock,
                  stop, cancel_event):
     """下載 [start, end] 這段並寫入 dest 的對應偏移。失敗丟例外由 worker 重試。"""
@@ -535,6 +580,8 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
 
     reporter = _ProgressReporter(progress_cb, total, downloaded, active_count)
     reporter.start()
+    watchdog = _StallWatchdog(downloaded, active_count, stop)
+    watchdog.start()
 
     def worker():
         session = requests.Session()
@@ -554,7 +601,7 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
                     active[0] += 1
                 try:
                     attempt = 0
-                    while True:
+                    while not stop.is_set():
                         attempt += 1
                         try:
                             _fetch_block(session, final_url, b_start, b_end, dest,
@@ -585,9 +632,26 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
     workers = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
     for t in workers:
         t.start()
-    for t in workers:
-        t.join()
 
+    # 正常情況 worker 會自然結束。真的停滯時 watchdog 會設 stop；被阻塞在
+    # read() 的 worker 則靠 _TIMEOUT_READ 自行逾時退出（Windows 無法從外部
+    # 取消阻塞的 recv）。這裡是最後保險：stop 設起卻仍有執行緒存活時，最多再
+    # 等 STOP_GRACE 秒就放棄，絕不無限等待。
+    grace_deadline = None
+    for t in workers:
+        while True:
+            t.join(timeout=0.5)
+            if not t.is_alive():
+                break
+            if stop.is_set():
+                if grace_deadline is None:
+                    grace_deadline = time.monotonic() + STOP_GRACE
+                elif time.monotonic() >= grace_deadline:
+                    break
+
+    alive = any(t.is_alive() for t in workers)
+    stop.set()
+    watchdog.stop()
     reporter.emit()
     reporter.stop()
 
@@ -595,6 +659,8 @@ def _download_multipart(final_url, dest, total, threads, progress_cb, cancel_eve
         raise UpdateCancelled()
     if failures:
         raise RuntimeError(failures[0])
+    if alive:
+        raise RuntimeError("下載執行緒停滯且未能結束，已中止")
     if os.path.getsize(dest) != total or downloaded() < total:
         raise RuntimeError(
             "下載不完整: {}/{} 位元組".format(downloaded(), total))
@@ -604,9 +670,13 @@ def _download_single(final_url, dest, total_hint, progress_cb, cancel_event,
                      proxy_url=None):
     """單線串流下載 (伺服器不支援 Range，或分段失敗時的後備路徑)。"""
     headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+    stop = threading.Event()
     r = requests.get(final_url, headers=headers, stream=True,
                      timeout=(_TIMEOUT_CONNECT, _TIMEOUT_READ),
                      allow_redirects=True, proxies=_proxy_map(proxy_url))
+    done_holder = [0]
+    watchdog = _StallWatchdog(lambda: done_holder[0], lambda: True, stop)
+    watchdog.start()
     try:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0) or 0) or total_hint
@@ -617,12 +687,15 @@ def _download_single(final_url, dest, total_hint, progress_cb, cancel_event,
         win_bytes = 0
         with open(dest, "wb") as f:
             for chunk in r.iter_content(CHUNK_SIZE):
+                if stop.is_set():
+                    raise RuntimeError("停滯: 連線無回應")
                 if cancel_event is not None and cancel_event.is_set():
                     raise UpdateCancelled()
                 if not chunk:
                     continue
                 f.write(chunk)
                 done += len(chunk)
+                done_holder[0] = done
                 win_bytes += len(chunk)
                 now = time.monotonic()
                 if progress_cb is not None and now - last_t >= 0.5:
@@ -641,6 +714,8 @@ def _download_single(final_url, dest, total_hint, progress_cb, cancel_event,
         if total and done < total:
             raise RuntimeError("下載不完整: {}/{} 位元組".format(done, total))
     finally:
+        stop.set()
+        watchdog.stop()
         r.close()
 
 
@@ -663,6 +738,15 @@ def _download_over_path(url, dest, proxy_url, threads, progress_cb, cancel_event
     for attempt in range(1, MAX_BLOCK_RETRIES + 1):
         if cancel_event is not None and cancel_event.is_set():
             raise UpdateCancelled()
+        # 每次重試都重新探測：GitHub 的簽名 URL 有時效，沿用舊 URL 會 403
+        try:
+            fresh_url, fresh_total, _ = _probe_download(url, proxy_url=proxy_url)
+            if fresh_url:
+                final_url = fresh_url
+            if fresh_total:
+                total = fresh_total
+        except Exception:  # noqa: BLE001 — 探測失敗就沿用既有 URL 再試
+            pass
         try:
             _download_single(final_url, dest, total, progress_cb, cancel_event,
                              proxy_url=proxy_url)
