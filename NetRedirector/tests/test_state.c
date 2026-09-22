@@ -125,11 +125,22 @@ int main(void)
         remove_connection(port, AF_INET, dns1);
         CHECK(is_connection_tracked_udp(port, AF_INET, dns1) == TRUE, "TCP remove keeps UDP entry");
 
-        // 回應改寫用的 per-app-port 查詢: 找得到任一 UDP 條目的目的 port
-        CHECK(get_udp_dest_port_for_app(port, &dport) == TRUE, "response rewrite lookup found");
-        CHECK(dport == 53, "response rewrite port");
+        // 回應改寫用的 per-app-port 查詢: 必須同時拿回目的「位址」與「端口」。
+        // 只還原端口、把來源位址留成本機，會讓 connect() 的 socket 丟棄所有回覆。
+        UINT8 got_srv[16] = {0};
+        UINT16 got_srv_port = 0;
+        CHECK(get_udp_reply_endpoint(port, AF_INET, got_srv, &got_srv_port) == TRUE,
+              "response rewrite endpoint found");
+        CHECK(got_srv_port == 53, "response rewrite port");
+        CHECK(memcmp(got_srv, dns1, 4) == 0 || memcmp(got_srv, dns2, 4) == 0,
+              "response rewrite returns a real destination address");
+        CHECK(memcmp(got_srv, src, 4) != 0,
+              "response rewrite does NOT return the app's own address");
+        CHECK(get_udp_reply_endpoint(port, AF_INET6, got_srv, &got_srv_port) == FALSE,
+              "response rewrite family mismatch -> miss");
         clear_connections();
-        CHECK(get_udp_dest_port_for_app(port, &dport) == FALSE, "cleared -> miss");
+        CHECK(get_udp_reply_endpoint(port, AF_INET, got_srv, &got_srv_port) == FALSE,
+              "cleared -> miss");
     }
 
     printf("== IPv6 UDP 多目的地 ==\n");

@@ -24,6 +24,15 @@ DWORD WINAPI transfer_handler(LPVOID arg);
 BOOL flow_queues_init(void);
 void flow_queues_shutdown(void);
 
+// [Pure, host-testable] Source endpoint a packet returning from the relay must
+// carry so the app sees the real remote server as the sender. Rewrites to the
+// remote endpoint when known; otherwise leaves the packet's own source as-is.
+// Returns TRUE when the source was rewritten.
+BOOL udp_reply_source(int family,
+                      const UINT8 *pkt_src_addr, UINT16 pkt_src_port,
+                      BOOL have_remote, const UINT8 *remote_addr, UINT16 remote_port,
+                      UINT8 *out_src_addr, UINT16 *out_src_port);
+
 // Transfer-socket registry: Stop() shuts every registered pair down so
 // connection/transfer threads blocked in recv() unblock and exit. Threads
 // keep ownership of closesocket() (no double-close).

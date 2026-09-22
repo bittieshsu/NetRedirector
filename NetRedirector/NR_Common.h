@@ -41,6 +41,12 @@
 #define TCP_TIMEOUT_MS 3600000   // 1 hour
 #define UDP_TIMEOUT_MS 600000    // 10 minutes
 
+// Receive/send buffer for the UDP relay sockets and every UDP association
+// socket. These carry all proxied UDP flows at once, and the Windows default
+// is small enough that a burst (game map load, QUIC ramp-up) overflows it and
+// drops datagrams - which a game client sees as packet loss.
+#define UDP_SOCK_BUF_BYTES (1024 * 1024)
+
 // Max text length of an IP address (IPv6: 45 chars + null)
 #define MAX_IP_STR 48
 

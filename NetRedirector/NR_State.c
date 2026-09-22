@@ -229,24 +229,87 @@ BOOL is_connection_tracked_udp(UINT16 src_port, int family, const UINT8 *dest_ad
     return tracked;
 }
 
-// [Added] For rewriting relay->app UDP responses: recovers an original
-// destination port for the app port. With multiple destinations behind one
-// socket this returns the most recently used entry's port - when two
-// destinations share the same service port (DNS 53, QUIC 443) this is exact;
-// mixed ports on one socket are a rare residual limitation of the
-// relay-port-rewrite design.
-BOOL get_udp_dest_port_for_app(UINT16 src_port, UINT16 *dest_port)
+// [Fixed] For rewriting relay->app UDP responses: recovers the FULL remote
+// endpoint (address + port) the app actually sent to, so the reply can be
+// re-injected with "source == the real server" instead of the local machine.
+//
+// Restoring only the port (and swapping in the app's own address) made the
+// reply look like it came from the app itself: a connect()ed UDP socket - which
+// is what game clients use - silently discards it, so the match connection
+// never came up. The address and the port must therefore be taken from the
+// SAME entry.
+//
+// With multiple destinations behind one unconnected socket this returns the
+// most recently used entry, which is exact for the connected-socket case (one
+// peer per app port) and no worse than the previous port-only lookup otherwise.
+BOOL get_udp_reply_endpoint(UINT16 src_port, int family, UINT8 *dest_addr, UINT16 *dest_port)
 {
     BOOL found = FALSE;
+    if (dest_addr == NULL || dest_port == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
     EnterCriticalSection(&lock_connections);
     CONNECTION_INFO *conn = connection_list;
     while (conn != NULL) {
-        if (conn->is_udp && conn->src_port == src_port) {
-            if (dest_port) *dest_port = conn->orig_dest_port;
+        if (conn->is_udp && conn->src_port == src_port && conn->family == family) {
+            memset(dest_addr, 0, 16);
+            memcpy(dest_addr, conn->orig_dest_addr, n);
+            *dest_port = conn->orig_dest_port;
             found = TRUE;
             break;
         }
         conn = conn->next;
+    }
+    LeaveCriticalSection(&lock_connections);
+    return found;
+}
+
+// [Fixed] Resolve the tracked UDP flow a relay response belongs to, and report
+// the app endpoint it must be delivered to.
+//
+//   family/src_addr/src_port  the responder's address, from the SOCKS5 UDP header
+//   out_app_addr/out_app_port the app endpoint (conn->src_addr / conn->src_port)
+//   out_exact                 TRUE  = the responder address matched the tracked
+//                                     destination exactly
+//                             FALSE = matched on port alone
+//
+// The exact match is tried first and always wins, so the common case is
+// unchanged. The port-only fallback exists because game backends sit behind
+// load balancers / anycast: the server you sent to may answer from a different
+// address, and the old exact-only comparison dropped every such reply as
+// "no matching connection", which broke the session.
+BOOL resolve_udp_response(int family, const UINT8 *src_addr, UINT16 src_port,
+                          UINT8 *out_app_addr, UINT16 *out_app_port, BOOL *out_exact)
+{
+    BOOL found = FALSE;
+    if (src_addr == NULL || out_app_addr == NULL || out_app_port == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_connections);
+    CONNECTION_INFO *conn = connection_list;
+    CONNECTION_INFO *port_only = NULL;
+    while (conn != NULL) {
+        if (conn->is_udp && conn->family == family && conn->orig_dest_port == src_port) {
+            if (memcmp(conn->orig_dest_addr, src_addr, n) == 0) {
+                memset(out_app_addr, 0, 16);
+                memcpy(out_app_addr, conn->src_addr, n);
+                *out_app_port = conn->src_port;
+                if (out_exact) *out_exact = TRUE;
+                found = TRUE;
+                break;
+            }
+            // Remember the first (most recently used) same-port candidate as a
+            // fallback; keep scanning for an exact address match.
+            if (port_only == NULL) port_only = conn;
+        }
+        conn = conn->next;
+    }
+    if (!found && port_only != NULL) {
+        memset(out_app_addr, 0, 16);
+        memcpy(out_app_addr, port_only->src_addr, n);
+        *out_app_port = port_only->src_port;
+        if (out_exact) *out_exact = FALSE;
+        found = TRUE;
     }
     LeaveCriticalSection(&lock_connections);
     return found;

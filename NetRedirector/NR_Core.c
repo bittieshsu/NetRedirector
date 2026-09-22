@@ -39,6 +39,38 @@ static void send_packet_checked(const unsigned char *packet, UINT packet_len, WI
     }
 }
 
+// [Pure, host-testable] Source endpoint a packet returning from the relay must
+// carry so the app sees the real remote server as the sender.
+//
+// The relay delivers its reply to the app's own address, so the packet seen
+// here has the local relay socket as its source. A connect()ed UDP socket
+// (which is what game clients use) silently discards any reply whose source is
+// not its peer, so when the tracked flow endpoint is known the source must
+// become the remote server - address AND port, taken from the same connection
+// entry. Leaving the source as the app itself is exactly the bug this guards
+// against.
+//
+// Returns TRUE when the source was rewritten; FALSE when it must stay as-is
+// (no tracked endpoint, e.g. the flow already timed out).
+BOOL udp_reply_source(int family,
+                      const UINT8 *pkt_src_addr, UINT16 pkt_src_port,
+                      BOOL have_remote, const UINT8 *remote_addr, UINT16 remote_port,
+                      UINT8 *out_src_addr, UINT16 *out_src_port)
+{
+    if (out_src_addr == NULL || out_src_port == NULL) return FALSE;
+    int n = (family == AF_INET) ? 4 : 16;
+    memset(out_src_addr, 0, 16);
+
+    if (have_remote && remote_addr != NULL) {
+        memcpy(out_src_addr, remote_addr, n);
+        *out_src_port = remote_port;
+        return TRUE;
+    }
+    if (pkt_src_addr != NULL) memcpy(out_src_addr, pkt_src_addr, n);
+    *out_src_port = pkt_src_port;
+    return FALSE;
+}
+
 // [Added] Per-packet NAT/rule processing, extracted verbatim from the old
 // packet_processor loop body (the `continue`s became `return`s). Runs on a
 // flow worker thread - or inline on the receiver when its queue is full.
@@ -76,13 +108,22 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
         if (addr->Outbound) {
             // 1. Returning from Relay
             if (udp_header->SrcPort == htons(LOCAL_UDP_RELAY_PORT)) {
-                UINT16 dst_port = ntohs(udp_header->DstPort);
-                UINT16 orig_dest_port;
-                if (get_udp_dest_port_for_app(dst_port, &orig_dest_port)) {
-                    udp_header->SrcPort = htons(orig_dest_port);
-                    // Swap IPs
-                    swap_addr_bytes(family, src_addr, dst_addr);
-                }
+                // The relay sent this to the app's own address (src = us, dst =
+                // app); rewrite the source to the real remote server. See
+                // udp_reply_source() for why the source ADDRESS (not just the
+                // port) must be restored. DstAddr/DstPort already hold the app
+                // endpoint, so only the source side changes.
+                UINT8 srv_addr[16] = {0};
+                UINT16 srv_port = 0;
+                BOOL have_remote = get_udp_reply_endpoint(ntohs(udp_header->DstPort), family,
+                                                          srv_addr, &srv_port);
+                UINT8 new_src[16] = {0};
+                UINT16 new_src_port = 0;
+                udp_reply_source(family, src_addr, ntohs(udp_header->SrcPort),
+                                 have_remote, srv_addr, srv_port,
+                                 new_src, &new_src_port);
+                memcpy(src_addr, new_src, (family == AF_INET) ? 4 : 16);
+                udp_header->SrcPort = htons(new_src_port);
                 addr->Outbound = FALSE; // Inject to App
             }
             // 2. Tracked Outbound (keyed by src_port + destination: the
@@ -822,6 +863,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     unsigned char recv_buf[MAXBUF], send_buf[MAXBUF];
     int recv_len, from_len;
     int on = 1;
+    int udp_buf = UDP_SOCK_BUF_BYTES;
 
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) return 1;
 
@@ -830,6 +872,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     if (udp_relay_socket == INVALID_SOCKET) { WSACleanup(); return 1; }
 
     setsockopt(udp_relay_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+    setsockopt(udp_relay_socket, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
+    setsockopt(udp_relay_socket, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
 
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
@@ -845,6 +889,8 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     if (udp_relay_socket6 != INVALID_SOCKET) {
         setsockopt(udp_relay_socket6, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&on, sizeof(on));
         setsockopt(udp_relay_socket6, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+        setsockopt(udp_relay_socket6, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
+        setsockopt(udp_relay_socket6, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
 
         memset(&local_addr6, 0, sizeof(local_addr6));
         local_addr6.sin6_family = AF_INET6;
@@ -1025,30 +1071,29 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 recv_len = recvfrom(curr->udp_socket, (char*)recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from_addr, &from_len);
                 if (recv_len > 10 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV4) {
                     curr->last_activity = GetTickCount();
-                    UINT32 src_ip = *(UINT32*)&recv_buf[4];
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[8]);
-                    BOOL matched = FALSE;
+                    UINT8 app_addr[16] = {0};
+                    UINT16 app_port = 0;
+                    BOOL exact = FALSE;
 
-                    EnterCriticalSection(&lock_connections);
-                    CONNECTION_INFO *conn = connection_list;
-                    while (conn != NULL) {
-                        if (conn->is_udp && conn->family == AF_INET &&
-                            conn->orig_dest_port == src_port &&
-                            memcmp(conn->orig_dest_addr, &src_ip, 4) == 0) {
-                            struct sockaddr_in target_addr;
-                            memset(&target_addr, 0, sizeof(target_addr));
-                            target_addr.sin_family = AF_INET;
-                            memcpy(&target_addr.sin_addr.s_addr, conn->src_addr, 4);
-                            target_addr.sin_port = htons(conn->src_port);
-                            sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len - 10, 0,
-                                (struct sockaddr *)&target_addr, sizeof(target_addr));
-                            matched = TRUE;
-                            break;
+                    if (resolve_udp_response(AF_INET, &recv_buf[4], src_port,
+                                             app_addr, &app_port, &exact)) {
+                        if (!exact) {
+                            // Answered from a different address than the one we
+                            // sent to (load-balanced / anycast backend). The port
+                            // match is enough to place it, but leave a trace -
+                            // this reply used to be dropped outright.
+                            log_message("UDP relay: response from unexpected address %u.%u.%u.%u:%u - matched by port",
+                                recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
                         }
-                        conn = conn->next;
-                    }
-                    LeaveCriticalSection(&lock_connections);
-                    if (!matched) {
+                        struct sockaddr_in target_addr;
+                        memset(&target_addr, 0, sizeof(target_addr));
+                        target_addr.sin_family = AF_INET;
+                        memcpy(&target_addr.sin_addr.s_addr, app_addr, 4);
+                        target_addr.sin_port = htons(app_port);
+                        sendto(udp_relay_socket, (char*)&recv_buf[10], recv_len - 10, 0,
+                            (struct sockaddr *)&target_addr, sizeof(target_addr));
+                    } else {
                         log_message("UDP relay: response no matching connection (%u.%u.%u.%u:%u)",
                             recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7], src_port);
                     }
@@ -1057,30 +1102,26 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 else if (recv_len > 22 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV6) {
                     curr->last_activity = GetTickCount();
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[20]);
-                    BOOL matched = FALSE;
+                    UINT8 app_addr[16] = {0};
+                    UINT16 app_port = 0;
+                    BOOL exact = FALSE;
 
-                    EnterCriticalSection(&lock_connections);
-                    CONNECTION_INFO *conn = connection_list;
-                    while (conn != NULL) {
-                        if (conn->is_udp && conn->family == AF_INET6 &&
-                            conn->orig_dest_port == src_port &&
-                            memcmp(conn->orig_dest_addr, &recv_buf[4], 16) == 0) {
-                            if (udp_relay_socket6 != INVALID_SOCKET) {
-                                struct sockaddr_in6 target_addr6;
-                                memset(&target_addr6, 0, sizeof(target_addr6));
-                                target_addr6.sin6_family = AF_INET6;
-                                memcpy(&target_addr6.sin6_addr, conn->src_addr, 16);
-                                target_addr6.sin6_port = htons(conn->src_port);
-                                sendto(udp_relay_socket6, (char*)&recv_buf[22], recv_len - 22, 0,
-                                    (struct sockaddr *)&target_addr6, sizeof(target_addr6));
-                            }
-                            matched = TRUE;
-                            break;
+                    if (resolve_udp_response(AF_INET6, &recv_buf[4], src_port,
+                                             app_addr, &app_port, &exact)) {
+                        if (!exact) {
+                            log_message("UDP relay: response from unexpected address (IPv6, port %u) - matched by port",
+                                src_port);
                         }
-                        conn = conn->next;
-                    }
-                    LeaveCriticalSection(&lock_connections);
-                    if (!matched) {
+                        if (udp_relay_socket6 != INVALID_SOCKET) {
+                            struct sockaddr_in6 target_addr6;
+                            memset(&target_addr6, 0, sizeof(target_addr6));
+                            target_addr6.sin6_family = AF_INET6;
+                            memcpy(&target_addr6.sin6_addr, app_addr, 16);
+                            target_addr6.sin6_port = htons(app_port);
+                            sendto(udp_relay_socket6, (char*)&recv_buf[22], recv_len - 22, 0,
+                                (struct sockaddr *)&target_addr6, sizeof(target_addr6));
+                        }
+                    } else {
                         log_message("UDP relay: response no matching connection (IPv6, port %u)", src_port);
                     }
                 }

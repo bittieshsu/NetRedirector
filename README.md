@@ -29,7 +29,7 @@
 
 | 5. VPN Gate 節點派發 (VPN Gate) |
 | :---: |
-| [VPN Gate 界面預覽](docs/images/5.png) |
+| ![VPN Gate 界面預覽](docs/images/5.png) |
 | *SoftEther 虛擬網卡管理、VPN Gate 公開節點抓取與自動連線派發* |
 
 ---

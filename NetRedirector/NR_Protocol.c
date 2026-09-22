@@ -247,6 +247,13 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
         return NULL;
     }
 
+    // This single socket carries every proxied UDP flow for this proxy, so a
+    // burst (game map load, QUIC ramp-up) can overflow the default receive
+    // buffer and drop datagrams before the relay thread drains them.
+    int udp_buf = UDP_SOCK_BUF_BYTES;
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
+    setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
+
     UDP_ASSOCIATION* assoc = (UDP_ASSOCIATION*)malloc(sizeof(UDP_ASSOCIATION));
     if (assoc == NULL) {
         closesocket(tcp_sock);

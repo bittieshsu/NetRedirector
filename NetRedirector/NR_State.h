@@ -23,7 +23,8 @@ BOOL get_connection(UINT16 src_port, int family, const UINT8 *dest_key, int *out
 BOOL is_connection_tracked(UINT16 src_port, int family, const UINT8 *dest_key);                                      // TCP full-key lookup
 BOOL get_connection_udp(UINT16 src_port, int family, const UINT8 *dest_addr, UINT16 *dest_port, UINT32 *proxy_id);   // UDP full-key lookup
 BOOL is_connection_tracked_udp(UINT16 src_port, int family, const UINT8 *dest_addr);                                 // UDP full-key lookup
-BOOL get_udp_dest_port_for_app(UINT16 src_port, UINT16 *dest_port);             // UDP relay->app response rewrite
+BOOL get_udp_reply_endpoint(UINT16 src_port, int family, UINT8 *dest_addr, UINT16 *dest_port);  // UDP relay->app response rewrite (full endpoint)
+BOOL resolve_udp_response(int family, const UINT8 *src_addr, UINT16 src_port, UINT8 *out_app_addr, UINT16 *out_app_port, BOOL *out_exact);  // relay response -> tracked flow
 void remove_connection(UINT16 src_port, int family, const UINT8 *dest_key);
 void clear_connections(); // New helper
 
