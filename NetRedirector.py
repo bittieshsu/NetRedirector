@@ -124,7 +124,11 @@ class NetRedirectorWrapper:
         """
         def c_callback(msg_ptr):
             if msg_ptr:
-                msg = msg_ptr.decode('utf-8', errors='ignore')
+                # [Fixed] 用 'replace' 而非 'ignore'：引擎送來的是 C 端的 UTF-8 位元組，
+                # 若哪天編碼又出問題(例如 MSVC 用系統 ANSI 字碼頁讀原始碼，讓中文字串
+                # 常值變成 '?' 混殘缺位元組)，'ignore' 會把壞位元組靜默吃掉、只留下看似
+                # 正常的殘字；'replace' 會顯示 U+FFFD，讓問題一眼看得見。
+                msg = msg_ptr.decode('utf-8', errors='replace')
                 python_func(msg)
 
         # 將 Python 函數包裝成 C 函數指針
