@@ -109,7 +109,12 @@ if (-not $NoDll) {
         # cl 永遠不會執行, 導致 DLL 一直複製舊檔 (功能修復不會進到 DLL)
         $batContent += "CALL `"$vcvars`" >nul 2>&1`r`n"
     }
-    $batContent += "cl /nologo /LD /DNETREDIRECTOR_EXPORTS $($dllSrc -join ' ') /Fe:NetRedirector.dll /I. $dllLibs"
+    # [Fixed] 必須加 /utf-8。原始碼是「UTF-8 無 BOM」，不指定時 MSVC 會改用系統 ANSI
+    # 字碼頁(本機為 CP950)解讀原始碼，於是**字串常值**裡的中文被寫成 '?' 與殘缺位元組
+    # 混雜的亂碼(建置時看到的 warning C4819 就是這個徵兆)。Python 端是用 UTF-8 解碼
+    # DLL 送來的 log，所以亂碼會原樣出現在 UI 上。
+    # 實測：不加時 obj 內找不到正確的 UTF-8 位元組；加了之後 3 個中文字串常值全部正確。
+    $batContent += "cl /nologo /LD /utf-8 /DNETREDIRECTOR_EXPORTS $($dllSrc -join ' ') /Fe:NetRedirector.dll /I. $dllLibs"
     [System.IO.File]::WriteAllText($batPath, $batContent)
 
     Write-Host "  執行 cl: $($dllSrc -join ' ')" -ForegroundColor Gray
