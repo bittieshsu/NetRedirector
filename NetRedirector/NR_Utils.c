@@ -1,6 +1,13 @@
 // --- FILE: NR_Utils.c ---
 #include "NR_Utils.h"
 #include <ws2tcpip.h> // [Added] for getaddrinfo
+#include "NR_PidMap.h" // [Added] socket-event pid map (see NR_PidMap.h)
+
+// [Fixed] Forward declaration. refresh_rule_dns() (line ~693) calls this before
+// its definition at ~1144. MSVC only warns about the implicit declaration; gcc
+// treats "static declaration follows non-static declaration" as an ERROR, which
+// blocked linking NR_Utils.c into the gcc-based benchmarks. Semantics unchanged.
+static BOOL is_ip_like_pattern(const char *pattern);
 
 // === PID Lookup Caches ===
 //
@@ -8,7 +15,20 @@
 // enumerate the ENTIRE system connection table. On an active machine that is a
 // sizeable kernel+user-space cost when it happens for every new connection.
 //
-// Two complementary caches reduce the cost:
+// Measured cost of that call (tests/bench_conn_lookup.c, dev machine): ~650 us,
+// and the cost is essentially FIXED rather than per-row - IPv4 with 468 rows and
+// IPv6 with 173 rows both land at ~640 us, and dropping the owner-PID field
+// entirely (TCP_TABLE_BASIC_ALL) still costs 621 us. It is ~5 orders of
+// magnitude above the whole per-packet path, and it runs for every new
+// connection.
+//
+// Three complementary caches reduce the cost:
+//   0. PID EVENT MAP (NR_PidMap.c): (protocol, local port) -> pid, fed by
+//      WinDivert SOCKET-layer events. This is the only one of the three that can
+//      answer the FIRST lookup of a connection - the two below are keyed on the
+//      local port, which is brand new every time, so they structurally cannot.
+//      A miss/expiry/ambiguity returns 0 and falls through to the table scan, so
+//      the map can only ever be a shortcut, never a source of a wrong answer.
 //   1. PID_RESULT_CACHE  : (family, local ip, local port, is_udp) -> pid
 //      UDP sockets are long-lived and reused for many destinations, so a single
 //      socket only needs ONE table scan per TTL window instead of one per
@@ -771,6 +791,12 @@ DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port) {
     DWORD cached = pid_result_cache_lookup(AF_INET, FALSE, addr4, src_port);
     if (cached != 0) return cached;
 
+    // [Added] Event-map fast path (see NR_PidMap.h). Deliberately NOT written
+    // into the result cache below: that would extend trust in the map's answer
+    // past the map's own TTL, and the map's TTL is what bounds staleness.
+    DWORD mapped = pid_map_lookup(FALSE, src_port);
+    if (mapped != 0) return mapped;
+
     DWORD pid = 0;
     MIB_TCPTABLE_OWNER_PID *tcp_table = NULL;
     DWORD size = 0;
@@ -795,6 +821,10 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port) {
     memcpy(addr4, &src_ip, 4);
     DWORD cached = pid_result_cache_lookup(AF_INET, TRUE, addr4, src_port);
     if (cached != 0) return cached;
+
+    // [Added] Event-map fast path; see get_process_id_from_connection().
+    DWORD mapped = pid_map_lookup(TRUE, src_port);
+    if (mapped != 0) return mapped;
 
     DWORD pid = 0;
     MIB_UDPTABLE_OWNER_PID *udp_table = NULL;
@@ -824,6 +854,10 @@ DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
     DWORD cached = pid_result_cache_lookup(AF_INET6, FALSE, src_ip6, src_port);
     if (cached != 0) return cached;
 
+    // [Added] Event-map fast path; see get_process_id_from_connection().
+    DWORD mapped = pid_map_lookup(FALSE, src_port);
+    if (mapped != 0) return mapped;
+
     DWORD pid = 0;
     MIB_TCP6TABLE_OWNER_PID *tcp_table = NULL;
     DWORD size = 0;
@@ -846,6 +880,10 @@ DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
 DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port) {
     DWORD cached = pid_result_cache_lookup(AF_INET6, TRUE, src_ip6, src_port);
     if (cached != 0) return cached;
+
+    // [Added] Event-map fast path; see get_process_id_from_connection().
+    DWORD mapped = pid_map_lookup(TRUE, src_port);
+    if (mapped != 0) return mapped;
 
     DWORD pid = 0;
     MIB_UDP6TABLE_OWNER_PID *udp_table = NULL;

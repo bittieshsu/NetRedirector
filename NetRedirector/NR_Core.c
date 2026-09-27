@@ -103,6 +103,14 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
 
     // --- 以下邏輯對 IPv4 / IPv6 皆適用 (位址統一為 16 bytes) ---
 
+    // [Added] Snapshot of the direction flag before any rewrite. Every rewrite
+    // below flips Outbound TRUE -> FALSE, so a change in this flag is an exact
+    // indicator that the packet was modified - or, in the case-1 lookup miss,
+    // that it is being re-injected inbound without a rewrite and therefore
+    // still needs a full checksum (an outbound packet may carry an offloaded
+    // one). Untouched packets keep their original, already-valid checksum.
+    BOOL was_outbound = addr->Outbound;
+
     // UDP Logic
     if (udp_header != NULL && tcp_header == NULL) {
         if (addr->Outbound) {
@@ -172,8 +180,17 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                 return;
             }
         }
-        WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
-        send_packet_checked(packet, packet_len, addr, "udp rewritten");
+        if (was_outbound != addr->Outbound) {
+            // Rewritten above -> header bytes changed, checksums must be redone.
+            WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
+            send_packet_checked(packet, packet_len, addr, "udp rewritten");
+        } else {
+            // Captured but untouched (a DIRECT flow, or an inbound datagram
+            // addressed to the relay port). Re-injecting it unchanged keeps its
+            // original, already-valid checksum - recomputing it here was pure
+            // waste on a large share of the captured UDP traffic.
+            send_packet_checked(packet, packet_len, addr, "udp passthrough");
+        }
         return;
     }
 
@@ -240,8 +257,18 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                 return;
             }
         }
-        WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
-        send_packet_checked(packet, packet_len, addr, "tcp rewritten");
+        if (was_outbound != addr->Outbound) {
+            // Rewritten above -> header bytes changed, checksums must be redone.
+            WinDivertHelperCalcChecksums(packet, packet_len, addr, 0);
+            send_packet_checked(packet, packet_len, addr, "tcp rewritten");
+        } else {
+            // Captured but untouched: a DIRECT flow (case 2 with proxy_id == 0,
+            // or case 3 DIRECT), or an inbound packet addressed to the relay
+            // port. Its checksum is already valid, so leave it alone - this is
+            // the hot path for every DIRECT connection, which previously paid a
+            // full checksum recomputation per packet for nothing.
+            send_packet_checked(packet, packet_len, addr, "tcp unchanged");
+        }
     }
 }
 
@@ -264,17 +291,24 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
 #define FLOW_WORKERS (NUM_PACKET_THREADS - 1)   // thread[0] is the receiver
 #define FLOW_QUEUE_SLOTS 512
 
+// Slot payload capacity allocated up front. Covers a standard 1500-byte
+// Ethernet MTU with headroom; a slot grows on demand if a larger packet ever
+// arrives (jumbo frame, oversized UDP datagram), so this is a floor and not a
+// ceiling.
+#define FLOW_SLOT_INIT_CAP 2048
+
 C_ASSERT(NUM_PACKET_THREADS >= 2);   // FLOW_WORKERS must be >= 1
 
 typedef struct {
-    unsigned char *pkt;      // heap copy owned by the queue until processed
-    UINT len;
+    unsigned char *buf;      // preallocated payload storage, reused per packet
+    UINT cap;                // bytes allocated at buf (>= FLOW_SLOT_INIT_CAP)
+    UINT len;                // valid payload length of the queued packet
     WINDIVERT_ADDRESS addr;
 } FLOW_SLOT;
 
 typedef struct {
     CRITICAL_SECTION lock;   // short push/pop critical sections
-    HANDLE sem;              // tokens == queued items
+    HANDLE wake;             // auto-reset: "queue non-empty, drain it"
     FLOW_SLOT slots[FLOW_QUEUE_SLOTS];
     int head, tail, count;
 } FLOW_QUEUE;
@@ -282,18 +316,57 @@ typedef struct {
 static FLOW_QUEUE g_flow_queues[FLOW_WORKERS];
 static BOOL g_flow_queues_ready = FALSE;
 
+static void flow_queue_release(FLOW_QUEUE *q)
+{
+    if (q->wake != NULL) { CloseHandle(q->wake); q->wake = NULL; }
+    for (int s = 0; s < FLOW_QUEUE_SLOTS; s++) {
+        free(q->slots[s].buf);
+        q->slots[s].buf = NULL;
+        q->slots[s].cap = 0;
+    }
+    q->head = q->tail = q->count = 0;
+}
+
 BOOL flow_queues_init(void)
 {
     memset(g_flow_queues, 0, sizeof(g_flow_queues));
     for (int i = 0; i < FLOW_WORKERS; i++) {
-        InitializeCriticalSection(&g_flow_queues[i].lock);
-        g_flow_queues[i].sem = CreateSemaphore(NULL, 0, FLOW_QUEUE_SLOTS, NULL);
-        if (g_flow_queues[i].sem == NULL) {
-            for (int j = 0; j < i; j++) {
-                CloseHandle(g_flow_queues[j].sem);
+        FLOW_QUEUE *q = &g_flow_queues[i];
+        InitializeCriticalSection(&q->lock);
+        // [Changed] Auto-reset event instead of a counting semaphore. The
+        // worker drains the entire backlog per wakeup, so a per-packet token
+        // would leave the semaphore permanently over-counted (one release per
+        // packet, one wait per burst) and spin the worker on stale tokens.
+        q->wake = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (q->wake == NULL) {
+            for (int j = 0; j <= i; j++) {
+                flow_queue_release(&g_flow_queues[j]);
                 DeleteCriticalSection(&g_flow_queues[j].lock);
             }
+            memset(g_flow_queues, 0, sizeof(g_flow_queues));
             return FALSE;
+        }
+        // [Changed] Payload storage is allocated once per slot and reused,
+        // instead of malloc()/free() per packet. The old code allocated a heap
+        // block for every captured packet, so 1 receiver + 3 workers all
+        // contended on the process heap for what is a fixed-size, very
+        // short-lived object - the case the heap is worst at. A slot buffer is
+        // never touched by two threads at once (see dispatch_packet /
+        // flow_worker: a slot keeps counting towards q->count until its worker
+        // has finished with it), so reuse needs no extra synchronisation.
+        for (int s = 0; s < FLOW_QUEUE_SLOTS; s++) {
+            q->slots[s].buf = (unsigned char*)malloc(FLOW_SLOT_INIT_CAP);
+            if (q->slots[s].buf == NULL) {
+                log_message("Failed to allocate flow queue %d slot %d (%d bytes); "
+                    "packet dispatch unavailable", i, s, (int)FLOW_SLOT_INIT_CAP);
+                for (int j = 0; j <= i; j++) {
+                    flow_queue_release(&g_flow_queues[j]);
+                    DeleteCriticalSection(&g_flow_queues[j].lock);
+                }
+                memset(g_flow_queues, 0, sizeof(g_flow_queues));
+                return FALSE;
+            }
+            q->slots[s].cap = FLOW_SLOT_INIT_CAP;
         }
     }
     g_flow_queues_ready = TRUE;
@@ -307,14 +380,8 @@ void flow_queues_shutdown(void)
     if (!g_flow_queues_ready) return;
     g_flow_queues_ready = FALSE;
     for (int i = 0; i < FLOW_WORKERS; i++) {
-        FLOW_QUEUE *q = &g_flow_queues[i];
-        while (q->count > 0) {
-            free(q->slots[q->head].pkt);
-            q->head = (q->head + 1) % FLOW_QUEUE_SLOTS;
-            q->count--;
-        }
-        CloseHandle(q->sem);
-        DeleteCriticalSection(&q->lock);
+        flow_queue_release(&g_flow_queues[i]);
+        DeleteCriticalSection(&g_flow_queues[i].lock);
     }
 }
 
@@ -346,25 +413,35 @@ static void dispatch_packet(unsigned char *packet, UINT packet_len, WINDIVERT_AD
                             const UINT8 *dst, UINT16 dport)
 {
     FLOW_QUEUE *q = &g_flow_queues[flow_hash(family, is_tcp, src, sport, dst, dport) % FLOW_WORKERS];
+    BOOL queued = FALSE;
 
-    unsigned char *copy = (unsigned char*)malloc(packet_len);
-    if (copy != NULL) {
-        memcpy(copy, packet, packet_len);
-        EnterCriticalSection(&q->lock);
-        if (q->count < FLOW_QUEUE_SLOTS) {
-            FLOW_SLOT *slot = &q->slots[q->tail];
-            slot->pkt = copy;
+    EnterCriticalSection(&q->lock);
+    if (q->count < FLOW_QUEUE_SLOTS) {
+        FLOW_SLOT *slot = &q->slots[q->tail];
+        // Steady state allocates nothing: the slot buffer is reused. It only
+        // grows when a packet exceeds the slot's current capacity.
+        if (slot->cap < packet_len) {
+            unsigned char *grown = (unsigned char*)realloc(slot->buf, packet_len);
+            if (grown != NULL) { slot->buf = grown; slot->cap = packet_len; }
+        }
+        if (slot->cap >= packet_len) {
+            memcpy(slot->buf, packet, packet_len);
             slot->len = packet_len;
             slot->addr = *addr;
             q->tail = (q->tail + 1) % FLOW_QUEUE_SLOTS;
             q->count++;
-            LeaveCriticalSection(&q->lock);
-            ReleaseSemaphore(q->sem, 1, NULL);
-            return;
+            queued = TRUE;
         }
-        LeaveCriticalSection(&q->lock);
-        free(copy);   // queue full -> fall through to inline processing
     }
+    LeaveCriticalSection(&q->lock);
+
+    if (queued) {
+        SetEvent(q->wake);
+        return;
+    }
+    // Queue full, or the slot buffer could not be grown -> process inline. A
+    // rare degradation that trades a slight reordering risk under extreme
+    // overload for not dropping the packet.
     process_packet(packet, packet_len, addr);
 }
 
@@ -418,29 +495,36 @@ DWORD WINAPI flow_worker(LPVOID arg)
 
     while (running) {
         // 1 s timeout keeps `running` responsive during shutdown even if the
-        // semaphore/count are momentarily out of sync after a timeout race.
-        WaitForSingleObject(q->sem, 1000);
+        // wake event and q->count are momentarily out of sync.
+        WaitForSingleObject(q->wake, 1000);
 
-        unsigned char *pkt = NULL;
-        UINT len = 0;
-        WINDIVERT_ADDRESS addr;
-        BOOL have = FALSE;
+        // Drain the whole backlog per wakeup: one wait per burst instead of
+        // one wait per packet.
+        for (;;) {
+            unsigned char *buf = NULL;
+            UINT len = 0;
+            WINDIVERT_ADDRESS addr;
 
-        EnterCriticalSection(&q->lock);
-        if (q->count > 0) {
-            FLOW_SLOT *slot = &q->slots[q->head];
-            pkt = slot->pkt;
-            len = slot->len;
-            addr = slot->addr;
+            EnterCriticalSection(&q->lock);
+            if (q->count > 0) {
+                FLOW_SLOT *slot = &q->slots[q->head];
+                buf = slot->buf;
+                len = slot->len;
+                addr = slot->addr;
+            }
+            LeaveCriticalSection(&q->lock);
+
+            if (buf == NULL) break;
+
+            process_packet(buf, len, &addr);
+
+            // Release the slot only AFTER processing. While head is unadvanced
+            // the slot still counts towards q->count, so the receiver can never
+            // enqueue into a buffer that is still in use.
+            EnterCriticalSection(&q->lock);
             q->head = (q->head + 1) % FLOW_QUEUE_SLOTS;
             q->count--;
-            have = TRUE;
-        }
-        LeaveCriticalSection(&q->lock);
-
-        if (have) {
-            process_packet(pkt, len, &addr);
-            free(pkt);
+            LeaveCriticalSection(&q->lock);
         }
     }
     return 0;
@@ -744,15 +828,32 @@ DWORD WINAPI connection_handler(LPVOID arg)
     #define PROXY_HANDSHAKE_TIMEOUT_MS 10000
     DWORD timeout = PROXY_HANDSHAKE_TIMEOUT_MS;
     int opt_val = 1;
-    int buf_size = 64 * 1024;
     DWORD no_timeout = 0;
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&no_timeout, sizeof(no_timeout));
     setsockopt(proxy_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(proxy_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
     setsockopt(proxy_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&opt_val, sizeof(opt_val));
-    setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
-    setsockopt(proxy_sock, SOL_SOCKET, SO_RCVBUF, (char*)&buf_size, sizeof(buf_size));
+
+    // [Removed] SO_RCVBUF used to be pinned to 64 KB on BOTH sockets here.
+    // On Windows, *calling* setsockopt(SO_RCVBUF) disables receive-window
+    // auto-tuning for that socket, so the advertised window stayed pinned near
+    // 64 KB for the whole connection. The tunnel socket (proxy_sock) therefore
+    // capped a single flow at roughly 64 KB / RTT.
+    //
+    // Measured on this machine (interleaved, 6 rounds each, same destination
+    // and same file, only the setsockopt differing):
+    //   setsockopt(SO_RCVBUF, 64KB)   min 171.6  avg 230.9  max 281.6 Mbps
+    //   no setsockopt (auto-tune)     min 263.7  avg 281.0  max 296.2 Mbps
+    //   setsockopt(SO_RCVBUF, 256KB)  min 261.5  avg 279.2  max 294.8 Mbps
+    // End to end through the relay, the 64 KB pin cost 183-198 Mbps against a
+    // path that sustains 244-300 Mbps (RTT ~2.5 ms awake; the BDP at 280 Mbps
+    // is already ~88 KB, before the 80-120 ms Wi-Fi latency spikes).
+    //
+    // NOTE: Windows' DEFAULT SO_RCVBUF is already 65536 - the regression comes
+    // from *calling* setsockopt, not from the value chosen. Do not re-add this
+    // "to save memory": auto-tuning sizes the buffer to the BDP, and even a few
+    // hundred concurrent tunnels only cost tens of MB.
 
     memset(&proxy_addr, 0, sizeof(proxy_addr));
     proxy_addr.sin_family = AF_INET;
@@ -855,6 +956,23 @@ DWORD WINAPI transfer_handler(LPVOID arg)
 
 // === UDP Relay Server ===
 
+// Upper bound on datagrams drained from one socket per select() round. Keeps
+// the time an association can hold lock_udp during a burst bounded.
+#define UDP_RELAY_DRAIN_MAX 64
+
+// Non-blocking "is another datagram already queued on this socket?" probe.
+// Lets a socket be drained completely inside a single select() round. The old
+// code read exactly one datagram per readable socket per round, so a burst cost
+// one select() syscall per datagram - and select() is O(fds), which gets
+// expensive once several UDP associations are open.
+static BOOL udp_socket_has_pending(SOCKET s)
+{
+    u_long avail = 0;
+    if (s == INVALID_SOCKET) return FALSE;
+    if (ioctlsocket(s, FIONREAD, &avail) != 0) return FALSE;
+    return avail > 0;
+}
+
 DWORD WINAPI udp_relay_server(LPVOID arg)
 {
     WSADATA wsa_data;
@@ -930,9 +1048,12 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
 
         // Local Apps (IPv4) -> Relay
         if (udp_relay_socket != INVALID_SOCKET && FD_ISSET(udp_relay_socket, &read_fds)) {
+          for (int _drain = 0; _drain < UDP_RELAY_DRAIN_MAX; _drain++) {
+            if (_drain > 0 && !udp_socket_has_pending(udp_relay_socket)) break;
             from_len = sizeof(from_addr);
             recv_len = recvfrom(udp_relay_socket, (char*)recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from_addr, &from_len);
-            if (recv_len > 0) {
+            if (recv_len <= 0) break;
+            {   // bare block: keeps the original body indentation after the change
                 UINT16 from_port = ntohs(from_addr.sin_port);
                 UINT8 dest_addr[16];
                 UINT16 dest_port;
@@ -989,13 +1110,17 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     }
                 }
             }
+          }
         }
 
         // Local Apps (IPv6) -> Relay
         if (udp_relay_socket6 != INVALID_SOCKET && FD_ISSET(udp_relay_socket6, &read_fds)) {
+          for (int _drain = 0; _drain < UDP_RELAY_DRAIN_MAX; _drain++) {
+            if (_drain > 0 && !udp_socket_has_pending(udp_relay_socket6)) break;
             from_len = sizeof(from_addr6);
             recv_len = recvfrom(udp_relay_socket6, (char*)recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from_addr6, &from_len);
-            if (recv_len > 0) {
+            if (recv_len <= 0) break;
+            {   // bare block: keeps the original body indentation after the change
                 UINT16 from_port = ntohs(from_addr6.sin6_port);
                 UINT8 dest_addr[16];
                 UINT16 dest_port;
@@ -1048,6 +1173,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     }
                 }
             }
+          }
         }
 
         // Proxy -> Relay -> Apps
@@ -1067,8 +1193,11 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
 
             // Check UDP Data
             if (!remove && FD_ISSET(curr->udp_socket, &read_fds)) {
+              for (int _drain = 0; _drain < UDP_RELAY_DRAIN_MAX; _drain++) {
+                if (_drain > 0 && !udp_socket_has_pending(curr->udp_socket)) break;
                 from_len = sizeof(from_addr);
                 recv_len = recvfrom(curr->udp_socket, (char*)recv_buf, sizeof(recv_buf), 0, (struct sockaddr *)&from_addr, &from_len);
+                if (recv_len <= 0) break;
                 if (recv_len > 10 && recv_buf[2] == 0 && recv_buf[3] == SOCKS5_ATYP_IPV4) {
                     curr->last_activity = GetTickCount();
                     UINT16 src_port = ntohs(*(UINT16*)&recv_buf[8]);
@@ -1125,6 +1254,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         log_message("UDP relay: response no matching connection (IPv6, port %u)", src_port);
                     }
                 }
+              }
             }
 
             if (remove) {

@@ -97,7 +97,7 @@ if (-not $NoDll) {
     $dllDir = "NetRedirector"
     $dllSrc = @(
         "NetRedirector.c", "NR_Core.c", "NR_Protocol.c",
-        "NR_RuleEngine.c", "NR_State.c", "NR_Utils.c"
+        "NR_RuleEngine.c", "NR_State.c", "NR_Utils.c", "NR_PidMap.c"
     )
     $dllLibs = "windivert.lib User32.lib Advapi32.lib Ws2_32.lib Iphlpapi.lib"
 

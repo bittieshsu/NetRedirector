@@ -7,6 +7,7 @@
 #include "NR_Core.h"
 #include "NR_RuleEngine.h"
 #include "NR_Protocol.h"
+#include "NR_PidMap.h"   // [Added] socket-event pid map (optional fast path)
 
 // Forward Declarations to prevent implicit declaration warnings
 NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_id);
@@ -458,7 +459,7 @@ static DWORD WINAPI dns_refresh_worker(LPVOID arg)
 // 這條規則；失敗只記錄 log，不當成 Start 錯誤(要維持原本寬鬆環境能正常運作)。
 static BOOL g_firewall_rule_active = FALSE;
 
-static void run_netsh_firewall(const char *args)
+static void run_netsh_firewall(const char *args, BOOL quiet)
 {
     char cmdline[512];
     snprintf(cmdline, sizeof(cmdline), "netsh.exe %s", args);
@@ -473,14 +474,16 @@ static void run_netsh_firewall(const char *args)
 
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        log_message("防火牆規則: 無法啟動 netsh (%lu)", GetLastError());
+        if (!quiet) log_message("防火牆規則: 無法啟動 netsh (%lu)", GetLastError());
         return;
     }
     WaitForSingleObject(pi.hProcess, 10000);
     DWORD exit_code = 0;
     GetExitCodeProcess(pi.hProcess, &exit_code);
     if (exit_code != 0) {
-        log_message("防火牆規則: netsh 回傳 %lu (%s)", exit_code, args);
+        // Deleting a rule that does not exist returns non-zero; that is the
+        // expected outcome of the pre-add sweep, not a failure worth logging.
+        if (!quiet) log_message("防火牆規則: netsh 回傳 %lu (%s)", exit_code, args);
     } else {
         log_message("防火牆規則已更新: %s", args);
     }
@@ -492,27 +495,209 @@ static void set_relay_firewall_rules(BOOL enable)
 {
     if (!enable && !g_firewall_rule_active) return; // 本來就沒加，無需移除
 
-    char cmd[256];
+    char cmd[384];
+    char tcp_name[64];
+    char udp_name[64];
+    snprintf(tcp_name, sizeof(tcp_name), "NetRedirector Relay TCP %u", (unsigned)g_local_relay_port);
+    snprintf(udp_name, sizeof(udp_name), "NetRedirector Relay UDP %u", (unsigned)LOCAL_UDP_RELAY_PORT);
+
+    if (enable) {
+        // [Fixed] Delete before add. netsh "add rule" does NOT replace an
+        // existing rule with the same name - it appends another one. Any Start
+        // that was not paired with a successful Stop (crash, kill, failed
+        // Stop) therefore left its rule behind, and every later Start added one
+        // more: the rule table grew without bound. Found on this machine with
+        // 118 accumulated rules (59 TCP + 59 UDP). Deleting first makes the
+        // operation idempotent, and because "delete rule name=..." removes
+        // *every* rule with that name it also sweeps up the existing backlog.
+        snprintf(cmd, sizeof(cmd), "advfirewall firewall delete rule name=\"%s\"", tcp_name);
+        run_netsh_firewall(cmd, TRUE);
+        snprintf(cmd, sizeof(cmd), "advfirewall firewall delete rule name=\"%s\"", udp_name);
+        run_netsh_firewall(cmd, TRUE);
+    }
+
     const char *op = enable ? "add" : "delete";
 
     snprintf(cmd, sizeof(cmd),
-        "advfirewall firewall %s rule name=\"NetRedirector Relay TCP %u\" "
+        "advfirewall firewall %s rule name=\"%s\" "
         "dir=in action=allow protocol=TCP localport=%u",
-        op, (unsigned)g_local_relay_port, (unsigned)g_local_relay_port);
-    run_netsh_firewall(cmd);
+        op, tcp_name, (unsigned)g_local_relay_port);
+    run_netsh_firewall(cmd, FALSE);
 
     snprintf(cmd, sizeof(cmd),
-        "advfirewall firewall %s rule name=\"NetRedirector Relay UDP %u\" "
+        "advfirewall firewall %s rule name=\"%s\" "
         "dir=in action=allow protocol=UDP localport=%u",
-        op, (unsigned)LOCAL_UDP_RELAY_PORT, (unsigned)LOCAL_UDP_RELAY_PORT);
-    run_netsh_firewall(cmd);
+        op, udp_name, (unsigned)LOCAL_UDP_RELAY_PORT);
+    run_netsh_firewall(cmd, FALSE);
 
     g_firewall_rule_active = enable;
 }
 
+// === WinDivert filter: proxy-endpoint exclusion ===
+//
+// The relay reaches a proxy over its own TCP/UDP sockets, and every byte of
+// proxied traffic crosses them. Those packets match the filter's blanket
+// "outbound" clause, are then judged DIRECT (the endpoint is reached directly,
+// never through itself), and are re-injected unchanged - so 100% of proxied
+// traffic paid a full user-mode round trip (queue -> worker -> checksum ->
+// WinDivertSend) for a decision that was always "leave it alone".
+//
+// The fix reuses the reasoning the loopback exclusion above already applies:
+// traffic that is unconditionally DIRECT by policy does not need capturing.
+// Only the exact endpoint (address AND port) is excluded, so a legitimate
+// connection to the same host on any other port still goes through the proxy -
+// excluding by address alone would silently leak such flows to DIRECT.
+//
+// The filter is fixed when WinDivertOpen is called, so a proxy added or edited
+// while running is not excluded until the next Start. That only costs the round
+// trip; it is never a correctness problem.
+#define MAX_FILTER_ENDPOINTS 8
+
+typedef struct {
+    int family;           // AF_INET / AF_INET6
+    char ip[MAX_IP_STR];  // canonical literal, safe to embed in a filter
+    UINT16 port;
+} FILTER_ENDPOINT;
+
+// Collect the enabled proxy endpoints as filter-safe literals. Returns the
+// number written. Entries whose address is a hostname (or malformed) are
+// skipped: the filter language has no DNS, and emitting an unparseable clause
+// would make WinDivertOpen fail, taking the whole Start with it.
+static int collect_proxy_endpoints(FILTER_ENDPOINT *out, int max)
+{
+    int n = 0;
+    struct in_addr a4;
+    struct in6_addr a6;
+
+    EnterCriticalSection(&lock_proxies);
+    for (PROXY_CONFIG *c = proxy_configs; c != NULL && n < max; c = c->next) {
+        int family;
+        if (!c->enabled || c->proxy_ip[0] == '\0' || c->proxy_port == 0) continue;
+        if (InetPtonA(AF_INET, c->proxy_ip, &a4) == 1) family = AF_INET;
+        else if (InetPtonA(AF_INET6, c->proxy_ip, &a6) == 1) family = AF_INET6;
+        else continue;   // hostname -> cannot be expressed in the filter
+        if (InetNtopA(family, (family == AF_INET) ? (const void*)&a4 : (const void*)&a6,
+                       out[n].ip, MAX_IP_STR) == NULL) continue;
+        out[n].family = family;
+        out[n].port = c->proxy_port;
+        n++;
+    }
+    LeaveCriticalSection(&lock_proxies);
+
+    // The legacy single-proxy globals (NetRedirector_SetProxyConfig) live in a
+    // different store than the list, so fold them in as well.
+    if (n < max && g_proxy_ip[0] != '\0' && g_proxy_port != 0) {
+        int family = 0;
+        if (InetPtonA(AF_INET, g_proxy_ip, &a4) == 1) family = AF_INET;
+        else if (InetPtonA(AF_INET6, g_proxy_ip, &a6) == 1) family = AF_INET6;
+        if (family != 0) {
+            char ip[MAX_IP_STR];
+            if (InetNtopA(family, (family == AF_INET) ? (const void*)&a4 : (const void*)&a6,
+                          ip, sizeof(ip)) != NULL) {
+                BOOL dup = FALSE;
+                for (int i = 0; i < n; i++) {
+                    if (out[i].port == g_proxy_port && strcmp(out[i].ip, ip) == 0) { dup = TRUE; break; }
+                }
+                if (!dup) {
+                    out[n].family = family;
+                    strncpy(out[n].ip, ip, sizeof(out[n].ip) - 1);
+                    out[n].ip[sizeof(out[n].ip) - 1] = '\0';
+                    out[n].port = g_proxy_port;
+                    n++;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+// Build the WinDivert filter string.
+//
+// Non-static so tests/test_filter.c can pin its semantics: the exclusions are
+// hand-written in De Morgan form (the filter language has no unary NOT), and an
+// over-broad exclusion would silently stop proxying a whole class of traffic -
+// exactly the failure mode that leaks the host IP.
+//
+// Two exclusions are applied, both to traffic that is unconditionally DIRECT by
+// policy and therefore never needs capturing:
+//   1. Loopback (127.0.0.0/8 and ::1). Written as "inbound OR destination is
+//      not loopback", evaluated per family. Localhost services used to pay a
+//      user-mode round trip per packet for nothing.
+//   2. The relay's own tunnel sockets to each proxy endpoint (address AND
+//      port). Every byte of proxied traffic crosses these, so capturing them
+//      cost a user-mode round trip per packet - queue -> worker -> checksum ->
+//      WinDivertSend - for a decision that was always "leave it alone".
+//      Matching on the port as well as the address matters: excluding the
+//      address alone would stop proxying legitimate connections to that host
+//      on any other port.
+void build_windivert_filter(char *filter, size_t filter_size)
+{
+    // [Exclusion 2] Clauses for the relay's own tunnel sockets, in positive
+    // (De Morgan) form: "drop the relay's traffic to/from an endpoint" becomes
+    // "not addressed to X:Y" AND "not sourced from X:Y". A packet addressed to
+    // the endpoint is the relay's tunnel; one sourced from it is its reply.
+    char excl_tcp4[1024], excl_udp4[1024], excl_tcp6[1024], excl_udp6[1024];
+    excl_tcp4[0] = excl_udp4[0] = excl_tcp6[0] = excl_udp6[0] = '\0';
+
+    FILTER_ENDPOINT endpoints[MAX_FILTER_ENDPOINTS];
+    int ep_count = collect_proxy_endpoints(endpoints, MAX_FILTER_ENDPOINTS);
+    if (ep_count == MAX_FILTER_ENDPOINTS) {
+        log_message("Warning: %d or more enabled proxies; only the first %d are "
+            "excluded from capture (the rest cost a user-mode round trip per packet)",
+            MAX_FILTER_ENDPOINTS, MAX_FILTER_ENDPOINTS);
+    }
+    for (int i = 0; i < ep_count; i++) {
+        BOOL v4 = (endpoints[i].family == AF_INET);
+        const char *ipa = v4 ? "ip" : "ipv6";
+        char *tb = v4 ? excl_tcp4 : excl_tcp6;
+        char *ub = v4 ? excl_udp4 : excl_udp6;
+        size_t tcap = v4 ? sizeof(excl_tcp4) : sizeof(excl_tcp6);
+        size_t ucap = v4 ? sizeof(excl_udp4) : sizeof(excl_udp6);
+        size_t tlen = strlen(tb);
+        size_t ulen = strlen(ub);
+        if (tlen + 140 >= tcap || ulen + 140 >= ucap) {
+            log_message("Warning: WinDivert exclusion list is full; %s:%u left unexcluded",
+                endpoints[i].ip, (unsigned)endpoints[i].port);
+            continue;
+        }
+        snprintf(tb + tlen, tcap - tlen,
+            " and (tcp.DstPort != %u or %s.DstAddr != %s)"
+            " and (tcp.SrcPort != %u or %s.SrcAddr != %s)",
+            (unsigned)endpoints[i].port, ipa, endpoints[i].ip,
+            (unsigned)endpoints[i].port, ipa, endpoints[i].ip);
+        snprintf(ub + ulen, ucap - ulen,
+            " and (udp.DstPort != %u or %s.DstAddr != %s)"
+            " and (udp.SrcPort != %u or %s.SrcAddr != %s)",
+            (unsigned)endpoints[i].port, ipa, endpoints[i].ip,
+            (unsigned)endpoints[i].port, ipa, endpoints[i].ip);
+    }
+    if (ep_count > 0)
+        log_message("WinDivert filter: excluding %d proxy endpoint(s) from capture", ep_count);
+
+    snprintf(filter, filter_size,
+        "(ip and ("
+        "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)%s) or "
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
+        " and udp.DstPort != 67 and udp.SrcPort != 67"
+        " and udp.DstPort != 68 and udp.SrcPort != 68%s))"
+        " and (inbound or ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255))"
+        " or "
+        "(ipv6 and ("
+        "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)%s) or "
+        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
+        " and udp.DstPort != 67 and udp.SrcPort != 67"
+        " and udp.DstPort != 68 and udp.SrcPort != 68%s))"
+        " and (inbound or ipv6.DstAddr != ::1))",
+        g_local_relay_port, g_local_relay_port, excl_tcp4,
+        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT, excl_udp4,
+        g_local_relay_port, g_local_relay_port, excl_tcp6,
+        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT, excl_udp6);
+}
+
 NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 {
-    char filter[1024];
+    // Room for the base filter plus one exclusion pair per proxy endpoint.
+    char filter[4096];
     if (running) return FALSE;
 
     // [Fixed] Pre-flight: verify the local relay port is bindable BEFORE
@@ -630,24 +815,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     // WinDivert filter language has no unary NOT: "keep" = inbound, OR
     // destination-not-loopback, evaluated per family. Verified against the
     // real driver: parses OK and captures zero loopback packets.
-    snprintf(filter, sizeof(filter),
-        "(ip and ("
-        "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
-        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
-        " and udp.DstPort != 67 and udp.SrcPort != 67"
-        " and udp.DstPort != 68 and udp.SrcPort != 68))"
-        " and (inbound or ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255))"
-        " or "
-        "(ipv6 and ("
-        "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)) or "
-        "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
-        " and udp.DstPort != 67 and udp.SrcPort != 67"
-        " and udp.DstPort != 68 and udp.SrcPort != 68))"
-        " and (inbound or ipv6.DstAddr != ::1))",
-        g_local_relay_port, g_local_relay_port,
-        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT,
-        g_local_relay_port, g_local_relay_port,
-        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
+    build_windivert_filter(filter, sizeof(filter));
 
     windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 123, 0);
     if (windivert_handle == INVALID_HANDLE_VALUE) {
@@ -658,6 +826,13 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 
     // 放行防火牆，讓重寫後 re-inject 回來的 inbound relay 封包能送達本機。
     set_relay_firewall_rules(TRUE);
+
+    // [Added] Start the socket-event pid map before any packet thread exists, so
+    // it is warm by the time the first connection is classified. This is an
+    // OPTIONAL accelerator: if it fails to start, pid_map_lookup() returns 0 and
+    // every process lookup falls back to GetExtendedTcpTable - i.e. the previous
+    // behaviour. It must never fail Start().
+    pid_map_start();
 
     // [Added] These are best-effort tuning knobs (16384 is the allowed max),
     // but a silent failure would leave the queue at the small default and
@@ -715,6 +890,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 
 fail:
     set_relay_firewall_rules(FALSE);
+    pid_map_stop();   // [Added] joins its own consumer thread and closes its handle
     // running is already FALSE, so every server thread exits its loop on its
     // own. Wake the sleepers first (same as Stop), close WinDivert to unblock
     // any packet_processor threads, then wait for and close every handle that
@@ -771,6 +947,29 @@ NETREDIRECTOR_API BOOL NetRedirector_Stop(void)
     if (windivert_handle != INVALID_HANDLE_VALUE) {
         WinDivertClose(windivert_handle);
         windivert_handle = INVALID_HANDLE_VALUE;
+    }
+
+    // [Added] Stop the socket-event pid map: joins its consumer thread and
+    // closes its own (SOCKET-layer) handle. Must happen before the locks are
+    // torn down in DllMain, since its thread takes g_lock inside NR_PidMap.c.
+    pid_map_stop();
+
+    // [Added] Report what the map actually saved. Without this the feature is
+    // invisible from the outside: it either answers or silently falls back, and
+    // both look identical in the log. (A fallback is safe by design - see
+    // NR_PidMap.h - but the user should be able to see which one is happening.)
+    {
+        PID_MAP_STATS st;
+        pid_map_get_stats(&st);
+        if (st.lookups > 0) {
+            log_message("PID map: %lu/%lu process lookups served from socket events (%.1f%%), "
+                        "%lu ambiguous, %lu events consumed",
+                        (unsigned long)st.hits, (unsigned long)st.lookups,
+                        100.0 * (double)st.hits / (double)st.lookups,
+                        (unsigned long)st.ambiguous, (unsigned long)st.events);
+        } else {
+            log_message("PID map: no process lookups recorded this session");
+        }
     }
 
     // [Added] Unblock every connection/transfer thread parked in recv(): they

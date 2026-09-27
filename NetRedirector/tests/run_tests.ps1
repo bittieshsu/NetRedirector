@@ -38,7 +38,7 @@ if (-not $vcvars) {
 }
 if (-not $vcvars) { Write-Error "找不到 MSVC Build Tools (vcvars64.bat)" }
 
-$dllSrc = @("NetRedirector.c", "NR_Core.c", "NR_Protocol.c", "NR_RuleEngine.c", "NR_State.c", "NR_Utils.c")
+$dllSrc = @("NetRedirector.c", "NR_Core.c", "NR_Protocol.c", "NR_RuleEngine.c", "NR_State.c", "NR_Utils.c", "NR_PidMap.c")
 $libs = "windivert.lib User32.lib Advapi32.lib Ws2_32.lib Iphlpapi.lib"
 
 $testFiles = Get-ChildItem "$TestDir\test_$Name.c" -ErrorAction SilentlyContinue
