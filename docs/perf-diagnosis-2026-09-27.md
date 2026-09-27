@@ -522,6 +522,59 @@ proxy thread、udp relay thread、cleanup thread、DNS refresher —— 全部�
 修完之後，端到端是否真的回到 ~280 Mbps。** 這需要一次 A/B（見 §7「尚未完成」）。
 在那之前不要對殘餘落差再編故事 —— 先量。
 
+---
+
+## 12. 發行後端到端複測（2026-09-27，v1.8.2 已發行）
+
+本報告最後留下的未驗證項目（「修完之後，端到端是否真的回到 ~280 Mbps」）已補測完成。
+
+**受測對象**：`IntegratedApp.dist\NetRedirector.dll`，md5 `E0E4EE1E…`，與 repo 根目錄、
+`NetRedirector\` 兩份完全相同，且位元組比對含全部新字串（`udp passthrough`、`tcp unchanged`、
+`proxy endpoint(s) from capture`、`process lookups served from socket events`）
+→ 18:52 啟動的 App 跑的就是修好的引擎，**不必關 App、不必重啟**即可量測。
+防火牆規則恰好 2 條也是佐證。
+
+**吞吐（交錯 6 輪 × 6 s + 暖機，`ab_measure.py`）**
+
+| 臂 | median | min | max | avg |
+|---|---|---|---|---|
+| A 中繼（本機 33100） | **254.6 Mbps** | 226.5 | 272.1 | 252.8 |
+| B 直通（`curl -x socks5h://192.168.1.178:1080`） | 261.0 | — | — | 249.4 |
+
+A/B = **0.976**。對照 §5 修正前 A 臂的 182.7–197.5 Mbps（天花板 ~210 Mbps），
+本輪 max 272.1 Mbps **越過舊天花板** → 天花板解除，該未驗證項目結案。
+
+**新連線延遲歸因（15 對，`ab_latency.py`，中位數 ms）**
+
+| 階段 | A 中繼 | B 直通 | 差 |
+|---|---|---|---|
+| DNS | 9.46 | 0.04 | +9.42 |
+| connect | 11.58 | 5.57 | −3.40 |
+| 請求／回應 | 76.57 | 66.69 | +3.87 |
+| 合計 | 76.70 | 66.75 | +9.95 |
+
+DNS 的 +9.42 ms 是 `g_dns_via_proxy = TRUE` 的設計行為；connect 反而快 3.4 ms
+（中繼在本機就完成交握）。扣掉兩者後**引擎自身每條新連線只加約 4 ms** ——
+§10.2 的 650 µs pid 查詢只是其中一小部分，**不是延遲主因**。
+（證據等級：已量測。）
+
+**pid 快取命中率（實機累積約 1 小時 42 分，真實流量）**
+
+```
+[DLL] PID map: 15541/23554 process lookups served from socket events (66.0%), 2473 ambiguous, 235199 events consumed
+```
+
+命中率 66.0%；`ambiguous` 2473 次即 §10.3 fail-closed 設計的實際觸發次數。
+另 log 顯示 `PID map: socket-event cache up (layer=SOCKET, ttl=3000 ms)`。
+
+**其他現場證據**：防火牆規則 118 → 2 條（§6 第 5 項的現場驗證）；
+log 顯示 `excluding 8 proxy endpoint(s) from capture`（§6 第 2 項生效）。
+
+> 方法備註：引擎 log 只進 GUI 的 `txt_log`（`IntegratedApp.py` 的 `append_log`），
+> **不落檔**；而該 Qt 視窗被縮到系統匣時不會重繪，`PrintWindow` 也拿不到內容。
+> 本次流程是：以 `WM_MOUSEWHEEL` 定點滾動 + `PrintWindow(PW_RENDERFULLCONTENT)` 取像，
+> 最後用「點進日誌區 → Ctrl+A → Ctrl+C → 讀剪貼簿」取得精確文字（免 OCR）。
+
 
 
 
