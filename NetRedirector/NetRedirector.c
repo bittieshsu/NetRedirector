@@ -13,6 +13,7 @@
 NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_id);
 NETREDIRECTOR_API BOOL NetRedirector_EditRuleWithProxy(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_id);
 static void signal_dns_refresh(void);   // [Added] wake the background DNS refresher (defined above NetRedirector_Start)
+static void flush_dns_if_domain_hosts(const char *hosts_field);   // [Added] OS resolver flush for rules that carry a domain (defined above NetRedirector_Start)
 
 // === Global Variable Definitions ===
 // Per-structure locks (see NR_Common.h for the ordering rule).
@@ -91,6 +92,7 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleWithProxy(const char* process_name
     LeaveCriticalSection(&lock_rules);
 
     signal_dns_refresh();   // [Added] resolve domain patterns in target_hosts right away
+    flush_dns_if_domain_hosts(rule->target_hosts);   // [Added] force an on-the-wire resolve
     return rule->rule_id;
 }
 
@@ -122,6 +124,7 @@ NETREDIRECTOR_API UINT32 NetRedirector_AddRuleByPID(DWORD pid, const char* targe
     LeaveCriticalSection(&lock_rules);
 
     signal_dns_refresh();   // [Added] resolve domain patterns in target_hosts right away
+    flush_dns_if_domain_hosts(rule->target_hosts);   // [Added] force an on-the-wire resolve
     return rule->rule_id;
 }
 
@@ -129,14 +132,26 @@ NETREDIRECTOR_API BOOL NetRedirector_EnableRule(UINT32 rule_id)
 {
     if (rule_id == 0) return FALSE;
     BOOL found = FALSE;
+    BOOL needs_flush = FALSE;   // [Added] read under the lock, acted on after it
     EnterCriticalSection(&lock_rules);
     PROCESS_RULE *rule = rules_list;
     while (rule) {
-        if (rule->rule_id == rule_id) { rule->enabled = TRUE; found = TRUE; break; }
+        if (rule->rule_id == rule_id) {
+            rule->enabled = TRUE;
+            needs_flush = hosts_field_has_domain(rule->target_hosts);
+            found = TRUE;
+            break;
+        }
         rule = rule->next;
     }
     LeaveCriticalSection(&lock_rules);
-    if (found) signal_dns_refresh();   // [Added] re-enabled domain rule may need a fresh resolve
+    if (found) {
+        signal_dns_refresh();   // [Added] re-enabled domain rule may need a fresh resolve
+        if (needs_flush) {
+            flush_dns_resolver_cache();
+            log_message("DNS resolver cache flushed: re-enabled domain rule needs an on-the-wire resolve to learn its IP mapping");
+        }
+    }
     return found;
 }
 
@@ -212,7 +227,10 @@ NETREDIRECTOR_API BOOL NetRedirector_EditRuleWithProxy(UINT32 rule_id, const cha
         rule = rule->next;
     }
     LeaveCriticalSection(&lock_rules);
-    if (found) signal_dns_refresh();   // [Added] hosts may have changed to new domains
+    if (found) {
+        signal_dns_refresh();   // [Added] hosts may have changed to new domains
+        flush_dns_if_domain_hosts(target_hosts);   // [Added] force an on-the-wire resolve
+    }
     return found;
 }
 
@@ -356,6 +374,25 @@ NETREDIRECTOR_API BOOL NetRedirector_DisableProxyConfig(UINT32 proxy_id)
     return FALSE;
 }
 
+// [Added] Toggle socks5h-style remote DNS for one proxy: when enabled, the
+// SOCKS5 CONNECT / HTTP CONNECT handshake carries the original hostname
+// (recovered from the DNS snoop cache) so the proxy resolves it instead of
+// being handed a bare IP.
+NETREDIRECTOR_API BOOL NetRedirector_SetProxySendDomain(UINT32 proxy_id, BOOL enable)
+{
+    EnterCriticalSection(&lock_proxies);
+    PROXY_CONFIG *config = get_proxy_by_id(proxy_id);
+    if (config) {
+        config->send_domain_to_proxy = enable ? TRUE : FALSE;
+        log_message("Proxy config ID %u: remote DNS (socks5h) %s",
+                    proxy_id, enable ? "enabled" : "disabled");
+        LeaveCriticalSection(&lock_proxies);
+        return TRUE;
+    }
+    LeaveCriticalSection(&lock_proxies);
+    return FALSE;
+}
+
 NETREDIRECTOR_API PROXY_CONFIG_API* NetRedirector_GetProxyConfig(UINT32 proxy_id)
 {
     // NOTE: returns an internal pointer without a lock — the caller must not
@@ -402,6 +439,37 @@ static volatile BOOL dns_refresh_running = FALSE;
 static void signal_dns_refresh(void)
 {
     if (dns_refresh_event != NULL) SetEvent(dns_refresh_event);
+}
+
+// [Added] TRUE when at least one ENABLED rule carries a domain pattern. Only
+// those rules depend on the DNS-snoop IP->hostname map, so this gates the OS
+// resolver cache flush: a setup with no domain rules never pays for it.
+static BOOL has_domain_rule(void)
+{
+    BOOL found = FALSE;
+    EnterCriticalSection(&lock_rules);
+    for (PROCESS_RULE *r = rules_list; r != NULL; r = r->next) {
+        if (r->enabled && hosts_field_has_domain(r->target_hosts)) { found = TRUE; break; }
+    }
+    LeaveCriticalSection(&lock_rules);
+    return found;
+}
+
+// [Added] A rule that introduces a domain pattern can only match once the
+// hostname has been resolved ON THE WIRE after this point, because that is the
+// only thing that feeds the DNS-snoop reverse map (see the long comment on
+// flush_dns_resolver_cache in NR_Utils.c). If the app - or any other process -
+// already has the answer in the Windows resolver cache, no DNS query is sent,
+// the map never learns the IP, and the rule fails SILENTLY (traffic that should
+// be proxied goes direct). Flushing forces the next resolution onto the wire.
+//
+// Rules that carry only IPs or "*" do not benefit, so the flush stays tied to
+// the case that actually needs it rather than firing on every rule edit.
+static void flush_dns_if_domain_hosts(const char *hosts_field)
+{
+    if (!hosts_field_has_domain(hosts_field)) return;
+    flush_dns_resolver_cache();
+    log_message("DNS resolver cache flushed: new domain rule needs an on-the-wire resolve to learn its IP mapping");
 }
 
 #define DNS_REFRESH_MAX_RULES 256
@@ -924,6 +992,21 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
             running = FALSE;
             goto fail;
         }
+    }
+
+    // [Added] Domain rules that were configured BEFORE this Start can be
+    // silently dead: whatever hostname they target may already sit in the
+    // Windows resolver cache (resolved before the rule existed, or before the
+    // app was even started), so the application never sends a DNS query, our
+    // port-53 snoop never sees the answer, and the IP->hostname map stays empty
+    // - the rule matches nothing and the traffic goes direct, with no error
+    // anywhere. Flushing forces the next resolution onto the wire where the
+    // snoop can observe it. Done BEFORE the refresher thread starts so both
+    // paths see the same post-flush world.
+    if (has_domain_rule()) {
+        flush_dns_resolver_cache();
+        log_message("Domain rules present: flushed the Windows DNS resolver cache "
+            "so hostnames are re-resolved on the wire and the DNS snoop can map them");
     }
 
     // [Added] DNS refresher for domain-name rules (keeps resolve_rule_host_

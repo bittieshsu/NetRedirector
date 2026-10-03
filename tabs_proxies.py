@@ -12,7 +12,7 @@ import traceback
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidget, QTableWidgetItem, QPushButton, QLabel,
                              QMessageBox, QHeaderView, QComboBox, QLineEdit,
-                             QDialog, QFormLayout, QAbstractItemView)
+                             QDialog, QFormLayout, QAbstractItemView, QCheckBox)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QBrush
 
@@ -40,7 +40,7 @@ class ProxyDialog(QDialog):
         self.setWindowTitle(
             tr.t("編輯代理 (ID: {pid})").format(pid=proxy_data.get('id', 0))
             if self._editing else tr.t("新增外部代理 (SOCKS5/HTTP)"))
-        self.resize(460, 320)
+        self.resize(460, 360)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
@@ -73,6 +73,12 @@ class ProxyDialog(QDialog):
         self.ent_pass.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow(tr.t("Pass:"), self.ent_pass)
 
+        self.chk_send_domain = QCheckBox(tr.t("由代理端解析網域 (socks5h)"))
+        self.chk_send_domain.setToolTip(tr.t(
+            "開啟後把原始網域交給代理伺服器解析（避免 DNS 洩漏、取得較正確的 CDN 節點）。"
+            "僅在攔截到該網域的明文 DNS 時有效，否則自動改用 IP。"))
+        form.addRow(tr.t("遠端 DNS:"), self.chk_send_domain)
+
         layout.addLayout(form)
         layout.addStretch()
 
@@ -101,10 +107,11 @@ class ProxyDialog(QDialog):
         self.ent_port.setText(str(proxy_data.get('port', '')))
         self.ent_user.setText(proxy_data.get('user', ''))
         self.ent_pass.setText(proxy_data.get('pass', ''))
+        self.chk_send_domain.setChecked(bool(proxy_data.get('send_domain', False)))
 
     def get_data(self):
         """收集表單內容 (去除前後空白；密碼原樣保留)。"""
-        return {
+        data = {
             'name': self.ent_name.text().strip(),
             'type': self.combo_type.currentText(),
             'ip': self.ent_ip.text().strip(),
@@ -112,6 +119,10 @@ class ProxyDialog(QDialog):
             'user': self.ent_user.text(),
             'pass': self.ent_pass.text(),
         }
+        # 只在勾選時帶上，維持既有回傳字典形狀（未勾選 = 不帶此欄位）
+        if self.chk_send_domain.isChecked():
+            data['send_domain'] = True
+        return data
 
 
 class ProxiesTabMixin:
@@ -217,6 +228,7 @@ class ProxiesTabMixin:
         user = data['user']
         pwd = data['pass']
         ptype_str = data['type']
+        send_domain = bool(data.get('send_domain', False))
         if not name or not ip or not port_str:
             QMessageBox.warning(self, self.t("警告"), self.t("名稱、IP 與 Port 為必填"))
             return
@@ -251,7 +263,9 @@ class ProxiesTabMixin:
                     for p in self.custom_proxies:
                         if p['id'] == old_proxy_id:
                             p.update({'name': name, 'type': ptype_str, 'ip': ip,
-                                      'port': port, 'user': user, 'pass': pwd})
+                                      'port': port, 'user': user, 'pass': pwd,
+                                      'send_domain': send_domain})
+                    self.bridge.set_proxy_send_domain(old_proxy_id, send_domain)
                     # [Fixed] 改名時同步置換引用此代理的規則 (新舊前綴與舊版
                     # 無前綴都要比對): 否則存檔後規則仍指向舊名稱, 下次啟動
                     # 代理解析落空 → 規則靜默退回直連
@@ -288,8 +302,10 @@ class ProxiesTabMixin:
                 'port': port,
                 'user': user,
                 'pass': pwd,
-                'latency': '-'
+                'latency': '-',
+                'send_domain': send_domain
             })
+            self.bridge.set_proxy_send_domain(pid, send_domain)
             self.refresh_custom_proxy_table()
             self.refresh_proxy_combobox()
             self.append_log(f"自訂代理已新增: {name}")

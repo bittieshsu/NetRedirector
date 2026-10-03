@@ -15,12 +15,15 @@ BOOL resolve_rule_host_cached6(const char *host, UINT8 *out_addr6); // [Added] I
 void force_resolve_rule_host6(const char *host);    // [Added] unconditional IPv6 resolve+store
 void refresh_rule_dns(const char *hosts_field);    // [Added] pre-resolve all domain patterns in one rule's hosts field
 void clear_dns_cache(void);                   // [Added] Clear the DNS resolution cache
+BOOL hosts_field_has_domain(const char *hosts_field);  // [Added] TRUE if a hosts field contains a domain token (not "*"/IP)
+void flush_dns_resolver_cache(void);                   // [Added] force re-resolution on the wire so the DNS snoop can learn IP->hostname
 
 // === DNS Snooping (wildcard-subdomain matching) ===
 void dns_snoop_record(UINT32 ip, const char *domain);              // [Added] record one IPv4->domain mapping
 void dns_snoop_record6(const UINT8 *addr6, const char *domain);    // [Added] record one IPv6->domain mapping
 BOOL dns_snoop_matches_suffix(UINT32 ip, const char *suffix);      // [Added] IPv4 cache-only suffix lookup (packet-thread safe)
 BOOL dns_snoop_matches_suffix6(const UINT8 *addr6, const char *suffix); // [Added] IPv6 cache-only suffix lookup
+BOOL dns_snoop_lookup_domain(int family, const UINT8 *addr, char *out, size_t out_size); // [Added] recover the hostname for an IP (socks5h)
 int dns_snoop_parse_response(const UINT8 *msg, UINT msg_len);      // [Added] parse a DNS response, record A/AAAA records
 void clear_dns_snoop_cache(void);                                  // [Added] clear the addr->domain snoop cache
 const char* extract_filename(const char* path);

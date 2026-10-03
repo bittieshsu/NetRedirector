@@ -37,6 +37,9 @@ typedef enum {
 } RuleProtocol;
 
 // Public Structure for API consumers (Do not expose internal pointers here usually, but keeping compatible with original)
+// NOTE: the field layout up to and including `next` MUST match the internal
+// PROXY_CONFIG prefix exactly - GetAllProxyConfigs() hands out the internal
+// list cast to this type, and consumers walk `next`.
 typedef struct PROXY_CONFIG_API {
     UINT32 proxy_id;
     char name[256];
@@ -46,6 +49,7 @@ typedef struct PROXY_CONFIG_API {
     char username[256];
     char password[256];
     BOOL enabled;
+    BOOL send_domain_to_proxy;   // [Added] socks5h: let the proxy resolve the hostname
     struct PROXY_CONFIG_API *next;
 } PROXY_CONFIG_API;
 
@@ -68,6 +72,9 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
 NETREDIRECTOR_API BOOL NetRedirector_DeleteProxyConfig(UINT32 proxy_id);
 NETREDIRECTOR_API BOOL NetRedirector_EnableProxyConfig(UINT32 proxy_id);
 NETREDIRECTOR_API BOOL NetRedirector_DisableProxyConfig(UINT32 proxy_id);
+// [Added] socks5h-style remote DNS toggle for one proxy (0 = send the IP, 1 =
+// send the hostname recovered from the DNS snoop cache when one is known).
+NETREDIRECTOR_API BOOL NetRedirector_SetProxySendDomain(UINT32 proxy_id, BOOL enable);
 NETREDIRECTOR_API PROXY_CONFIG_API* NetRedirector_GetProxyConfig(UINT32 proxy_id);
 NETREDIRECTOR_API PROXY_CONFIG_API* NetRedirector_GetAllProxyConfigs(UINT32* count);
 

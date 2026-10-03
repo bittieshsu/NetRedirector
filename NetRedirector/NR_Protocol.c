@@ -56,11 +56,30 @@ int socks5_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UIN
         return -1;
     }
 
-    // Send Connect Command
+    // Send Connect Command.
+    // Remote DNS (socks5h): when the proxy is configured to resolve names and
+    // the DNS snoop cache knows the hostname behind this IP, send ATYP_DOMAIN
+    // so the proxy resolves it (geo-correct CDN routing, no local DNS leak).
+    // Falls back to the IP when no hostname is known.
     buf[0] = SOCKS5_VERSION;
     buf[1] = SOCKS5_CMD_CONNECT;
     buf[2] = 0x00;
-    if (family == AF_INET6) {
+
+    char domain[256];
+    size_t dlen = 0;
+    if (proxy_config != NULL && proxy_config->send_domain_to_proxy &&
+        dns_snoop_lookup_domain(family, dest_addr, domain, sizeof(domain))) {
+        dlen = strlen(domain);
+    }
+
+    if (dlen > 0 && dlen <= 255) {
+        buf[3] = SOCKS5_ATYP_DOMAIN;
+        buf[4] = (unsigned char)dlen;
+        memcpy(&buf[5], domain, dlen);
+        buf[5 + dlen] = (dest_port >> 8) & 0xFF;
+        buf[6 + dlen] = (dest_port >> 0) & 0xFF;
+        len = (int)(7 + dlen);
+    } else if (family == AF_INET6) {
         buf[3] = SOCKS5_ATYP_IPV6;
         memcpy(&buf[4], dest_addr, 16);
         buf[20] = (dest_port >> 8) & 0xFF;
@@ -101,8 +120,13 @@ int http_connect_with_config(SOCKET s, int family, const UINT8 *dest_addr, UINT1
     int len;
     BOOL use_auth = (proxy_config != NULL && proxy_config->username[0] != '\0');
 
-    char host_str[64];
-    if (family == AF_INET6) {
+    char host_str[300];
+    char domain[256];
+    if (proxy_config != NULL && proxy_config->send_domain_to_proxy &&
+        dns_snoop_lookup_domain(family, dest_addr, domain, sizeof(domain))) {
+        // Remote DNS: CONNECT to the hostname so the proxy resolves it.
+        snprintf(host_str, sizeof(host_str), "%s:%u", domain, dest_port);
+    } else if (family == AF_INET6) {
         char ip6[MAX_IP_STR];
         addr_to_string(AF_INET6, dest_addr, ip6, sizeof(ip6));
         snprintf(host_str, sizeof(host_str), "[%s]:%u", ip6, dest_port);

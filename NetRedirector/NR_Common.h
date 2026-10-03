@@ -62,6 +62,12 @@ typedef struct PROXY_CONFIG {
     char username[256];       // Username
     char password[256];       // Password
     BOOL enabled;             // Is enabled
+    // [Added] socks5h-style remote DNS: hand the original hostname (recovered
+    // from the DNS-snoop IP->domain map) to the proxy instead of the bare IP.
+    // Lets the proxy do geo-correct resolution / avoids a local DNS leak. Only
+    // meaningful when the hostname is known; otherwise the IP is used.
+    // Must stay BEFORE `next`: PROXY_CONFIG_API mirrors this prefix exactly.
+    BOOL send_domain_to_proxy;
     struct PROXY_CONFIG *next;
 } PROXY_CONFIG;
 

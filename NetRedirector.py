@@ -34,6 +34,8 @@ PROXY_CONFIG._fields_ = [
     ("username", c_char * 256),
     ("password", c_char * 256),
     ("enabled", c_bool),
+    # C BOOL 為 4 bytes，用 c_int 對齊；放在 next 之前以維持與 PROXY_CONFIG_API 相同的欄位位移
+    ("send_domain_to_proxy", c_int),
     ("next", POINTER(PROXY_CONFIG))
 ]
 
@@ -67,6 +69,13 @@ class NetRedirectorWrapper:
         # UINT32 NetRedirector_AddProxyConfig(...)
         self.lib.NetRedirector_AddProxyConfig.argtypes = [c_int, c_char_p, c_char_p, c_uint16, c_char_p, c_char_p, c_bool]
         self.lib.NetRedirector_AddProxyConfig.restype = c_uint32
+
+        # BOOL NetRedirector_SetProxySendDomain(UINT32 proxy_id, BOOL enable)  [新增]
+        # 舊版 DLL 可能沒有此匯出，能力探測一次即可。
+        self._has_set_proxy_send_domain = hasattr(self.lib, 'NetRedirector_SetProxySendDomain')
+        if self._has_set_proxy_send_domain:
+            self.lib.NetRedirector_SetProxySendDomain.argtypes = [c_uint32, c_bool]
+            self.lib.NetRedirector_SetProxySendDomain.restype = c_bool
 
         # BOOL NetRedirector_SetProxyConfig(...) (設定全局/預設代理)
         self.lib.NetRedirector_SetProxyConfig.argtypes = [c_int, c_char_p, c_uint16, c_char_p, c_char_p]
@@ -185,6 +194,17 @@ class NetRedirectorWrapper:
             password.encode('utf-8'),
             True # enabled
         )
+
+    def set_proxy_send_domain(self, proxy_id, enable):
+        """設定某代理是否採遠端 DNS (socks5h)。
+
+        True = 把原始主機名交給代理伺服器解析 (避免 DNS 洩漏、取得較正確的
+        CDN 節點)；False = 送 IP。主機名來自被動 DNS snoop 反查表，若學不到
+        就會自動退回送 IP。舊版 DLL 無此匯出時回傳 False。
+        """
+        if not getattr(self, '_has_set_proxy_send_domain', False):
+            return False
+        return bool(self.lib.NetRedirector_SetProxySendDomain(int(proxy_id), bool(enable)))
 
     def add_rule(self, process_name, target_hosts="*", target_ports="*", protocol=RuleProtocol.BOTH, action=RuleAction.PROXY):
         return self.lib.NetRedirector_AddRule(

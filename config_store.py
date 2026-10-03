@@ -36,14 +36,19 @@ def build_config_data(lang, ping_target, minimize_to_tray, hubs, custom_proxies,
     }
 
     for p in custom_proxies:
-        config_data["proxies"].append({
+        entry = {
             "name": p['name'],
             "type": p['type'],
             "ip": p['ip'],
             "port": p['port'],
             "user": p['user'],
             "pass": secure_config.encrypt_password(p['pass']),
-        })
+        }
+        # [Added] 遠端 DNS (socks5h)：只在啟用時寫入；關閉或舊設定檔維持原本的
+        # 字典形狀（還原端一律 p.get('send_domain', False)，缺欄位即視為關閉）
+        if p.get('send_domain'):
+            entry["send_domain"] = True
+        config_data["proxies"].append(entry)
 
     for r in rules:
         config_data["rules"].append({

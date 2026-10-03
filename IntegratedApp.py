@@ -397,6 +397,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                 plain_pass = secure_config.decrypt_password(p.get('pass', ''))  # [新增] 解密儲存的密碼
                 pid = self.bridge.add_proxy(p['ip'], int(p['port']), p['user'], plain_pass, ptype, p['name'])
                 if pid > 0:
+                    send_domain = bool(p.get('send_domain', False))
+                    self.bridge.set_proxy_send_domain(pid, send_domain)
                     self.custom_proxies.append({
                         'id': pid, # 取得新的 ID
                         'name': p['name'],
@@ -405,7 +407,8 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
                         'port': p['port'],
                         'user': p['user'],
                         'pass': plain_pass,
-                        'latency': '-'
+                        'latency': '-',
+                        'send_domain': send_domain
                     })
             self.refresh_custom_proxy_table()
 

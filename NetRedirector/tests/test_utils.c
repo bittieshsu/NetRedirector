@@ -105,6 +105,23 @@ int main(void)
     CHECK(match_process_list("chrome.*;Game*.exe", "firefox.exe") == FALSE, "list miss");
     CHECK(match_process_list("*", "anything.exe") == TRUE, "'*' list");
 
+    printf("== hosts_field_has_domain ==\n");
+    // Gates the OS resolver-cache flush: only rules that carry a domain token
+    // depend on the DNS-snoop IP->hostname map, so only those need the flush.
+    // A false positive here means a needless machine-wide DNS cache flush on
+    // every rule edit; a false negative means a domain rule that silently
+    // never matches.
+    CHECK(hosts_field_has_domain("google.com") == TRUE, "bare domain");
+    CHECK(hosts_field_has_domain("*.google.com") == TRUE, "wildcard subdomain");
+    CHECK(hosts_field_has_domain("*google*") == TRUE, "generic wildcard with letters");
+    CHECK(hosts_field_has_domain("8.8.8.8;example.com") == TRUE, "mixed list with a domain");
+    CHECK(hosts_field_has_domain("8.8.8.8;1.1.1.1") == FALSE, "IP-only list");
+    CHECK(hosts_field_has_domain("192.168.*.*") == FALSE, "IP octet wildcard is not a domain");
+    CHECK(hosts_field_has_domain("*") == FALSE, "'*' is not a domain");
+    CHECK(hosts_field_has_domain("ANY") == FALSE, "'ANY' is not a domain");
+    CHECK(hosts_field_has_domain("") == FALSE, "empty");
+    CHECK(hosts_field_has_domain(NULL) == FALSE, "NULL");
+
     printf("== is_lan_or_on_link_address ==\n");
     {
         UINT8 a10[4] = {10, 1, 1, 1};

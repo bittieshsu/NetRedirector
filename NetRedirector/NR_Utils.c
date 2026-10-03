@@ -615,6 +615,37 @@ BOOL dns_snoop_matches_suffix6(const UINT8 *addr6, const char *suffix)
     return dns_snoop_matches_suffix_addr(AF_INET6, addr6, suffix);
 }
 
+// Return the hostname most recently resolved to an address, if the snoop cache
+// still holds one. This is what lets a SOCKS5/HTTP proxy resolve the name
+// itself (socks5h) instead of being handed a bare IP: the packet engine only
+// ever sees the destination address, so the hostname has to be recovered here.
+// When a CDN address maps to several names, the first recorded is returned -
+// the proxy re-resolves it, so any name that did resolve to this address works.
+// Cold path (one call per new flow), bounded linear scan over the fixed cache.
+BOOL dns_snoop_lookup_domain(int family, const UINT8 *addr, char *out, size_t out_size)
+{
+    if (addr == NULL || out == NULL || out_size == 0) return FALSE;
+
+    int addr_len = (family == AF_INET) ? 4 : 16;
+    DWORD now = GetTickCount();
+    BOOL found = FALSE;
+
+    out[0] = '\0';
+    EnterCriticalSection(&lock_pid_cache);
+    for (UINT32 i = 0; i < DNS_SNOOP_CACHE_SIZE; i++) {
+        DNS_SNOOP_ENTRY *e = &g_dns_snoop_cache[i];
+        if (e->family != family || e->domain_count <= 0) continue;
+        if (memcmp(e->addr, addr, addr_len) != 0) continue;
+        if ((now - e->timestamp) > DNS_SNOOP_TTL_MS) break;   // expired
+        strncpy(out, e->domains[0], out_size - 1);
+        out[out_size - 1] = '\0';
+        found = (out[0] != '\0');
+        break;   // at most one entry per (family, addr)
+    }
+    LeaveCriticalSection(&lock_pid_cache);
+    return found;
+}
+
 // Parse a plaintext DNS response message and record every A record's IP under
 // the question name. Returns the number of A records processed, or -1 if the
 // message is not a parseable DNS response (or not a response at all).
@@ -706,6 +737,67 @@ void refresh_rule_dns(const char *hosts_field)
         token = strtok(NULL, ";");
     }
     free(copy);
+}
+
+// [Added] TRUE when a rule's hosts field contains at least one DOMAIN token,
+// i.e. a token that is neither a wildcard ("*"/"ANY") nor an IP-octet pattern.
+// Such rules are the only ones that depend on the DNS-snoop IP->hostname map,
+// which can only be populated by observing a DNS response on the wire - see
+// flush_dns_resolver_cache() below for why that matters.
+// Reuses is_ip_like_pattern() so the notion of "this token is a domain" is
+// identical to the one match_ip_pattern() uses when deciding which lookup to do.
+BOOL hosts_field_has_domain(const char *hosts_field)
+{
+    if (hosts_field == NULL || hosts_field[0] == '\0') return FALSE;
+    if (is_wildcard_str(hosts_field)) return FALSE;
+
+    size_t len = strlen(hosts_field) + 1;
+    char *copy = malloc(len);
+    if (copy == NULL) return FALSE;
+    strncpy(copy, hosts_field, len);
+
+    BOOL has_domain = FALSE;
+    char *token = strtok(copy, ";");
+    while (token != NULL) {
+        while (*token == ' ' || *token == '\t') token++;
+        if (token[0] != '\0' && !is_wildcard_str(token) && !is_ip_like_pattern(token)) {
+            has_domain = TRUE;
+            break;
+        }
+        token = strtok(NULL, ";");
+    }
+    free(copy);
+    return has_domain;
+}
+
+// [Added] Flush the Windows DNS resolver cache.
+//
+// Why this exists: a wildcard-subdomain rule ("*.example.com") can only match
+// through the DNS-snoop reverse map (IP -> hostname), and that map is fed
+// exclusively by parsing plaintext DNS responses on the wire (port 53). If the
+// application - or any process on the machine - already resolved the hostname
+// before the rule existed (or before Start), Windows answers from its resolver
+// cache, no DNS query is ever sent, and the snoop never learns the mapping.
+// The rule then fails SILENTLY: traffic that should be proxied goes direct.
+//
+// Flushing forces the next resolution onto the wire, where the snoop can see
+// it. Called when a domain rule is introduced (add/edit/enable) and once at
+// Start if any enabled rule has a domain filter.
+//
+// DnsFlushResolverCache is resolved dynamically so the DLL keeps no hard
+// dnsapi.lib dependency (the MinGW/GCC build path stays unchanged), and every
+// failure is a silent no-op - flushing is a best-effort accelerator, never a
+// correctness requirement.
+void flush_dns_resolver_cache(void)
+{
+    HMODULE dnsapi = LoadLibraryA("dnsapi.dll");
+    if (dnsapi == NULL) return;
+
+    typedef BOOL (WINAPI *DnsFlushFn)(void);
+    DnsFlushFn flush = (DnsFlushFn)(void *)GetProcAddress(dnsapi, "DnsFlushResolverCache");
+    if (flush != NULL) flush();
+
+    FreeLibrary(dnsapi);
 }
 
 // [Preserved] Helper function
