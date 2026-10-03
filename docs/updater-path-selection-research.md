@@ -528,11 +528,21 @@ deadline」。在那之前，8 MB / 1.5 s 維持不動 —— 它是目前唯一
 
 ## 7. 兩個專案共用的規格
 
-`MultiSocksDownloader/updater.py` 是同一套設計的來源。**D2/D3/D5/D6/D7/D8/D9
-以及自適應連線數都已同步**（`_measure_path_detailed`、`_rank_download_paths`、
-`_get_allow_range_fallback`、`_adaptive_threads` 逐字相同；D1 它沒有，因為它有
-PySocks；D4 它天生沒有 —— 段數由 `TARGET_BLOCK_SIZE` / `MAX_BLOCKS` 決定，
-沒有 `threads` 參數，這次為了自適應才補上 `max_blocks`）。
+`MultiSocksDownloader/updater.py` 是同一套設計的來源。**已同步：D2 / D3 / D7 /
+D8 / D9 以及自適應連線數**（`_measure_path_detailed`、`_get_allow_range_fallback`、
+`_adaptive_threads` 逐字相同；D1 它沒有，因為它有 PySocks；D4 它天生沒有 ——
+段數由 `TARGET_BLOCK_SIZE` / `MAX_BLOCKS` 決定，沒有 `threads` 參數，這次為了
+自適應才補上 `max_blocks`）。
+
+**尚未移植：D5（失敗靜默）與 D6（標籤「直連」說謊）。** 原因很具體：它的
+`_rank_download_paths(url, use_proxy=True)` 沒有 `log_cb` 參數，而 D5 要「把失敗
+講出來」就得先把日誌介面一路穿進去（選路 → 下載 → 呼叫端），D6 的 `DIRECT_LABEL`
+也掛在同一個函式上。所以在補上 `log_cb` 之前，它這兩條維持原狀 —— 不是忘了。
+
+> ⚠️ 更正記錄：本節初稿曾寫成「D2/D3/**D5/D6**/D7/D8/D9 都已同步」，那是錯的。
+> 錯因是把「交接文件裡寫了」當成「程式裡做了」，沒有實際 grep 驗證。實際在該檔
+> 搜 `log_cb` 與 `DIRECT_LABEL` 是**零命中**。於 2026-10-03 發佈 v1.8.3 時更正。
+
 **其中 D7 對它比對本專案更要緊** —— 下載器抓的是使用者給的任意檔案，
 小檔比 34 MB 的更新檔常見得多。可移植的規則：
 
