@@ -1,167 +1,192 @@
-# NetRedirector v1.8.2
+# NetRedirector v1.8.3
 
-## 效能修正：解除約 200 Mbps 的吞吐天花板，並移除每條新連線的固定系統呼叫開銷
+## 引擎熱路徑開銷、由代理端解析網域（socks5h）、UDP 中繼穩健性，以及更新器選路的九個缺陷
 
-這一版是針對核心轉發引擎（NetRedirector.dll）的效能修正。起因是本機實測發現：
-經過 NetRedirector 的單一連線只能跑約 190 Mbps，而同一條網路路徑直通時可以跑 260–300 Mbps。
-完整診斷過程與實測數據原記錄於 `docs/perf-diagnosis-2026-09-27.md`；該報告已自 repo 移除，
-如需查閱可從 git 歷史取得。
+這一版同時動了引擎（NetRedirector.dll）與更新器（updater.py）。引擎側是三個熱路徑開銷、
+一個新功能與一批小修正；更新器側是「在直連與代理之間挑最快」那套機制的九個缺陷 ——
+其中好幾個會**靜默**給出錯誤答案，也就是更新器會長期選到慢的那條路，而且日誌上看不出來。
 
-### 1. 解除吞吐天花板：不再把接收緩衝釘死在 64 KB
+---
 
-通道 socket 原本呼叫 `setsockopt(SO_RCVBUF, 64KB)`。在 Windows 上，**只要呼叫了 `setsockopt(SO_RCVBUF)`，
-該 socket 的接收視窗自動調整就會失效**，視窗從此被綁在 64 KB 附近。以實測的通道 RTT（約 2.5 ms）計算，
-64 KB ÷ 2.5 ms ≈ 210 Mbps —— 這正是觀察到的天花板。
+## 一、引擎：三個熱路徑開銷
 
-三臂交錯受控實驗（同一目的地、同一檔案，只差這行 setsockopt）：
+三個各自獨立、都落在封包處理路徑上的成本。以下都是**每封包微基準**（單機、`cl /O2`），
+不是端到端吞吐。
 
-| socket 設定 | 平均 | 最差 |
+### 1. 追蹤中的連線查找走了兩次
+
+原本是 `is_connection_tracked*()` 先判斷、再用 `get_connection*()` 取值。但兩者的判斷條件
+完全相同（`is_udp` + `src_port` + `family` + `memcmp orig_dest_addr`），而 `get_connection*()`
+本來就會回報是否命中。於是**每一個 outbound 封包都把同一份鏈結串列走兩遍、同一把鎖拿兩次**。
+
+改成只呼叫 `get_connection*()`、用它回傳的命中結果分支：
+
+| 執行緒數 | 修正前 | 修正後 |
 |---|---|---|
-| `setsockopt(SO_RCVBUF, 64KB)` | 230.9 Mbps | 171.6 Mbps |
-| 不呼叫 setsockopt（自動調整） | 281.0 Mbps | 263.7 Mbps |
-| `setsockopt(SO_RCVBUF, 256KB)` | 279.2 Mbps | 261.5 Mbps |
+| 1 | 104.0 ns | **82.2 ns** |
+| 3 | 233.7 ns | **175.3 ns** |
 
-修正方式：**移除該行，讓 Windows 的自動調整生效**（不是把數值加大而已 —— 重點在於「有沒有呼叫它」，
-Windows 的預設值本來就是 65536，但不呼叫時自動調整仍然有效）。
+### 2. 佇列喚醒訊號不再每個封包都發
 
-### 2. 中繼自己的通道流量不再進入使用者模式
+`SetEvent` 是核心轉換，實測**即使沒有人在等也要約 309 ns**；而 worker 每次被喚醒都會把
+整個積壓抽乾，所以同一批裡除了第一個以外的喚醒全是多餘的。加上 `wake_pending` 閘，只在
+idle→busy 轉換時發訊號：**444.8 → 95.3 ns/封包**。
 
-WinDivert 濾鏡原本是 `tcp and outbound`，會把中繼自己連往代理伺服器的通道封包也一起攔下。
-這些封包最終一定判定為 DIRECT、不修改任何欄位，卻仍走完「recv → parse → 雜湊 → 配置記憶體 →
-排隊 → 喚醒 worker → 再 parse → 重算 checksum → 送回」的整趟使用者模式流程 —— 也就是
-**100% 的代理流量都為一個永遠是「不要動它」的決定付了一次完整來回**。
+> `flow_worker()` 的重置順序是關鍵：必須**先重置旗標、再檢查佇列**。反過來會吃掉一次喚醒
+> —— 生產者在空隙中入列，看到 `wake_pending` 仍為 1 就不發訊號，該封包得等到 1 秒逾時。
 
-修正方式：新增 `build_windivert_filter()`，對每個已啟用的代理端點加上排除條件。
-排除條件同時比對**位址與埠**（address AND port）—— 只排除位址的話，連到同一台主機其他埠的連線
-也會被漏成 DIRECT，那就是真實 IP 外洩。主機名形式的代理位址會被安全跳過（濾鏡語言沒有 DNS），
-只記 warning、不影響啟動。
+### 3. 行程 PID 不再重複解析
 
-### 3. 沒改寫的封包不再重算 checksum
+呼叫端已經跑完整條解析鏈（結果快取 → 事件表 → `GetExtendedTcpTable`），
+`check_process_rule()` 進來又跑一次。這不是免費的：**解析失敗刻意不入快取**，所以解析不到的
+連線會再付一次完整的 `GetExtendedTcpTable`（約 650 µs）。改為由呼叫端把已解析的 PID 傳進去
+（`pid_in` / `have_pid`）。
 
-原本所有被攔下的封包都無條件重算 checksum。實際上「判定為 DIRECT」與「來自代理端點的入站封包」
-這兩類完全沒有改寫任何欄位，其 checksum 本來就是有效的。修正後只在真的改寫過時才重算。
+---
 
-### 4. 封包佇列：不再每包 malloc，worker 一次喚醒排空整批
+## 二、新增：由代理端解析網域（socks5h）
 
-原本每一個封包都要 `malloc` 一份拷貝、並用一個 counting semaphore 交棒给 worker。
-在 1 個接收執行緒 + 3 個 worker 的情況下，等於全部執行緒都在爭用處理程序堆積（heap 最不擅長的
-正是這種固定大小、極短生命週期的物件）。
+引擎在封包層只看得到目的地位址、看不到主機名，所以「讓代理自己解析」得先把主機名救回來。
+做法是從既有的 DNS snoop 反查表（IP → 主機名，由監聽 port 53 的明文 DNS 回應餵養）取回原始
+主機名，再以 SOCKS5 的 `ATYP_DOMAIN`（或 HTTP CONNECT 的 `hostname:port`）交給代理去解析
+—— 換來地理正確的 CDN 選路，且本機不必為此發出 DNS 查詢。
 
-修正方式：環狀佇列的每個槽位預先配置緩衝區（2048 B，必要時才成長）並重複使用；
-semaphore 換成 auto-reset event，worker 改成一次喚醒就排空整個 backlog。
+介面上在「代理」頁籤多了一個 **「由代理端解析網域 (socks5h)」** 勾選框，逐代理設定。
+`NetRedirector.py` 對舊版 DLL 用 `hasattr` 做能力探測，`config_store.py` 只在勾選時才寫入
+（維持舊設定檔的字典形狀），所以舊設定檔不會被改形狀。
 
-### 5. UDP relay 每輪排空整批 datagram
+### ⚠️ 這條路徑有一個會靜默失效的陷阱，一併修掉
 
-原本每個 socket 每輪 `select()` 只收一個 datagram，所以一陣突發流量要付出一次 `select()`
-系統呼叫 per datagram。修正後以 `FIONREAD` 探測是否還有待收資料，在單輪內排空（上限 64 個）。
+萬用子網域規則（例如 `*.example.com`）**只能**透過 DNS snoop 反查表命中，而那張表只由
+「線路上的明文 DNS 回應」餵養。如果應用程式（或機器上任何行程）在規則存在之前就已經解析過
+該主機名，Windows 會直接從 resolver cache 回答，**一個 DNS 查詢都不會送出去**，snoop 永遠
+學不到對應關係 —— 規則於是靜默失效：本該走代理的流量走了直連，而且哪裡都不會報錯。
 
-### 6. 防火牆規則不再無限累加
+修正方式：新增 `flush_dns_resolver_cache()`，在「新增／編輯／啟用帶網域的規則」以及
+「`Start()` 時若已存在啟用的網域規則」時呼叫（`Start()` 那次刻意排在 DNS refresher 執行緒
+之前，讓兩條路徑看到同一個 flush 後的世界）。只帶 IP 或 `*` 的規則不受影響，所以 flush 綁在
+真正需要它的情況上，而不是每次改規則都掃一次。
 
-`netsh advfirewall firewall add rule` **不會**取代同名規則，而是再新增一條。
-因此任何沒有配對到成功 Stop 的 Start（程式崩潰、被強制結束、Stop 失敗）都會留下規則，
-每次啟動再加一條 —— 本機實測已累積 **118 條**（59 TCP + 59 UDP）。
+`DnsFlushResolverCache` 以 `LoadLibraryA` 動態解析，DLL 不需要硬連結 `dnsapi.lib`
+（MinGW/GCC 建置路徑維持不變）；所有失敗都是靜默 no-op —— flush 只是加速器，不是正確性前提。
+它的語意是清掉**整個**系統 resolver 快取，範圍無法再縮小。
 
-修正方式：新增規則前先刪除同名規則（靜默，因為規則不存在時 netsh 本來就回非零），
-而 `delete rule name=...` 會刪掉**所有**同名規則，所以順帶清掉既有的積累。
+---
 
-### 7. 新連線的行程查詢改走 socket 事件快取
+## 三、UDP 中繼穩健性
 
-每條新連線都要查詢「這個連線屬於哪個行程」，原本的做法是快照整份系統連線表
-（`GetExtendedTcpTable`），實測約 **650 µs/次，而且是固定成本**（468 列與 173 列的 IPv6 表都是 ~640 µs，
-去掉 owner-PID 欄位也要 621 µs）。這是整個專案單價最高的操作：開 100 條連線的網頁 =
-65–130 ms 的純系統呼叫開銷，而且它跑在 flow worker 上、會讓同一條 flow 的封包排隊。
+UDP 中繼跑在單一執行緒上，而 `establish_udp_associate_with_config()` 是同步 dial 的。
+這代表**一條死掉的代理會拖垮所有其它 association 的流量**。三個修正都繞著這個事實：
 
-修正方式：新增 `NR_PidMap.c`，開一個 WinDivert SOCKET 層 handle，用 socket 生命週期事件維護
-`(協定, 本地埠) → pid` 的快取表。**先查快取，miss 才回退原本的系統表** —— 命中時 650 µs → 約 0.1 µs，
-競態時行為與修正前完全相同。安全設計：
+1. **每代理的 UDP ASSOCIATE 指數退避**。沒有它，一條死掉的代理會讓「每一個 datagram」都付滿
+   一次 ASSOCIATE 逾時，而逾時期間中繼執行緒完全無法服務其它代理。退避窗口掛在共享的
+   `PROXY_CONFIG` 上（不是傳給 `establish` 的那份複本），所以能跨 datagram 存活；成功即重設。
+   `UDP_ASSOC_TIMEOUT_MS` 也從 10 秒縮到 **3 秒** —— 這個逾時就是「一條死代理能卡住所有人的
+   時間」。修改代理設定（例如修正打錯的 IP）會清掉退避狀態，下一個 datagram 立刻重試。
 
-- **fail closed**：同一個 `(協定, 埠)` 出現兩個不同 pid 時該槽停止作答（回 miss，走權威表），
-  所以快取只可能是捷徑，不可能給出錯誤答案。
-- **可選加速器**：handle 開不起來時只記 log，所有查詢走原本的系統表，絕不讓 `Start()` 失敗。
-- 停止時會在 log 輸出命中率統計（例如 `PID map: 38/40 process lookups served from socket events (95%)`）。
+2. **`sendto` 失敗立刻丟掉該 association**。relay 已經死了、但 TCP 控制 socket 還沒被偵測到
+   斷線時，lazy establish 路徑永遠不會恢復 —— 原本的程式碼會一直對著同一個死 association
+   送、一直失敗。
 
-> 補充：SOCKET 層必須帶 `WINDIVERT_FLAG_SNIFF`。官方文件寫只要 `RECV_ONLY`，**照做會讓全機的
-> `bind()` 回 `WSAEACCES (10013)`**（實測 0/12 可建立）。本版已硬性固定為 `SNIFF | RECV_ONLY`。
+3. **關閉 UDP 的 `WSAECONNRESET` 通知**。Windows 會把 UDP send 觸發的 ICMP port-unreachable
+   回報成 10054，而 relay 的 drain loop 把 `recv_len <= 0` 當成「沒有更多資料」就跳出迴圈
+   —— 於是正常的 per-destination 錯誤（遊戲／串流／P2P 的 peer 三不五時就會 unreachable）
+   會一直打斷 loop。
+
+---
+
+## 四、四件小修正
+
+1. **IPv6 濾鏡誤攔 DHCPv6**。IPv6 的 UDP 排除子句抄了 IPv4 的 67/68（DHCPv4），但 IPv6 沒有
+   DHCPv4 —— DHCPv6 用的是 client 546 / server 547。每一次續租都被攔下來走完一趟使用者模式
+   往返。這從來不是正確性問題（規則引擎會把 multicast / link-local IPv6 強制走 DIRECT），
+   純粹是浪費。測試同時用「凍結的舊子句字串」對同一個封包做 old-vs-new 對照，證明行為真的
+   改變，並加了對照封包確認沒有過度排除（過度排除就是 IP 洩漏）。
+
+2. **WinDivert 開啟失敗的訊息**。原本只印一個數字。五個實際會遇到的錯誤碼全是「環境問題、
+   不是程式 bug」，現在訊息直接寫出使用者該做的事（防毒隔離了 `WinDivert64.sys`、沒以管理員
+   身分執行、驅動簽章驗證失敗、殘留的服務登錄項目被停用、被 BYOVD 防護擋下）。
+
+3. **佇列補上「位元組」上限**。原本只設了封包數上限（`QUEUE_LENGTH`），沒有 `QUEUE_SIZE`。
+   大封包的突發流量可以在封包數還遠低於 16384 時就撞到預設位元組上限，驅動直接丟棄溢出，
+   TCP 於是看到丟包而把壅塞視窗減半 —— 使用者感受到的是「上傳很慢」。同時把三個
+   `WinDivertSetParam` 改成不互相串接（原本用 `||` 串接，前面一失敗後面就不執行）。
+
+4. **行程名解析改用 `QueryFullProcessImageNameW`**。ANSI 版本會用系統代碼頁編碼路徑，非 ASCII
+   （例如中文）路徑回來的是 GBK/Big5 位元組，永遠比對不到以 UTF-8 存放的規則。
+
+---
+
+## 五、更新器：選路探針與分段下載的九個缺陷
+
+「在直連與代理之間挑最快」那套機制有一整批缺陷，多數會靜默給出錯誤答案。完整推導、量測方法
+與更正記錄見 `docs/updater-path-selection-research.md`（本版一併納入 repo）。
+
+| # | 缺陷 | 修正後實測 |
+|---|---|---|
+| D1 | `PySocks` 沒裝 → **SOCKS5 從來沒進過候選**（`InvalidSchema` 被 `except` 吞掉） | 已補進 `requirements.txt` |
+| D2 | 探針量的是延遲不是吞吐（分母含 TTFB，976.8 ms 佔 98%） | 119.4 Mbps 被量成 1.1 Mbps → **低估約 100 倍**；改為只量首個 chunk 之後 |
+| D3 | 1 MB 分段 × 每請求約 1.3 秒延遲 | 段大小下限 8 MB、段數上限 8（curl 對照：完整檔越快，1 MB Range 反而慢 3~7 倍） |
+| D4 | `DOWNLOAD_THREADS` 被完全忽略，worker 數 = 段數（34 MB 開 32 條） | 改為 `min(threads, MAX_BLOCKS, ceil(total / MIN_BLOCK_SIZE))` |
+| D5 | 失敗不發聲 —— D1 就是靠這個藏了整個產品生命週期 | 逐條輸出原因（逾時／HTTP 碼／例外型別）；選路日誌印出全部候選與各自速度 |
+| D6 | 標籤說謊：引擎全局轉發時「直連」不是直連（出口 IP 實測相同） | 改為「系統路由（未指定代理）」 |
+| D7 | 小於約 3.5 MB 的資產被誤判「樣本不足」→ 所有快路徑一起被丟掉 | 整份抓完算完整樣本；0.25 MB 由「丟棄」變成 7.5 Mbps |
+| D8 | 同一條路徑被探測兩次，再付一次 TTFB（1.7~2.1 秒，佔牆鐘 36~48%） | 34 MB 資產下載段 **4.28 → 2.67 秒（省 38%）**，`_probe_download` 1 → 0 次 |
+| D9 | 伺服器宣告 `Accept-Ranges: bytes` 卻對任何 Range 回 416 → 完全無法下載 | 0.02 秒就 416 失敗 → **3.74 秒 / 89.8 Mbps**（curl 對照 3.77~3.88 秒） |
+
+其中 D1 的後果值得單獨講：`requirements.txt` 少了 `PySocks`，而 CI 是
+`pip install -r requirements-dev.txt`（內含 `-r requirements.txt`）——**已發佈的每個版本，
+更新器裡的 SOCKS5 通路都是死的**，而且因為 D5 把例外吞掉，完全看不出來。
+
+---
+
+## 六、新增：自適應連線數（`ADAPTIVE_CONCURRENCY`，**預設關閉**）
+
+只有預估下載時間超過門檻（`ADAPTIVE_MIN_EST_SECONDS = 10` 秒）且檔案夠大時，才開 4 條連線做
+一次共同視窗的試探；聚合吞吐要贏基準 1.35 倍才採用，連線延遲漲超過 1.25 倍就退回單連線
+（Vegas 式煞車）。門檻經濟學：試探成本 `TTFB + 1.2 秒 ≈ 2.5 秒`，打平需要
+`est > 2.5 × 1.35/0.35 ≈ 9.6 秒` —— **快線不試探、慢線才試探**。
+
+開啟方式：`config.json` 頂層加 `"adaptive_concurrency": true`，或改
+`updater.ADAPTIVE_CONCURRENCY = True`。讀不到就回預設值，更新流程不因設定檔問題中斷。
+
+### ⚠️ 為什麼預設關閉（已知限制）
+
+- 探針自身的重複性（**±40%**）比它要偵測的效果（1→4 條連線的真實增益 **1.02 倍**）大一個量級。
+- 真網路端到端試探（把門檻暫時壓低以強制觸發）出現過**同一條路徑、相隔幾十秒，結論就從
+  「採用」翻成「退回」**：
+
+```
+NetRedirector（34 MB）  探針 4 條：吞吐 1.54x、延遲 0.34x → 採用
+NetRedirector（34 MB）  探針 4 條：吞吐 0.98x、延遲 0.68x → 退回單連線
+```
+
+- 尚未在第二條「會獎勵並行」的路徑上驗證（本機這條 5G 路徑的實測是 1→4 條沒有聚合增益）。
+- v2（傳輸中動態增減 worker，真正的 AIMD）刻意延後，等第二條路徑驗證過再說。
 
 ---
 
 ## 測試
 
-- **C 測試套件 222/222 通過**（`test_dns_snoop 29`、`test_filter 21`、`test_lock_stress 1`、
-  `test_rules 24`、`test_state 62`、`test_udp_rewrite 22`、`test_utils 63`）。
-- 新增 `tests/test_filter.c`（21 項）：以 `WinDivertHelperCompileFilter` / `EvalFilter`
-  （純使用者模式、不需驅動與管理員）**同時建構舊與新兩份濾鏡**逐案例比對，
-  斷言「行為差異恰好等於預期的 4 個通道案例，其餘 bit-for-bit 不變」。
-  含「同一台代理主機的其他埠仍會被攔截」的 IP 外洩防護回歸測試。
-- 新增基準／探針程式：`bench_conn_lookup.c`、`bench_packet_helpers.c`、`bench_pid_cache.c`、
-  `probe_flow_layer.c`、`probe_pid_map.c`、`probe_socket_layer_safety.c`。
-  pid 快取的正確性閘門：與權威系統表比對 **TCP 24/24、UDP 16/16 一致，CONFLICT 0**。
+- **C 測試套件 243/243 通過**（`test_dns_snoop 29`、`test_filter 32`、`test_lock_stress 1`、
+  `test_rules 24`、`test_state 62`、`test_udp_rewrite 22`、`test_utils 73`）。
+  新增的是 DHCPv6 濾鏡的 old-vs-new 對照組與 `hosts_field_has_domain` 的判定。
+- **Python：`pytest` 165 passed**（新增 D7/D8 7 條、D9 4 條、自適應連線數 11 條）。
+- **`flake8` 沒有新增任何違規**。比對方式是把每條違規**對應回原始碼行內容**做多重集合差集
+  （不比行號，行號會位移）：`updater.py` 40 → **38** 條、`tests/test_updater.py` 7 → **6** 條，
+  減少的 3 條是既有的超長行與檔尾空行被順手折掉，**新增 0 條**。
+- 姊妹專案 `MultiSocksDownloader`：`python -m unittest tests.test_updater` **26 passed**
+  （13 → 26）；`flake8` 淨變化 0。
 
----
+## 本版的量測範圍（說清楚哪個數字是哪種）
 
-## 已實測：吞吐天花板解除
+- **每封包微基準**（第一節的 ns 數字、D2/D3 的探針誤差）：單機受控量測，不是端到端吞吐。
+- **端到端**：更新器的 D8（4.28 → 2.67 秒）、D9（3.74 秒 / 89.8 Mbps）、自適應連線數的
+  真網路試探，都是在實機、真實網路上量到的，並與 `curl` 這條獨立協定棧對照。
+- **本版未做端到端 A/B 的項目**：引擎側的 socks5h 遠端 DNS 與 UDP 中繼退避。這兩項目前由
+  單元測試與程式碼審閱支撐，尚未在實機上做「開啟／關閉」的配對量測 —— 如果你要拿它們當
+  賣點，建議先補這一輪。
 
-發行後在實機上補做了端到端複測。受測的就是 v1.8.2 的引擎本體
-（`IntegratedApp.dist\NetRedirector.dll`，md5 `E0E4EE1E…`）—— 經位元組比對確認執行中的
-就是修好的版本，**不必關閉程式、不必重啟**即可量測。
-
-### 吞吐：A 中繼 vs B 直通（交錯 6 輪 × 6 秒 + 暖機）
-
-同一目的地（`http://http.speed.hinet.net/test_1024m.zip`）、同一時間窗，兩臂交錯：
-
-| 臂 | 路徑 | median | min | max | avg |
-|---|---|---|---|---|---|
-| A | 經 NetRedirector 中繼（本機 33100） | **254.6 Mbps** | 226.5 | 272.1 | 252.8 |
-| B | 直通 SOCKS5（`curl -x socks5h://192.168.1.178:1080`） | 261.0 Mbps | — | — | 249.4 |
-
-（B 臂該輪只留下 median / avg，min / max 未記錄。）
-
-**A/B = 0.976** —— 中繼相對直通只差 2.4%，等於「經過引擎」在吞吐上幾乎不再有代價。
-
-對照修正前（原診斷報告 §5）：同一條路徑的 A 臂 5 輪有 4 輪落在
-**182.7–197.5 Mbps**，且精準貼在「64 KB ÷ 2.5 ms ≈ 210 Mbps」的預測天花板上。
-本輪 max 已到 **272.1 Mbps**，越過舊天花板 —— **天花板確實解除了**。
-
-### 新連線延遲：引擎自身只佔約 4 ms
-
-15 對「全新連線的小請求」交錯量測（中位數，單位 ms；curl 的計時欄位是累計值，下表已相減）：
-
-| 階段 | A 中繼 | B 直通 | 差 |
-|---|---|---|---|
-| DNS | 9.46 | 0.04 | **+9.42** |
-| TCP connect | 11.58 | 5.57 | −3.40 |
-| 請求／回應 | 76.57 | 66.69 | +3.87 |
-| 合計 | 76.70 | 66.75 | +9.95 |
-
-- **DNS 的 +9.42 ms 是設計行為**：`g_dns_via_proxy = TRUE`，DNS 刻意走代理解析，不是回歸。
-- TCP connect 反而**快 3.4 ms**：中繼在本機就把交握完成，客戶端不必等跨網往返。
-- 扣掉上面兩項，**引擎自身對每條新連線只增加約 4 ms**。
-
-因此第 7 節的 pid 快取，正確的理解是「**移除每條新連線 650 µs 的固定系統呼叫**」，
-而不是「大幅降低連線延遲」—— 0.65 ms 只是那 4 ms 裡的一小部分。
-
-### pid 快取的實機命中率
-
-引擎停止時會輸出統計。本次實機連續運行約 1 小時 42 分（真實流量，非合成）後停止，log 為：
-
-```
-[DLL] PID map: 15541/23554 process lookups served from socket events (66.0%), 2473 ambiguous, 235199 events consumed
-```
-
-- **命中率 66.0%**（15541 / 23554）：三分之二的行程查詢由 socket 事件快取直接回答，
-  不必再快照整份系統連線表。
-- `2473 ambiguous` 是 fail-closed 設計生效的次數（同一 `(協定, 埠)` 出現兩個不同 pid 時
-  該槽停止作答、改走權威表）—— 快取只可能是捷徑，不可能給出錯誤答案。
-- 微基準：命中時 650 µs → **0.16 µs**；正確性閘門與權威系統表比對
-  **TCP 24/24、UDP 16/16 一致、CONFLICT 0**。
-
-### 其他現場證據
-
-- **防火牆規則去重**：修正前本機已累積 **118 條**（59 TCP + 59 UDP）；本版啟動後實測
-  恰好 **2 條**，log 也明確顯示「先 delete 同名規則、再 add」。
-- **濾鏡排除代理端點**：log 顯示 `excluding 8 proxy endpoint(s) from capture`，
-  中繼自己的通道封包不再進入使用者模式。
-- 快取層級與 TTL 也一併輸出：`PID map: socket-event cache up (layer=SOCKET, ttl=3000 ms)`。
-
-> 提醒：這些修正都在 NetRedirector.dll（核心引擎）與執行檔內。使用內建自動更新即可取得；
-> 若更新程式本身卡住，請直接下載本頁 zip 手動覆蓋。
+> 提醒：引擎修正都在 `NetRedirector.dll` 與執行檔內，更新器修正則在程式自己的更新流程裡。
+> 使用內建自動更新即可取得；若更新程式本身卡住（例如還在 1.8.2 之前、SOCKS5 通路是死的），
+> 請直接下載本頁 zip 手動覆蓋。
