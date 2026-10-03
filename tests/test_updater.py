@@ -247,3 +247,477 @@ def test_download_file_aborts_on_stalled_connection(monkeypatch, tmp_path):
         httpd.server_close()
     assert time.monotonic() - started < 30, "停滯時應迅速中止，不應卡住"
 
+
+# ------------------------------------------------------------------ #
+# 選路探針重用：下載階段不該為了 final_url / total 再付一次 TTFB
+# ------------------------------------------------------------------ #
+def test_total_from_range_headers():
+    total = updater._total_from_range_headers
+    assert total({"content-range": "bytes 0-99/5000"}, 206) == 5000
+    # 206 但長度未知 → 退回 content-length；都沒有則 0
+    assert total({"content-range": "bytes 0-99/*"}, 206) == 0
+    assert total({"content-length": "1234"}, 200) == 1234
+    # 206 卻沒有 content-range 時退回 content-length，不可直接當成未知
+    assert total({"content-length": "777"}, 206) == 777
+
+
+class _ThrottledHandler(_RangeHandler):
+    """分塊送出、塊間睡一下，讓探針的量測視窗長度可預期。
+
+    迴環線路快到視窗幾乎為 0，會被 PROXY_PROBE_MIN_SECONDS 判成樣本不足；
+    要驗證「有速度」就必須讓傳輸真的花掉一些時間。
+    """
+
+    delay = 0.03
+    step = 256 * 1024
+
+    def do_GET(self):
+        data = type(self).payload
+        rng = self.headers.get("Range")
+        if rng and type(self).supports_range:
+            m = re.match(r"bytes=(\d+)-(\d*)", rng)
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else len(data) - 1
+            end = min(end, len(data) - 1)
+            body = data[start:end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             "bytes {}-{}/{}".format(start, end, len(data)))
+        else:
+            body = data
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        for i in range(0, len(body), type(self).step):
+            self.wfile.write(body[i:i + type(self).step])
+            self.wfile.flush()
+            time.sleep(type(self).delay)
+
+    def log_message(self, *args):  # 靜音
+        pass
+
+
+def _serve_throttled(payload, supports_range=True, delay=0.03):
+    handler = type("_H", (_ThrottledHandler,),
+                   {"payload": payload, "supports_range": supports_range,
+                    "delay": delay})
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/file.bin".format(httpd.server_address[1])
+    return httpd, url
+
+
+def test_measure_path_detailed_reports_final_url_and_total():
+    """選路探針要順便帶回 final_url / total / supports_range 供下載階段重用。"""
+    data = os.urandom(4 * 1024 * 1024)      # 16 塊 x 0.03s ≈ 0.5s 視窗
+    httpd, url = _serve_throttled(data)
+    try:
+        speed, info = updater._measure_path_detailed(url, None)
+        assert speed is not None, info
+        assert speed > 0
+        assert info["final_url"] == url
+        assert info["total"] == len(data)
+        assert info["supports_range"] is True
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_measure_path_detailed_no_range_reports_full_total():
+    """伺服器不支援 Range 時，total 要退回 content-length 且標記不支援分段。"""
+    data = os.urandom(4 * 1024 * 1024)
+    httpd, url = _serve_throttled(data, supports_range=False)
+    try:
+        speed, info = updater._measure_path_detailed(url, None)
+        assert speed is not None, info
+        assert info["supports_range"] is False
+        assert info["total"] == len(data)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_over_path_reuses_probe_info(tmp_path, monkeypatch):
+    """帶了 probe_info 就不該再探一次 —— 那一次是 1.7~2.1 秒的完整 TTFB。"""
+    data = os.urandom(5 * 1024 * 1024)
+    httpd, url = _serve(data)
+    called = []
+
+    def boom(*a, **k):
+        called.append(1)
+        return (url, len(data), True)
+
+    monkeypatch.setattr(updater, "_probe_download", boom)
+    try:
+        dest = tmp_path / "out.bin"
+        updater._download_over_path(
+            url, str(dest), None, 4, None, None,
+            probe_info={"final_url": url, "total": len(data),
+                        "supports_range": True})
+        assert dest.read_bytes() == data
+        assert called == [], "已提供 probe_info 時不應再呼叫 _probe_download"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_over_path_probes_when_info_missing(tmp_path, monkeypatch):
+    """沒有 probe_info 時要退回自行探測，行為與舊版完全相同。"""
+    data = os.urandom(5 * 1024 * 1024)
+    httpd, url = _serve(data)
+    real = updater._probe_download
+    called = []
+
+    def counting(*a, **k):
+        called.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(updater, "_probe_download", counting)
+    try:
+        dest = tmp_path / "out.bin"
+        updater._download_over_path(url, str(dest), None, 4, None, None)
+        assert dest.read_bytes() == data
+        assert called, "未提供 probe_info 時必須自行探測"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_download_over_path_probes_when_info_incomplete(tmp_path, monkeypatch):
+    """probe_info 只給了 final_url、沒有 total 時，仍必須自行探測補齊。"""
+    data = os.urandom(5 * 1024 * 1024)
+    httpd, url = _serve(data)
+    real = updater._probe_download
+    called = []
+
+    def counting(*a, **k):
+        called.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(updater, "_probe_download", counting)
+    try:
+        dest = tmp_path / "out.bin"
+        updater._download_over_path(
+            url, str(dest), None, 4, None, None,
+            probe_info={"final_url": url, "total": 0, "supports_range": True})
+        assert dest.read_bytes() == data
+        assert called, "資訊不全時必須自行探測"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_rank_download_paths_returns_probe_info(monkeypatch):
+    """_rank_download_paths 的每個候選都要附帶自己的探針 info（4 元組）。"""
+    info = {"final_url": "http://x/f.bin", "total": 123,
+            "supports_range": True}
+    monkeypatch.setattr(
+        updater, "load_proxy_urls",
+        lambda *a, **k: [{"name": "P", "url": "socks5h://1.2.3.4:1"}])
+    monkeypatch.setattr(updater, "_measure_path_detailed",
+                        lambda url, proxy_url, **k: (1000.0, dict(info)))
+
+    ranked = updater._rank_download_paths("http://x/f.bin", use_proxy=True)
+    assert len(ranked) == 2, ranked          # 代理 + 保底直連
+    for _url, _speed, _label, got in ranked:
+        assert got.get("final_url") == "http://x/f.bin"
+        assert got.get("total") == 123
+
+
+# --------------------------------------------------------------------------- #
+# 伺服器「宣告支援 Range，實際回 416」
+#
+# 實測 http.speed.hinet.net 就是這種：標頭帶 Accept-Ranges: bytes，但任何
+# Range 請求（連 bytes=0-0）都回 416。舊版引擎在這裡 0.02 秒就失敗 ——
+# _probe_download 對 416 直接拋例外，於是 _download_over_path 根本走不到它
+# 自己的單線備援；而 curl 抓同一個 URL 完全正常（40 MB / 3.77 秒 / 87 Mbps）。
+#
+# 既有的 test_download_file_falls_back_to_single_when_no_range 只涵蓋「忽略
+# Range、回整份 200」，蓋不到「明確拒收」這條。
+# --------------------------------------------------------------------------- #
+class _RangeRejectingHandler(_RangeHandler):
+    """任何帶 Range 的請求都回 416；不帶 Range 則正常回 200 全檔。"""
+
+    def do_GET(self):
+        if self.headers.get("Range"):
+            body = b"416 Requested Range Not Satisfiable"
+            self.send_response(416)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+    def log_message(self, *args):  # 靜音
+        pass
+
+
+def _serve_rejecting_range(payload):
+    handler = type("_H", (_RangeRejectingHandler,), {"payload": payload})
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/file.bin".format(httpd.server_address[1])
+    return httpd, url
+
+
+class _ThrottledRangeRejectingHandler(_ThrottledHandler):
+    """拒收 Range（416），其餘同 _ThrottledHandler（分塊送出 + 塊間睡）。
+
+    量測視窗要驗「真的量到速度」就必須讓傳輸花掉時間：迴環線路上
+    ``time.monotonic()`` 的差會是 0.0，走完整樣本分支時會被判「無法計時」。
+    """
+
+    def do_GET(self):
+        if self.headers.get("Range"):
+            body = b"416 Requested Range Not Satisfiable"
+            self.send_response(416)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+
+def _serve_throttled_rejecting_range(payload, delay=0.03):
+    handler = type("_H", (_ThrottledRangeRejectingHandler,),
+                   {"payload": payload, "delay": delay})
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/file.bin".format(httpd.server_address[1])
+    return httpd, url
+
+
+def test_range_rejected_classification():
+    assert updater._range_rejected(416)
+    assert updater._range_rejected(501)
+    assert updater._range_rejected(400)
+    # 「忽略 Range、回整份 200」不算拒絕 —— 那是另一條路徑（supports_range=False）
+    assert not updater._range_rejected(200)
+    assert not updater._range_rejected(206)
+    assert not updater._range_rejected(404)
+
+
+def test_probe_download_falls_back_when_range_rejected():
+    data = os.urandom(4096)
+    httpd, url = _serve_rejecting_range(data)
+    try:
+        _final, total, supports = updater._probe_download(url)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert total == len(data)      # 拿掉 Range 之後仍量得到長度
+    assert supports is False       # 但明確不可分段
+
+
+def test_measure_path_detailed_falls_back_when_range_rejected():
+    data = os.urandom(512 * 1024)
+    httpd, url = _serve_throttled_rejecting_range(data)
+    try:
+        speed, info = updater._measure_path_detailed(url, None)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert info["error"] is None, info
+    assert info["supports_range"] is False
+    assert info["total"] == len(data)
+    assert speed is not None and speed > 0
+
+
+def test_download_file_survives_range_rejecting_server(tmp_path):
+    """端到端：這種伺服器舊版會直接失敗，修好後必須抓到完整內容。"""
+    data = os.urandom(512 * 1024)
+    httpd, url = _serve_rejecting_range(data)
+    dest = tmp_path / "out.bin"
+    try:
+        updater.download_file(url, str(dest), threads=4, use_proxy=False)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert dest.read_bytes() == data
+
+
+# ------------------------------------------------------------------ #
+# 自適應連線數
+# ------------------------------------------------------------------ #
+class _RecordingThrottledHandler(_ThrottledHandler):
+    """同 _ThrottledHandler，但把每個請求的 Range 起點記下來。
+
+    用來證明聚合量測真的是「每條連線從不同偏移起讀」，而不是大家一起讀
+    同一段（那會把同一批位元組算 n 次，憑空生出 n 倍吞吐）。
+    """
+
+    starts = None
+    lock = None
+
+    def do_GET(self):
+        rng = self.headers.get("Range")
+        if rng:
+            m = re.match(r"bytes=(\d+)-", rng)
+            if m:
+                with type(self).lock:
+                    type(self).starts.append(int(m.group(1)))
+        super().do_GET()
+
+    def log_message(self, *args):  # 靜音
+        pass
+
+
+def _serve_recording_throttled(payload, delay=0.05):
+    starts = []
+    handler = type("_H", (_RecordingThrottledHandler,),
+                   {"payload": payload, "delay": delay,
+                    "starts": starts, "lock": threading.Lock()})
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:{}/file.bin".format(httpd.server_address[1])
+    return httpd, url, starts
+
+
+def _fake_multipart(monkeypatch, calls):
+    """把 _download_multipart 換成只記錄 threads 的假函式。"""
+    def fake(final_url, dest, total, threads, progress_cb, cancel_event,
+             proxy_url=None):
+        calls.append(threads)
+        with open(dest, "wb") as f:
+            f.write(b"\0" * total)
+    monkeypatch.setattr(updater, "_download_multipart", fake)
+
+
+def _probe_info(url, total, speed=1.0e6, ttfb=0.5):
+    return {"final_url": url, "total": total, "supports_range": True,
+            "speed": speed, "ttfb": ttfb, "bytes": 1024, "elapsed": 1.0,
+            "error": None}
+
+
+def test_config_flag_reads_boolean(tmp_path):
+    cfg = tmp_path / "config.json"
+    paths = [str(cfg)]
+    cfg.write_text('{"adaptive_concurrency": true}', encoding="utf-8")
+    assert updater._config_flag("adaptive_concurrency", False, paths) is True
+    cfg.write_text('{"adaptive_concurrency": "on"}', encoding="utf-8")
+    assert updater._config_flag("adaptive_concurrency", False, paths) is True
+    cfg.write_text('{"adaptive_concurrency": false}', encoding="utf-8")
+    assert updater._config_flag("adaptive_concurrency", True, paths) is False
+    cfg.write_text("{ not json", encoding="utf-8")
+    assert updater._config_flag("adaptive_concurrency", False, paths) is False
+    missing = [str(tmp_path / "none.json")]
+    assert updater._config_flag("x", True, missing) is True
+
+
+def test_adaptive_off_by_default_keeps_threads(tmp_path, monkeypatch):
+    """預設關閉：threads 照傳，連試探都不做 —— 行為與舊版完全相同。"""
+    monkeypatch.setattr(updater, "ADAPTIVE_CONCURRENCY", False)
+    monkeypatch.setattr(updater, "_config_flag", lambda *a, **k: False)
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: pytest.fail("關閉時不該試探"))
+    calls = []
+    _fake_multipart(monkeypatch, calls)
+    pi = _probe_info("http://x/f.bin", 64 * 1024 * 1024)
+    updater._download_over_path("http://x/f.bin", str(tmp_path / "o.bin"),
+                                None, 5, None, None, probe_info=pi)
+    assert calls == [5]
+
+
+def test_adaptive_uses_single_thread_when_no_gain(tmp_path, monkeypatch):
+    """試探成功但吞吐沒明顯變好 → 退回單連線（這是實測那條路的結論）。"""
+    monkeypatch.setattr(updater, "ADAPTIVE_CONCURRENCY", True)
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: (1.02e6, 0.5, None))
+    calls = []
+    _fake_multipart(monkeypatch, calls)
+    pi = _probe_info("http://x/f.bin", 64 * 1024 * 1024, speed=1.0e6)
+    logs = []
+    updater._download_over_path("http://x/f.bin", str(tmp_path / "o.bin"),
+                                None, 8, None, None, probe_info=pi,
+                                log_cb=logs.append)
+    assert calls == [1]
+    assert any("退回單連線" in m for m in logs), logs
+
+
+def test_adaptive_adopts_more_threads_when_gain_is_high(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "ADAPTIVE_CONCURRENCY", True)
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: (2.0e6, 0.5, None))
+    calls = []
+    _fake_multipart(monkeypatch, calls)
+    pi = _probe_info("http://x/f.bin", 64 * 1024 * 1024, speed=1.0e6)
+    updater._download_over_path("http://x/f.bin", str(tmp_path / "o.bin"),
+                                None, 8, None, None, probe_info=pi)
+    assert calls == [updater.ADAPTIVE_PROBE_THREADS]
+
+
+def test_adaptive_threads_backs_off_when_latency_rises(monkeypatch):
+    """吞吐變好但延遲也漲 → 過度連線，不採用（Vegas 式煞車）。"""
+    total = 64 * 1024 * 1024
+    url = "http://x/f.bin"
+    info = _probe_info(url, total, speed=1.0e6, ttfb=0.5)
+    lat = updater.ADAPTIVE_LATENCY_TOLERANCE * 1.2
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: (2.0e6, info["ttfb"] * lat, None))
+    got, why = updater._adaptive_threads(url, total, None, 8, info)
+    assert 2.0e6 / info["speed"] >= updater.ADAPTIVE_GAIN
+    assert lat > updater.ADAPTIVE_LATENCY_TOLERANCE
+    assert got == 1, why
+
+
+def test_adaptive_threads_skips_probe_for_small_file(monkeypatch):
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: pytest.fail("小檔案不該試探"))
+    small = updater.ADAPTIVE_MIN_BYTES - 1
+    got, why = updater._adaptive_threads(
+        "http://x/f.bin", small, None, 8,
+        _probe_info("http://x/f.bin", small))
+    assert got == 8, why
+
+
+def test_adaptive_threads_skips_probe_when_estimate_is_short(monkeypatch):
+    """估計下載時間比試探成本還短 → 不試探（尊重呼叫端的設定值）。"""
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: pytest.fail("估計太短不該試探"))
+    total = 64 * 1024 * 1024
+    url = "http://x/f.bin"
+    info = _probe_info(url, total, speed=100e6, ttfb=0.5)
+    got, why = updater._adaptive_threads(url, total, None, 8, info)
+    assert got == 8, why
+
+
+def test_adaptive_threads_falls_back_to_base_when_probe_fails(monkeypatch):
+    monkeypatch.setattr(updater, "_measure_aggregate_throughput",
+                        lambda *a, **k: (None, None, "boom"))
+    total = 64 * 1024 * 1024
+    got, why = updater._adaptive_threads(
+        "http://x/f.bin", total, None, 8, _probe_info("http://x/f.bin", total))
+    assert got == 8, why
+    assert "boom" in why
+
+
+def test_adaptive_threads_falls_back_without_baseline():
+    total = 64 * 1024 * 1024
+    got, why = updater._adaptive_threads("http://x/f.bin", total, None, 8, {})
+    assert got == 8, why
+
+
+def test_measure_aggregate_throughput_guards():
+    agg = updater._measure_aggregate_throughput
+    assert agg("http://x/f", 0, None, 4)[0] is None
+    tiny = 4 * 1024 * 1024
+    bw, _ttfb, why = agg("http://x/f", tiny, None, 64)
+    assert bw is None and "太小" in why
+
+
+def test_measure_aggregate_throughput_uses_distinct_offsets():
+    """聚合量測必須讓每條連線讀不同區間，否則會憑空生出 n 倍吞吐。"""
+    total = 6 * 1024 * 1024
+    httpd, url, starts = _serve_recording_throttled(bytes(total))
+    try:
+        bw, ttfb, why = updater._measure_aggregate_throughput(
+            url, total, None, 3, seconds=0.3, max_bytes=1024 * 1024)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert why is None, why
+    assert bw is not None and bw > 0
+    assert ttfb is not None and ttfb >= 0
+    assert len(starts) == 3, starts
+    assert len(set(starts)) == 3, starts
+    assert min(starts) == 0 and max(starts) == 2 * (total // 3), starts

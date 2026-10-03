@@ -2,3 +2,7 @@
 # 升級前請先在分支驗證: python -m pytest && .\build.ps1 -Standalone
 PySide6==6.11.1
 requests>=2.31.0
+# requests 走 socks5h:// 需要 PySocks；少了它會拋 InvalidSchema("Missing
+# dependencies for SOCKS support.")，而 updater 的代理探測把例外吞掉，
+# 結果「更新走代理」這條路徑從來沒生效過 (2026-10-03 實測確認)。
+PySocks==1.7.1
