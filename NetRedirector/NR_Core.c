@@ -1012,6 +1012,79 @@ static BOOL udp_socket_has_pending(SOCKET s)
     return avail > 0;
 }
 
+// [Added] Per-proxy UDP ASSOCIATE retry backoff.
+//
+// The UDP relay runs on a single thread and establish_udp_associate_with_config()
+// dials the proxy inline (bounded by UDP_ASSOC_TIMEOUT_MS). Without a backoff a
+// dead proxy makes every datagram pay that full timeout and stalls every other
+// association's traffic. These helpers space attempts for one proxy by an
+// exponentially growing window (reset on success) so the caller can skip the
+// datagram entirely while the window is open.
+//
+// The window lives on the shared PROXY_CONFIG (not the copy handed to
+// establish), so it survives across datagrams.
+static BOOL udp_assoc_backoff_allow(UINT32 proxy_id, PROXY_CONFIG *out_cfg, BOOL *out_have_cfg)
+{
+    BOOL allow = FALSE;
+    if (out_have_cfg) *out_have_cfg = FALSE;
+    EnterCriticalSection(&lock_proxies);
+    PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
+    if (cfg != NULL && cfg->enabled) {
+        if (out_have_cfg) *out_have_cfg = TRUE;
+        DWORD now = GetTickCount();
+        // (LONG) cast keeps the comparison correct across GetTickCount() wrap.
+        if (cfg->udp_assoc_next_retry == 0 ||
+            (LONG)(now - cfg->udp_assoc_next_retry) >= 0) {
+            if (out_cfg != NULL) *out_cfg = *cfg;
+            allow = TRUE;
+        }
+    }
+    LeaveCriticalSection(&lock_proxies);
+    return allow;
+}
+
+static void udp_assoc_backoff_note(UINT32 proxy_id, BOOL success)
+{
+    EnterCriticalSection(&lock_proxies);
+    PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
+    if (cfg != NULL) {
+        if (success) {
+            cfg->udp_assoc_backoff_ms = 0;
+            cfg->udp_assoc_next_retry = 0;
+        } else {
+            DWORD b = cfg->udp_assoc_backoff_ms ? cfg->udp_assoc_backoff_ms * 2
+                                                : UDP_ASSOC_BACKOFF_INIT_MS;
+            if (b > UDP_ASSOC_BACKOFF_MAX_MS) b = UDP_ASSOC_BACKOFF_MAX_MS;
+            cfg->udp_assoc_backoff_ms = b;
+            cfg->udp_assoc_next_retry = GetTickCount() + b;
+        }
+    }
+    LeaveCriticalSection(&lock_proxies);
+}
+
+// Close and drop the association for one proxy so the next datagram re-dials it.
+// Called when a sendto to the proxy fails: the association's UDP relay is gone
+// even if the TCP control socket has not been detected as closed yet, and the
+// lazy establish path would otherwise never recover until that socket dies.
+// Relay-thread only (no other thread touches the association sockets).
+static void udp_assoc_drop(UINT32 proxy_id)
+{
+    EnterCriticalSection(&lock_udp);
+    UDP_ASSOCIATION **pp = &udp_associations;
+    while (*pp != NULL) {
+        if ((*pp)->proxy_id == proxy_id) {
+            UDP_ASSOCIATION *dead = *pp;
+            *pp = dead->next;
+            closesocket(dead->control_socket);
+            closesocket(dead->udp_socket);
+            free(dead);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    LeaveCriticalSection(&lock_udp);
+}
+
 DWORD WINAPI udp_relay_server(LPVOID arg)
 {
     WSADATA wsa_data;
@@ -1031,6 +1104,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
     setsockopt(udp_relay_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
     setsockopt(udp_relay_socket, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
     setsockopt(udp_relay_socket, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
+    disable_udp_connreset(udp_relay_socket);
 
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
@@ -1048,6 +1122,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
         setsockopt(udp_relay_socket6, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
         setsockopt(udp_relay_socket6, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
         setsockopt(udp_relay_socket6, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
+        disable_udp_connreset(udp_relay_socket6);
 
         memset(&local_addr6, 0, sizeof(local_addr6));
         local_addr6.sin6_family = AF_INET6;
@@ -1116,22 +1191,20 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     if (!target_assoc) {
                         PROXY_CONFIG cfg_copy;
                         BOOL have_cfg = FALSE;
-                        EnterCriticalSection(&lock_proxies);
-                        PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
-                        if (cfg && cfg->enabled) { cfg_copy = *cfg; have_cfg = TRUE; }
-                        LeaveCriticalSection(&lock_proxies);
-
-                        if (have_cfg) {
+                        // Skip entirely while this proxy is in its retry-backoff
+                        // window - avoids re-dialing a dead proxy per datagram.
+                        if (udp_assoc_backoff_allow(proxy_id, &cfg_copy, &have_cfg)) {
                             target_assoc = establish_udp_associate_with_config(&cfg_copy);
+                            udp_assoc_backoff_note(proxy_id, target_assoc != NULL);
                             if (target_assoc) {
                                 EnterCriticalSection(&lock_udp);
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
                                 LeaveCriticalSection(&lock_udp);
                             } else {
-                                log_message("UDP relay: UDP ASSOCIATE failed (proxy id %u, %s:%u)", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
+                                log_message("UDP relay: UDP ASSOCIATE failed (proxy id %u, %s:%u) - backing off", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
                             }
-                        } else {
+                        } else if (!have_cfg) {
                             log_message("UDP relay: no usable proxy config (proxy id %u)", proxy_id);
                         }
                     }
@@ -1143,9 +1216,14 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         memcpy(&send_buf[10], recv_buf, recv_len);
                         if (sendto(target_assoc->udp_socket, (char*)send_buf, 10 + recv_len, 0,
                             (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr)) == SOCKET_ERROR) {
-                            log_message("UDP relay: sendto proxy failed, error=%ld", WSAGetLastError());
+                            // The association's UDP relay is gone even if its TCP
+                            // control socket is still up; drop it so the next
+                            // datagram re-dials instead of failing forever.
+                            log_message("UDP relay: sendto proxy failed, error=%ld - dropping association", WSAGetLastError());
+                            udp_assoc_drop(proxy_id);
+                        } else {
+                            target_assoc->last_activity = GetTickCount();
                         }
-                        target_assoc->last_activity = GetTickCount();
                     }
                 }
             }
@@ -1179,22 +1257,18 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                     if (!target_assoc) {
                         PROXY_CONFIG cfg_copy;
                         BOOL have_cfg = FALSE;
-                        EnterCriticalSection(&lock_proxies);
-                        PROXY_CONFIG *cfg = get_proxy_by_id(proxy_id);
-                        if (cfg && cfg->enabled) { cfg_copy = *cfg; have_cfg = TRUE; }
-                        LeaveCriticalSection(&lock_proxies);
-
-                        if (have_cfg) {
+                        if (udp_assoc_backoff_allow(proxy_id, &cfg_copy, &have_cfg)) {
                             target_assoc = establish_udp_associate_with_config(&cfg_copy);
+                            udp_assoc_backoff_note(proxy_id, target_assoc != NULL);
                             if (target_assoc) {
                                 EnterCriticalSection(&lock_udp);
                                 target_assoc->next = udp_associations;
                                 udp_associations = target_assoc;
                                 LeaveCriticalSection(&lock_udp);
                             } else {
-                                log_message("UDP relay: UDP ASSOCIATE failed (IPv6, proxy id %u, %s:%u)", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
+                                log_message("UDP relay: UDP ASSOCIATE failed (IPv6, proxy id %u, %s:%u) - backing off", proxy_id, cfg_copy.proxy_ip, cfg_copy.proxy_port);
                             }
-                        } else {
+                        } else if (!have_cfg) {
                             log_message("UDP relay: no usable proxy config (IPv6, proxy id %u)", proxy_id);
                         }
                     }
@@ -1206,9 +1280,11 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                         memcpy(&send_buf[22], recv_buf, recv_len);
                         if (sendto(target_assoc->udp_socket, (char*)send_buf, 22 + recv_len, 0,
                             (struct sockaddr *)&target_assoc->relay_addr, sizeof(target_assoc->relay_addr)) == SOCKET_ERROR) {
-                            log_message("UDP relay: sendto proxy failed (IPv6), error=%ld", WSAGetLastError());
+                            log_message("UDP relay: sendto proxy failed (IPv6), error=%ld - dropping association", WSAGetLastError());
+                            udp_assoc_drop(proxy_id);
+                        } else {
+                            target_assoc->last_activity = GetTickCount();
                         }
-                        target_assoc->last_activity = GetTickCount();
                     }
                 }
             }

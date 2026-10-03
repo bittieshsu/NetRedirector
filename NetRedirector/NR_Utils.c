@@ -823,6 +823,24 @@ void EnableKeepAlive(SOCKET s) {
     WSAIoctl(s, SIO_KEEPALIVE_VALS, &alive_in, sizeof(alive_in), NULL, 0, &dwBytesRet, NULL, NULL);
 }
 
+// [Added] Windows surfaces an ICMP port-unreachable for a UDP send as
+// WSAECONNRESET (10054) on the socket's next recvfrom(). A relay drain loop
+// treats recv_len <= 0 as "nothing more to read" and bails, so a normal
+// per-destination error (game/streaming/P2P peers go unreachable all the time)
+// would keep tripping the loop. Turning the notification off per socket is the
+// standard fix. SIO_UDP_CONNRESET lives in mstcpip.h on modern SDKs; define it
+// for toolchains that lack it.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+void disable_udp_connreset(SOCKET s)
+{
+    if (s == INVALID_SOCKET) return;
+    BOOL report = FALSE;   // FALSE = do not surface ICMP unreachable as an error
+    DWORD bytes = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &report, sizeof(report), NULL, 0, &bytes, NULL, NULL);
+}
+
 // [Added] Bounded connect(): switches the socket to non-blocking, starts the
 // connect, waits up to timeout_ms via select(), then restores blocking mode.
 // A plain blocking connect() stalls ~21 s (TCP SYN retries) per attempt on a

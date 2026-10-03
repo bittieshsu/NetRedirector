@@ -28,6 +28,7 @@ int dns_snoop_parse_response(const UINT8 *msg, UINT msg_len);      // [Added] pa
 void clear_dns_snoop_cache(void);                                  // [Added] clear the addr->domain snoop cache
 const char* extract_filename(const char* path);
 void EnableKeepAlive(SOCKET s);
+void disable_udp_connreset(SOCKET s);   // [Added] stop ICMP-unreachable surfacing as WSAECONNRESET on recvfrom
 BOOL connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, DWORD timeout_ms);   // [Added] bounded connect for proxy dial-outs
 void base64_encode(const char* input, char* output, size_t output_size);
 

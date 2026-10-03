@@ -232,10 +232,12 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     if (tcp_sock == INVALID_SOCKET) return NULL;
 
     // [Fixed] Was timeout = 0 (infinite): a dead SOCKS5 proxy parked the relay
-    // thread forever in the handshake recv(). 10 s bounds the whole dial +
-    // handshake; the control socket is only select()'d for readability later,
-    // so the timeout cannot drop an established association.
-    DWORD timeout = 10000;
+    // thread forever in the handshake recv(). Bounded to UDP_ASSOC_TIMEOUT_MS
+    // (short, because this dial runs on the single UDP relay thread and stalls
+    // every other proxied UDP flow while it blocks); the control socket is only
+    // select()'d for readability later, so the timeout cannot drop an
+    // established association.
+    DWORD timeout = UDP_ASSOC_TIMEOUT_MS;
     setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 
@@ -252,7 +254,7 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     }
 
     // [Fixed] Bounded connect (blocking connect burns ~21 s on SYN retries)
-    if (!connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), 10000)) {
+    if (!connect_with_timeout(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr), UDP_ASSOC_TIMEOUT_MS)) {
         closesocket(tcp_sock);
         return NULL;
     }
@@ -277,6 +279,9 @@ UDP_ASSOCIATION* establish_udp_associate_with_config(const PROXY_CONFIG* proxy_c
     int udp_buf = UDP_SOCK_BUF_BYTES;
     setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&udp_buf, sizeof(udp_buf));
     setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&udp_buf, sizeof(udp_buf));
+    // A dead destination behind the proxy must not abort the relay's drain loop
+    // with WSAECONNRESET; this socket carries every UDP flow for this proxy.
+    disable_udp_connreset(udp_sock);
 
     UDP_ASSOCIATION* assoc = (UDP_ASSOCIATION*)malloc(sizeof(UDP_ASSOCIATION));
     if (assoc == NULL) {

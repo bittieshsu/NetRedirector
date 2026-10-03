@@ -312,10 +312,18 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
         config->proxy_type = type;
         config->proxy_port = proxy_port;
         config->enabled = enabled;
+        // A config change (e.g. fixing a wrong IP) should clear any UDP ASSOCIATE
+        // backoff so the relay retries the corrected proxy immediately.
+        config->udp_assoc_next_retry = 0;
+        config->udp_assoc_backoff_ms = 0;
         if (proxy_ip) { strncpy(config->proxy_ip, proxy_ip, sizeof(config->proxy_ip)-1); config->proxy_ip[sizeof(config->proxy_ip)-1] = '\0'; }
         if (name) { strncpy(config->name, name, sizeof(config->name)-1); config->name[sizeof(config->name)-1] = '\0'; }
         if (username) { strncpy(config->username, username, sizeof(config->username)-1); config->username[sizeof(config->username)-1] = '\0'; }
         if (password) { strncpy(config->password, password, sizeof(config->password)-1); config->password[sizeof(config->password)-1] = '\0'; }
+        // [Added] Clear the UDP ASSOCIATE retry backoff so a corrected proxy is
+        // retried on the next datagram instead of waiting out the old window.
+        config->udp_assoc_backoff_ms = 0;
+        config->udp_assoc_next_retry = 0;
         log_message("Updated proxy config ID: %u", proxy_id);
         LeaveCriticalSection(&lock_proxies);
         return TRUE;

@@ -47,6 +47,18 @@
 // drops datagrams - which a game client sees as packet loss.
 #define UDP_SOCK_BUF_BYTES (1024 * 1024)
 
+// Bound on the UDP ASSOCIATE dial + handshake. The relay is single-threaded, so
+// this timeout is how long a dead/unreachable SOCKS5 proxy can stall EVERY
+// proxied UDP flow while the association is (re)established. Kept short on
+// purpose; the per-proxy backoff below keeps a dead proxy from being retried
+// once per datagram.
+#define UDP_ASSOC_TIMEOUT_MS 3000
+
+// Per-proxy UDP ASSOCIATE retry backoff (see udp_assoc_backoff_note in NR_Core.c).
+// A failed attempt doubles the wait up to the max; a success resets it.
+#define UDP_ASSOC_BACKOFF_INIT_MS 2000
+#define UDP_ASSOC_BACKOFF_MAX_MS 30000
+
 // Max text length of an IP address (IPv6: 45 chars + null)
 #define MAX_IP_STR 48
 
@@ -69,6 +81,10 @@ typedef struct PROXY_CONFIG {
     // Must stay BEFORE `next`: PROXY_CONFIG_API mirrors this prefix exactly.
     BOOL send_domain_to_proxy;
     struct PROXY_CONFIG *next;
+    // Internal-only state (not mirrored in PROXY_CONFIG_API): UDP ASSOCIATE
+    // retry backoff so a dead proxy is not re-dialed once per datagram.
+    DWORD udp_assoc_next_retry;   // GetTickCount() before which no retry is allowed
+    DWORD udp_assoc_backoff_ms;   // current backoff window (0 = healthy)
 } PROXY_CONFIG;
 
 // Process Rule Structure
