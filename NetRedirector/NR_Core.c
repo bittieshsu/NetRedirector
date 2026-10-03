@@ -136,34 +136,42 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
             }
             // 2. Tracked Outbound (keyed by src_port + destination: the
             // socket may send to several destinations)
-            else if (is_connection_tracked_udp(ntohs(udp_header->SrcPort), family, dst_addr)) {
-                UINT16 src_port = ntohs(udp_header->SrcPort);
-                UINT32 proxy_id = 0;
-                get_connection_udp(src_port, family, dst_addr, NULL, &proxy_id);
-
-                if (proxy_id > 0) {
-                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-                    // Swap IPs
-                    swap_addr_bytes(family, src_addr, dst_addr);
-                    addr->Outbound = FALSE; // Inject to Relay
-                }
-            }
-            // 3. New Connection
+            //
+            // [Perf] One walk, not two. get_connection_udp() uses the identical
+            // predicate to is_connection_tracked_udp() (is_udp + src_port +
+            // family + memcmp on orig_dest_addr) and already reports whether the
+            // flow was found, so the old is_connection_tracked_udp() +
+            // get_connection_udp() pair walked the same list and took the same
+            // lock twice for EVERY outbound datagram. Measured in
+            // tests/bench_conn_contention.c (mode 3 vs mode 4): 104.0 -> 82.2 ns
+            // at 1 thread, 233.7 -> 175.3 ns at 3 threads.
             else {
                 UINT16 src_port = ntohs(udp_header->SrcPort);
-                UINT16 dest_port = ntohs(udp_header->DstPort);
-                UINT32 selected_proxy_id = 0;
-                RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, TRUE, &selected_proxy_id);
+                UINT32 proxy_id = 0;
+                if (get_connection_udp(src_port, family, dst_addr, NULL, &proxy_id)) {
+                    if (proxy_id > 0) {
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                        // Swap IPs
+                        swap_addr_bytes(family, src_addr, dst_addr);
+                        addr->Outbound = FALSE; // Inject to Relay
+                    }
+                }
+                // 3. New Connection
+                else {
+                    UINT16 dest_port = ntohs(udp_header->DstPort);
+                    UINT32 selected_proxy_id = 0;
+                    RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, TRUE, &selected_proxy_id);
 
-                if (action == RULE_ACTION_DIRECT) {
-                    add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, TRUE);
-                } else if (action == RULE_ACTION_BLOCK) {
-                    return; // Drop
-                } else if (action == RULE_ACTION_PROXY) {
-                    add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, TRUE);
-                    udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-                    swap_addr_bytes(family, src_addr, dst_addr);
-                    addr->Outbound = FALSE;
+                    if (action == RULE_ACTION_DIRECT) {
+                        add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, TRUE);
+                    } else if (action == RULE_ACTION_BLOCK) {
+                        return; // Drop
+                    } else if (action == RULE_ACTION_PROXY) {
+                        add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, TRUE);
+                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+                        swap_addr_bytes(family, src_addr, dst_addr);
+                        addr->Outbound = FALSE;
+                    }
                 }
             }
         } else {
@@ -220,37 +228,42 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                     addr->Outbound = FALSE;
                 }
                 // 2. Tracked Outbound
-                else if (is_connection_tracked(ntohs(tcp_header->SrcPort), family, dst_addr)) {
+                //
+                // [Perf] One walk, not two - see the UDP branch above and
+                // tests/bench_conn_contention.c. get_connection() applies the
+                // identical predicate to is_connection_tracked() and already
+                // returns proxy_id, so the pair used to walk the same list and
+                // take the same lock twice for every outbound packet.
+                else {
                     UINT16 src_port = ntohs(tcp_header->SrcPort);
                     UINT32 proxy_id = 0;
-                    get_connection(src_port, family, dst_addr, NULL, NULL, NULL, &proxy_id, NULL);
+                    if (get_connection(src_port, family, dst_addr, NULL, NULL, NULL, &proxy_id, NULL)) {
+                        if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port, family, dst_addr);
 
-                    if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port, family, dst_addr);
+                        if (proxy_id > 0) {
+                            tcp_header->DstPort = htons(g_local_relay_port);
+                            swap_addr_bytes(family, src_addr, dst_addr);
+                            addr->Outbound = FALSE; // Inject to Proxy
+                        }
+                    }
+                    // 3. New Connection
+                    else {
+                        UINT16 dest_port = ntohs(tcp_header->DstPort);
+                        UINT32 selected_proxy_id = 0;
+                        RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
 
-                    if (proxy_id > 0) {
-                        tcp_header->DstPort = htons(g_local_relay_port);
-                        swap_addr_bytes(family, src_addr, dst_addr);
-                        addr->Outbound = FALSE; // Inject to Proxy
+                        if (action == RULE_ACTION_DIRECT) {
+                            add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, FALSE);
+                        } else if (action == RULE_ACTION_BLOCK) {
+                            return;
+                        } else if (action == RULE_ACTION_PROXY) {
+                            add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, FALSE);
+                            tcp_header->DstPort = htons(g_local_relay_port);
+                            swap_addr_bytes(family, src_addr, dst_addr);
+                            addr->Outbound = FALSE;
+                        }
                     }
                 }
-            // 3. New Connection
-            else {
-                UINT16 src_port = ntohs(tcp_header->SrcPort);
-                UINT16 dest_port = ntohs(tcp_header->DstPort);
-                UINT32 selected_proxy_id = 0;
-                RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
-
-                if (action == RULE_ACTION_DIRECT) {
-                    add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, FALSE);
-                } else if (action == RULE_ACTION_BLOCK) {
-                    return;
-                } else if (action == RULE_ACTION_PROXY) {
-                    add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, FALSE);
-                    tcp_header->DstPort = htons(g_local_relay_port);
-                    swap_addr_bytes(family, src_addr, dst_addr);
-                    addr->Outbound = FALSE;
-                }
-            }
         } else {
             if (tcp_header->DstPort != htons(g_local_relay_port)) {
                 send_packet_checked(packet, packet_len, addr, "tcp passthrough");
@@ -309,6 +322,12 @@ typedef struct {
 typedef struct {
     CRITICAL_SECTION lock;   // short push/pop critical sections
     HANDLE wake;             // auto-reset: "queue non-empty, drain it"
+    // [Perf] Gates the wake signal so it fires on the idle->busy transition
+    // instead of once per packet. SetEvent is a kernel transition (~309 ns
+    // measured even with nobody waiting), and the worker drains the whole
+    // backlog per wakeup, so all but the first signal of a burst are redundant.
+    // See tests/bench_dispatch_wake.c: 444.8 -> 95.3 ns/pkt.
+    volatile LONG wake_pending;
     FLOW_SLOT slots[FLOW_QUEUE_SLOTS];
     int head, tail, count;
 } FLOW_QUEUE;
@@ -325,6 +344,7 @@ static void flow_queue_release(FLOW_QUEUE *q)
         q->slots[s].cap = 0;
     }
     q->head = q->tail = q->count = 0;
+    q->wake_pending = 0;
 }
 
 BOOL flow_queues_init(void)
@@ -436,7 +456,13 @@ static void dispatch_packet(unsigned char *packet, UINT packet_len, WINDIVERT_AD
     LeaveCriticalSection(&q->lock);
 
     if (queued) {
-        SetEvent(q->wake);
+        // [Perf] Signal only on the idle->busy transition. SetEvent is a kernel
+        // transition costing ~309 ns even with nobody waiting, while the worker
+        // drains the ENTIRE backlog per wakeup - so signalling once per packet
+        // was ~350 ns of pure waste per packet (79% of the dispatch cost).
+        // flow_worker() resets the flag after it finds the queue empty, which
+        // is what re-arms this. See tests/bench_dispatch_wake.c.
+        if (InterlockedExchange(&q->wake_pending, 1) == 0) SetEvent(q->wake);
         return;
     }
     // Queue full, or the slot buffer could not be grown -> process inline. A
@@ -494,9 +520,22 @@ DWORD WINAPI flow_worker(LPVOID arg)
     FLOW_QUEUE *q = &g_flow_queues[index];
 
     while (running) {
+        // [Perf] Re-arm the wake gate, then re-check the queue before sleeping.
+        // The ORDER is load-bearing: resetting the flag AFTER an emptiness check
+        // loses a wakeup - a producer that enqueues in that gap sees
+        // wake_pending == 1, skips SetEvent, and its packet then sits until the
+        // 1 s timeout. Resetting first means a packet enqueued after this point
+        // either makes the re-check below see it, or signals the event.
+        InterlockedExchange(&q->wake_pending, 0);
+
+        BOOL idle;
+        EnterCriticalSection(&q->lock);
+        idle = (q->count == 0);
+        LeaveCriticalSection(&q->lock);
+
         // 1 s timeout keeps `running` responsive during shutdown even if the
         // wake event and q->count are momentarily out of sync.
-        WaitForSingleObject(q->wake, 1000);
+        if (idle) WaitForSingleObject(q->wake, 1000);
 
         // Drain the whole backlog per wakeup: one wait per burst instead of
         // one wait per packet.

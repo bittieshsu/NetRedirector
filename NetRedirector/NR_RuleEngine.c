@@ -84,13 +84,24 @@ RuleAction match_rule(DWORD current_pid, const char *process_name, int family, c
     return RULE_ACTION_DIRECT;
 }
 
-RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port, const UINT8 *dest_addr, UINT16 dest_port, BOOL is_udp, UINT32* out_proxy_id)
+RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port, const UINT8 *dest_addr, UINT16 dest_port, BOOL is_udp, UINT32* out_proxy_id, DWORD pid_in, BOOL have_pid)
 {
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
     UINT32 selected_proxy_id = 0;
 
-    if (family == AF_INET6) {
+    if (have_pid) {
+        // [Perf] The caller already ran the whole resolution chain (result
+        // cache -> event map -> GetExtendedTcpTable) for this exact
+        // (family, src_addr, src_port, is_udp), microseconds ago. Re-running it
+        // here was pure duplication, and it was NOT free: a failed resolution
+        // is deliberately not cached (see the pid == 0 early-return in
+        // pid_result_cache_store), so the duplicate cost another full
+        // GetExtendedTcpTable - ~650 us per unresolvable new connection, i.e.
+        // 2x per occurrence. Same inputs microseconds apart give the same
+        // answer, so the second query can only ever have repeated the first.
+        pid = pid_in;
+    } else if (family == AF_INET6) {
         pid = is_udp ? get_process_id_from_udp_connection6(src_addr, src_port) : get_process_id_from_connection6(src_addr, src_port);
         if (pid == 0 && is_udp) pid = get_process_id_from_connection6(src_addr, src_port);
     } else {
@@ -229,7 +240,7 @@ RuleAction handle_new_connection_logic(int family, const UINT8 *src_addr, const 
             *selected_proxy_id = 0;
         }
         else {
-            action = check_process_rule(family, src_addr, src_port, dest_addr, dest_port, is_udp, selected_proxy_id);
+            action = check_process_rule(family, src_addr, src_port, dest_addr, dest_port, is_udp, selected_proxy_id, pid, TRUE);
         }
 
         // Logging
@@ -247,7 +258,11 @@ RuleAction handle_new_connection_logic(int family, const UINT8 *src_addr, const 
             add_logged_connection(pid, family, dest_addr, dest_port, action);
         }
     } else {
-        action = check_process_rule(family, src_addr, src_port, dest_addr, dest_port, is_udp, selected_proxy_id);
+        // [Perf] `pid` is 0 here (or the name lookup failed) - but the full
+        // resolution chain was ALREADY run above. Hand it over instead of
+        // letting check_process_rule re-run it, which cost a second
+        // GetExtendedTcpTable (~650 us) whenever the pid could not be resolved.
+        action = check_process_rule(family, src_addr, src_port, dest_addr, dest_port, is_udp, selected_proxy_id, pid, TRUE);
     }
 
     return action;
