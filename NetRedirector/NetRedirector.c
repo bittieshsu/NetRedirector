@@ -685,13 +685,58 @@ void build_windivert_filter(char *filter, size_t filter_size)
         "(ipv6 and ("
         "(tcp and (outbound or tcp.DstPort == %d or tcp.SrcPort == %d)%s) or "
         "(udp and (outbound or udp.DstPort == %d or udp.SrcPort == %d or udp.SrcPort == 53)"
-        " and udp.DstPort != 67 and udp.SrcPort != 67"
-        " and udp.DstPort != 68 and udp.SrcPort != 68%s))"
+        // [Fixed] This clause used to carry 67/68 - the IPv4 DHCP ports - copied
+        // from the v4 branch. IPv6 has no DHCPv4: DHCPv6 uses client 546 /
+        // server 547. Leaving 546/547 unexcluded meant every DHCPv6 renewal was
+        // captured and paid a full user-mode round trip (queue -> worker ->
+        // checksum -> WinDivertSend). It was never a correctness bug (the rule
+        // engine forces multicast/link-local IPv6 to DIRECT), just pure waste.
+        " and udp.DstPort != 546 and udp.SrcPort != 546"
+        " and udp.DstPort != 547 and udp.SrcPort != 547%s))"
         " and (inbound or ipv6.DstAddr != ::1))",
         g_local_relay_port, g_local_relay_port, excl_tcp4,
         LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT, excl_udp4,
         g_local_relay_port, g_local_relay_port, excl_tcp6,
         LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT, excl_udp6);
+}
+
+// [Added] Turn a raw WinDivertOpen() failure code into something the user can
+// act on. Previously every failure was reported as a bare number, which tells a
+// non-developer nothing. All five mapped codes are ENVIRONMENTAL, not code
+// bugs - the fix is always something the user must do on their own machine, so
+// the message has to name that action.
+static void log_windivert_open_failure(DWORD err)
+{
+    switch (err) {
+    case 2:    // ERROR_FILE_NOT_FOUND
+        log_message("Failed to open WinDivert (%lu): WinDivert64.sys not found. "
+            "Antivirus commonly quarantines or deletes it - whitelist WinDivert64.sys "
+            "and NetRedirector.dll in your AV, then re-extract the app.", err);
+        break;
+    case 5:    // ERROR_ACCESS_DENIED
+        log_message("Failed to open WinDivert (%lu): access denied. The app must run "
+            "as Administrator - the WinDivert driver cannot be loaded otherwise.", err);
+        break;
+    case 577:  // ERROR_INVALID_IMAGE_HASH
+        log_message("Failed to open WinDivert (%lu): driver signature verification "
+            "failed. WinDivert64.sys may have been modified or is being blocked by "
+            "security software. Re-extract it from a trusted copy.", err);
+        break;
+    case 1058: // ERROR_SERVICE_DISABLED
+        log_message("Failed to open WinDivert (%lu): a stale WinDivert service entry "
+            "from a previous install is marked disabled. Delete the registry key "
+            "HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinDivert and retry.", err);
+        break;
+    case 1275: // ERROR_DRIVER_BLOCKED
+        log_message("Failed to open WinDivert (%lu): WinDivert64.sys is blocked by a "
+            "Windows security policy or antivirus (BYOVD protection). Whitelist it in "
+            "your security software.", err);
+        break;
+    default:
+        log_message("Failed to open WinDivert (%lu): make sure the app is running as "
+            "Administrator and that WinDivert64.sys sits next to the executable.", err);
+        break;
+    }
 }
 
 NETREDIRECTOR_API BOOL NetRedirector_Start(void)
@@ -819,7 +864,7 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 
     windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 123, 0);
     if (windivert_handle == INVALID_HANDLE_VALUE) {
-        log_message("Failed to open WinDivert (%lu)", GetLastError());
+        log_windivert_open_failure(GetLastError());
         running = FALSE;
         goto fail;
     }
@@ -834,13 +879,27 @@ NETREDIRECTOR_API BOOL NetRedirector_Start(void)
     // behaviour. It must never fail Start().
     pid_map_start();
 
-    // [Added] These are best-effort tuning knobs (16384 is the allowed max),
-    // but a silent failure would leave the queue at the small default and
-    // cost throughput under load - leave a trace instead.
-    if (!WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384) ||
-        !WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000)) {
-        log_message("Warning: WinDivertSetParam failed (%lu); using default queue limits",
-            GetLastError());
+    // [Added] These are best-effort tuning knobs (16384 and 33553920 are the
+    // allowed maxima for the count and byte caps respectively), but a silent
+    // failure would leave the queue at the small default and cost throughput
+    // under load - leave a trace instead.
+    //
+    // QUEUE_SIZE is the BYTE cap on the queue, separate from the packet-count
+    // cap QUEUE_LENGTH enforces. Without it a burst of large packets can hit
+    // the default byte ceiling while the count is still far below 16384, and
+    // the driver drops the overflow - TCP then sees loss and halves its
+    // congestion window, which reads to the user as "upload is slow".
+    //
+    // The three calls are deliberately not chained with || : that would skip
+    // the later ones as soon as an earlier one failed, and we want every knob
+    // attempted and a single honest report if any of them did not take.
+    {
+        BOOL q_ok = WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
+        q_ok = WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000) && q_ok;
+        q_ok = WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_SIZE, 33553920) && q_ok;
+        if (!q_ok)
+            log_message("Warning: WinDivertSetParam failed (%lu); using default queue limits",
+                GetLastError());
     }
 
     // [Modified] Single receiver + flow workers (see NR_Core.c "Flow

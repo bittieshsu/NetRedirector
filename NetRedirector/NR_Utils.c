@@ -1108,36 +1108,53 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
     }
     LeaveCriticalSection(&lock_pid_cache);
 
-    // 2. Miss: query the system
+// 2. Miss: query the system.
+    //    QueryFullProcessImageNameW (not ...A): the ANSI variant encodes the
+    //    path in the system code page, so a non-ASCII (e.g. Chinese) path comes
+    //    back as GBK/Big5 bytes and never matches a rule whose process name was
+    //    stored as UTF-8. Convert to UTF-8 explicitly so both sides agree.
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!hProcess) return FALSE;
-    char full_path[MAX_PATH];
-    DWORD path_len = MAX_PATH;
+    WCHAR full_path_w[MAX_PATH];
+    DWORD path_len = MAX_PATH;   // in WCHARs
     BOOL ok = FALSE;
-    if (QueryFullProcessImageNameA(hProcess, 0, full_path, &path_len)) {
-        strncpy(name, full_path, name_size - 1);
-        name[name_size - 1] = '\0';
-        ok = TRUE;
+    if (QueryFullProcessImageNameW(hProcess, 0, full_path_w, &path_len)) {
+        char utf8[MAX_PATH * 4];
+        int n = WideCharToMultiByte(CP_UTF8, 0, full_path_w, -1,
+                                    utf8, (int)sizeof(utf8), NULL, NULL);
+        if (n > 0) {
+            if (strlen(utf8) < name_size) {
+                strncpy(name, utf8, name_size - 1);
+                name[name_size - 1] = '\0';
+            } else {
+                // Path longer than the caller's buffer (possible for CJK paths,
+                // where each character is up to 3 UTF-8 bytes). Keep the
+                // filename - what process rules usually match on anyway.
+                strncpy(name, extract_filename(utf8), name_size - 1);
+                name[name_size - 1] = '\0';
+            }
+            ok = TRUE;
 
-        // 3. Store into cache: refresh the slot for this pid, else reuse the
-        //    oldest/empty slot (simple LRU-ish replacement).
-        EnterCriticalSection(&lock_pid_cache);
-        int slot = -1;
-        int oldest_slot = 0;
-        DWORD oldest_ts = 0xFFFFFFFF;
-        for (int i = 0; i < PROCESS_NAME_CACHE_SIZE; i++) {
-            PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[i];
-            if (e->pid == pid) { slot = i; break; }
-            if (!e->name[0]) { slot = i; break; }
-            if (e->timestamp < oldest_ts) { oldest_ts = e->timestamp; oldest_slot = i; }
+            // 3. Store into cache: refresh the slot for this pid, else reuse the
+            //    oldest/empty slot (simple LRU-ish replacement).
+            EnterCriticalSection(&lock_pid_cache);
+            int slot = -1;
+            int oldest_slot = 0;
+            DWORD oldest_ts = 0xFFFFFFFF;
+            for (int i = 0; i < PROCESS_NAME_CACHE_SIZE; i++) {
+                PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[i];
+                if (e->pid == pid) { slot = i; break; }
+                if (!e->name[0]) { slot = i; break; }
+                if (e->timestamp < oldest_ts) { oldest_ts = e->timestamp; oldest_slot = i; }
+            }
+            if (slot < 0) slot = oldest_slot;
+            PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[slot];
+            e->pid = pid;
+            e->timestamp = now;
+            strncpy(e->name, name, MAX_PROCESS_NAME - 1);
+            e->name[MAX_PROCESS_NAME - 1] = '\0';
+            LeaveCriticalSection(&lock_pid_cache);
         }
-        if (slot < 0) slot = oldest_slot;
-        PROCESS_NAME_CACHE_ENTRY *e = &g_process_name_cache[slot];
-        e->pid = pid;
-        e->timestamp = now;
-        strncpy(e->name, full_path, MAX_PROCESS_NAME - 1);
-        e->name[MAX_PROCESS_NAME - 1] = '\0';
-        LeaveCriticalSection(&lock_pid_cache);
     }
     CloseHandle(hProcess);
     return ok;
