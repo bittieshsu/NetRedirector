@@ -316,6 +316,7 @@ NETREDIRECTOR_API BOOL NetRedirector_EditProxyConfig(UINT32 proxy_id, ProxyType 
         // backoff so the relay retries the corrected proxy immediately.
         config->udp_assoc_next_retry = 0;
         config->udp_assoc_backoff_ms = 0;
+        config->udp_assoc_fail_streak = 0;
         if (proxy_ip) { strncpy(config->proxy_ip, proxy_ip, sizeof(config->proxy_ip)-1); config->proxy_ip[sizeof(config->proxy_ip)-1] = '\0'; }
         if (name) { strncpy(config->name, name, sizeof(config->name)-1); config->name[sizeof(config->name)-1] = '\0'; }
         if (username) { strncpy(config->username, username, sizeof(config->username)-1); config->username[sizeof(config->username)-1] = '\0'; }

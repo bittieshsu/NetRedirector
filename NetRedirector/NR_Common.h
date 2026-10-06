@@ -49,15 +49,31 @@
 
 // Bound on the UDP ASSOCIATE dial + handshake. The relay is single-threaded, so
 // this timeout is how long a dead/unreachable SOCKS5 proxy can stall EVERY
-// proxied UDP flow while the association is (re)established. Kept short on
-// purpose; the per-proxy backoff below keeps a dead proxy from being retried
-// once per datagram.
-#define UDP_ASSOC_TIMEOUT_MS 3000
+// proxied UDP flow while the association is (re)established. It must still be
+// generous enough for a slow or loaded proxy: a timeout here does not just fail
+// one datagram, it costs that proxy its entire UDP path until a retry succeeds.
+#define UDP_ASSOC_TIMEOUT_MS 8000
 
 // Per-proxy UDP ASSOCIATE retry backoff (see udp_assoc_backoff_note in NR_Core.c).
 // A failed attempt doubles the wait up to the max; a success resets it.
-#define UDP_ASSOC_BACKOFF_INIT_MS 2000
-#define UDP_ASSOC_BACKOFF_MAX_MS 30000
+//
+// The first (UDP_ASSOC_BACKOFF_MIN_FAILS - 1) failures do NOT open a window at
+// all - the next datagram retries immediately - so one transient failure cannot
+// black out a working flow. While a window IS open every datagram for that
+// proxy is dropped, so the cap must stay small enough that a recovered proxy is
+// re-tried promptly instead of being punished for a failure that has passed.
+#define UDP_ASSOC_BACKOFF_INIT_MS 500
+#define UDP_ASSOC_BACKOFF_MAX_MS 5000
+#define UDP_ASSOC_BACKOFF_MIN_FAILS 2
+
+// Consecutive failed sendto()s to the proxy relay before the association is torn
+// down. Most sendto failures on a UDP socket are transient and
+// per-destination (WSAENOBUFS under a burst, a momentary WSAENETUNREACH while
+// the upstream link blips); treating those as "the relay is dead" converts one
+// lost datagram into a full re-dial for EVERY UDP flow on this proxy. The
+// association is still reaped promptly when the relay really is gone, because
+// the TCP control socket reaches EOF and the relay walk drops it.
+#define UDP_ASSOC_SEND_FAIL_MAX 100
 
 // Max text length of an IP address (IPv6: 45 chars + null)
 #define MAX_IP_STR 48
@@ -85,6 +101,7 @@ typedef struct PROXY_CONFIG {
     // retry backoff so a dead proxy is not re-dialed once per datagram.
     DWORD udp_assoc_next_retry;   // GetTickCount() before which no retry is allowed
     DWORD udp_assoc_backoff_ms;   // current backoff window (0 = healthy)
+    DWORD udp_assoc_fail_streak;  // consecutive failed dials; gates the backoff
 } PROXY_CONFIG;
 
 // Process Rule Structure
@@ -124,6 +141,7 @@ typedef struct UDP_ASSOCIATION {
     SOCKET udp_socket;
     struct sockaddr_in relay_addr;
     DWORD last_activity;
+    DWORD send_fail_streak;   // consecutive failed sendto()s to the proxy relay
     struct UDP_ASSOCIATION *next;
 } UDP_ASSOCIATION;
 
