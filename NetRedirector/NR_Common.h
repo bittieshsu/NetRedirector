@@ -265,5 +265,15 @@ void log_message_throttled(UINT32 slot, DWORD interval_ms, const char *msg, ...)
 #define NR_THROTTLE_HANDSHAKE_FAIL   5  // SOCKS5 / HTTP handshake failed
 #define NR_THROTTLE_UNTRACKED        6  // relay conn with no tracked origin
 #define NR_THROTTLE_NAME_LOOKUP      7  // OpenProcess on the owning pid failed
+// The same "could not be attributed" message means two very different things
+// depending on the protocol. For TCP it is a real signal - the connection
+// tracking state machine is being asked about a flow it never saw. For UDP it
+// is routine: UDP has no TIME_WAIT and no handshake, so the socket is often
+// closed before the lookup runs (Dnscache is the usual culprit) and the
+// datagram is forwarded unchanged either way. One busy DNS client was
+// therefore burying every genuine line in the log. UDP gets its own slot and a
+// far longer window; the TCP window is deliberately left alone.
+#define NR_THROTTLE_UNKNOWN_PID_UDP  8  // pid unresolved on UDP -> normal, harmless
+#define NR_THROTTLE_UNKNOWN_PID_UDP_MS 60000
 
 #endif // NR_COMMON_H

@@ -130,7 +130,14 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
         char dest_str[MAX_IP_STR];
         addr_to_string(family, src_addr, src_str, sizeof(src_str));
         addr_to_string(family, dest_addr, dest_str, sizeof(dest_str));
-        log_message_throttled(NR_THROTTLE_UNKNOWN_PID, 5000,
+        // UDP gets its own, much longer window: an unattributable UDP datagram
+        // is routine (the socket is usually gone before the lookup - see
+        // NR_THROTTLE_UNKNOWN_PID_UDP in NR_Common.h) and it is forwarded
+        // unchanged, whereas the identical TCP line is a real signal. Sharing
+        // one slot let a single DNS client drown out the TCP case.
+        log_message_throttled(is_udp ? NR_THROTTLE_UNKNOWN_PID_UDP
+                                     : NR_THROTTLE_UNKNOWN_PID,
+            is_udp ? NR_THROTTLE_UNKNOWN_PID_UDP_MS : 5000,
             "Flow %s:%u -> %s:%u (family %d, %s) could not be attributed to a "
             "process; applying unknown-process action %d - process-name rules "
             "cannot match it",

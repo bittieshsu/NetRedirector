@@ -81,5 +81,33 @@ int main(void)
         CHECK(strcmp(g_last, "fallback 8") == 0, "fallback still formats its arguments");
     }
 
+    printf("== log_message_throttled: the UDP unknown-pid slot is separate ==\n");
+    {
+        // Regression guard for the UDP noise fix. The identical "could not be
+        // attributed" line means two different things: for TCP it is a real
+        // signal (the tracking state machine was asked about a flow it never
+        // saw), while for UDP it is routine - UDP has no TIME_WAIT and no
+        // handshake, so the socket is usually gone before the lookup and the
+        // datagram is forwarded unchanged. If the two ever shared a slot, one
+        // busy DNS client would throttle the TCP lines again, which is exactly
+        // the bug the separate slot was added to fix.
+        CHECK(NR_THROTTLE_UNKNOWN_PID_UDP != NR_THROTTLE_UNKNOWN_PID,
+              "the UDP slot is distinct from the TCP slot");
+        CHECK(NR_THROTTLE_UNKNOWN_PID_UDP < NR_THROTTLE_SLOTS,
+              "the UDP slot is in range (out of range would disable throttling)");
+        CHECK(NR_THROTTLE_UNKNOWN_PID_UDP_MS > 5000,
+              "the UDP window is deliberately longer than the TCP one");
+
+        // Hold the TCP slot for a minute, then use the UDP slot. The UDP call
+        // must still be emitted, which is only possible if the two keep
+        // separate window state.
+        log_message_throttled(NR_THROTTLE_UNKNOWN_PID, 60000, "tcp window held");
+        g_cb_count = 0;
+        log_message_throttled(NR_THROTTLE_UNKNOWN_PID_UDP,
+                              NR_THROTTLE_UNKNOWN_PID_UDP_MS, "udp window free");
+        CHECK(g_cb_count == 1,
+              "the TCP slot's window does not suppress the UDP slot");
+    }
+
     return test_summary("test_logging");
 }
