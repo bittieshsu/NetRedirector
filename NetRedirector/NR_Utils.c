@@ -894,8 +894,85 @@ void base64_encode(const char* input, char* output, size_t output_size) {
     output[output_len] = '\0';
 }
 
+// Two passes over the IPv4 TCP table.
+//
+// Pass 1 matches the full 4-tuple (local endpoint AND remote endpoint).
+// Pass 2 relaxes the remote and accepts any LIVE row on the local endpoint,
+// which is what the previous single pass did - minus the trap described below.
+//
+// [Fixed] The table holds one row per connection, so a single
+// (local_addr, local_port) can legitimately carry several of them: a LISTEN
+// row plus everything it accepted, and - the trap - TIME_WAIT rows left behind
+// by closed connections, whose dwOwningPid is *always* 0. The old single pass
+// returned the first row whose local endpoint matched, so whenever a dead row
+// happened to sort first it answered "no process" for a perfectly live
+// connection. check_process_rule() (NR_RuleEngine.c) turns that 0 into
+// g_unknown_process_action - DIRECT - *before* match_rule() runs, so even a
+// catch-all PROXY rule was bypassed. Measured on the dev machine: every sample
+// of the table contained such a duplicate key, all pid == 0 rows were
+// TIME_WAIT, and the engine's own relay port 192.168.1.200:33100 always had a
+// pid == 0 TIME_WAIT row first - so the engine kept downgrading its own relay
+// traffic and 72% of the engine log was that one message.
+//
+// Never accepting dwOwningPid == 0 is what actually fixes it; matching the
+// 4-tuple first is what makes the answer unambiguous when two sockets share a
+// local port (Windows allocates ephemeral ports per 4-tuple, not per port).
+static DWORD scan_tcp_table_v4(const MIB_TCPTABLE_OWNER_PID *t,
+                               UINT32 src_ip, UINT16 src_port,
+                               UINT32 dest_ip, UINT16 dest_port)
+{
+    DWORD i;
+    for (i = 0; i < t->dwNumEntries; i++) {
+        const MIB_TCPROW_OWNER_PID *row = &t->table[i];
+        if (row->dwOwningPid == 0) continue;
+        if (row->dwLocalAddr != src_ip) continue;
+        if (ntohs((UINT16)row->dwLocalPort) != src_port) continue;
+        if (row->dwRemoteAddr != dest_ip) continue;
+        if (ntohs((UINT16)row->dwRemotePort) != dest_port) continue;
+        return row->dwOwningPid;
+    }
+    for (i = 0; i < t->dwNumEntries; i++) {
+        const MIB_TCPROW_OWNER_PID *row = &t->table[i];
+        if (row->dwOwningPid == 0) continue;
+        if (row->dwLocalAddr != src_ip) continue;
+        if (ntohs((UINT16)row->dwLocalPort) != src_port) continue;
+        return row->dwOwningPid;
+    }
+    return 0;
+}
+
+// IPv6 twin of scan_tcp_table_v4(); same two passes, same pid == 0 rule.
+// An address-representation mismatch between the packet and the table simply
+// fails pass 1 and lands on pass 2, so this can only ever be more forgiving
+// than the old code, never less.
+static DWORD scan_tcp_table_v6(const MIB_TCP6TABLE_OWNER_PID *t,
+                               const UINT8 *src_ip6, UINT16 src_port,
+                               const UINT8 *dest_ip6, UINT16 dest_port)
+{
+    DWORD i;
+    for (i = 0; i < t->dwNumEntries; i++) {
+        const MIB_TCP6ROW_OWNER_PID *row = &t->table[i];
+        if (row->dwOwningPid == 0) continue;
+        if (memcmp(row->ucLocalAddr, src_ip6, 16) != 0) continue;
+        if (ntohs((UINT16)row->dwLocalPort) != src_port) continue;
+        if (dest_ip6 == NULL) return row->dwOwningPid;
+        if (memcmp(row->ucRemoteAddr, dest_ip6, 16) != 0) continue;
+        if (ntohs((UINT16)row->dwRemotePort) != dest_port) continue;
+        return row->dwOwningPid;
+    }
+    for (i = 0; i < t->dwNumEntries; i++) {
+        const MIB_TCP6ROW_OWNER_PID *row = &t->table[i];
+        if (row->dwOwningPid == 0) continue;
+        if (memcmp(row->ucLocalAddr, src_ip6, 16) != 0) continue;
+        if (ntohs((UINT16)row->dwLocalPort) != src_port) continue;
+        return row->dwOwningPid;
+    }
+    return 0;
+}
+
 // [Preserved] Process ID retrieval logic — now cache-first (see caches above)
-DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port) {
+DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port,
+                                     UINT32 dest_ip, UINT16 dest_port) {
     UINT8 addr4[4];
     memcpy(addr4, &src_ip, 4);
     DWORD cached = pid_result_cache_lookup(AF_INET, FALSE, addr4, src_port);
@@ -914,12 +991,7 @@ DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port) {
     tcp_table = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
     if (!tcp_table) return 0;
     if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-        for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
-            MIB_TCPROW_OWNER_PID *row = &tcp_table->table[i];
-            if (row->dwLocalAddr == src_ip && ntohs((UINT16)row->dwLocalPort) == src_port) {
-                pid = row->dwOwningPid; break;
-            }
-        }
+        pid = scan_tcp_table_v4(tcp_table, src_ip, src_port, dest_ip, dest_port);
     }
     free(tcp_table);
     pid_result_cache_store(AF_INET, FALSE, addr4, src_port, pid);
@@ -943,13 +1015,19 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port) {
     udp_table = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
     if (!udp_table) return 0;
     if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+        // [Fixed] Same trap as scan_tcp_table_v4(): a row with dwOwningPid == 0
+        // names no process, so accepting it merely because it sorted first
+        // turned a resolvable flow into g_unknown_process_action (DIRECT).
+        // Skipping it lets the scan reach a row that does name a process.
         for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
             MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+            if (row->dwOwningPid == 0) continue;
             if (row->dwLocalAddr == src_ip && ntohs((UINT16)row->dwLocalPort) == src_port) { pid = row->dwOwningPid; break; }
         }
         if (pid == 0) { // Try 0.0.0.0 match
             for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
                 MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
+                if (row->dwOwningPid == 0) continue;
                 if (row->dwLocalAddr == 0 && ntohs((UINT16)row->dwLocalPort) == src_port) { pid = row->dwOwningPid; break; }
             }
         }
@@ -960,7 +1038,8 @@ DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port) {
 }
 
 // === IPv6 Process ID lookup ===
-DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
+DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port,
+                                      const UINT8 *dest_ip6, UINT16 dest_port) {
     DWORD cached = pid_result_cache_lookup(AF_INET6, FALSE, src_ip6, src_port);
     if (cached != 0) return cached;
 
@@ -975,12 +1054,7 @@ DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port) {
     tcp_table = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
     if (!tcp_table) return 0;
     if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-        for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
-            MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
-            if (memcmp(row->ucLocalAddr, src_ip6, 16) == 0 && ntohs((UINT16)row->dwLocalPort) == src_port) {
-                pid = row->dwOwningPid; break;
-            }
-        }
+        pid = scan_tcp_table_v6(tcp_table, src_ip6, src_port, dest_ip6, dest_port);
     }
     free(tcp_table);
     pid_result_cache_store(AF_INET6, FALSE, src_ip6, src_port, pid);
@@ -1004,12 +1078,14 @@ DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port)
     if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
         for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
             MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+            if (row->dwOwningPid == 0) continue;   // see get_process_id_from_udp_connection()
             if (memcmp(row->ucLocalAddr, src_ip6, 16) == 0 && ntohs((UINT16)row->dwLocalPort) == src_port) { pid = row->dwOwningPid; break; }
         }
         if (pid == 0) { // Try :: (unspecified) match
             const UINT8 zero6[16] = {0};
             for (DWORD i = 0; i < udp_table->dwNumEntries; i++) {
                 MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
+                if (row->dwOwningPid == 0) continue;
                 if (memcmp(row->ucLocalAddr, zero6, 16) == 0 && ntohs((UINT16)row->dwLocalPort) == src_port) { pid = row->dwOwningPid; break; }
             }
         }
@@ -1224,7 +1300,27 @@ BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size) {
     //    back as GBK/Big5 bytes and never matches a rule whose process name was
     //    stored as UTF-8. Convert to UTF-8 explicitly so both sides agree.
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProcess) return FALSE;
+    if (!hProcess) {
+        // [Added] This used to return FALSE with no trace at all, and the
+        // consequence is not a missing log line: check_process_rule()
+        // (NR_RuleEngine.c) then had nothing to go on, so a flow that a
+        // catch-all PROXY rule was meant to capture could go direct instead.
+        // The usual cause is a process created by a non-elevated (UAC-filtered)
+        // token, whose default DACL grants only its own user and SYSTEM: an
+        // engine running as a different account then gets ERROR_ACCESS_DENIED
+        // (5) for every process on that user's desktop. That is what made an
+        // RDP session's traffic bypass the proxy while the console's did not.
+        // NetRedirector_Start() enables SeDebugPrivilege to lift exactly this
+        // restriction, so this line appearing means either that call failed or
+        // the target is protected. The flow is not lost: the caller continues
+        // with an empty name, so PID and wildcard rules still apply.
+        DWORD open_err = GetLastError();
+        log_message_throttled(NR_THROTTLE_NAME_LOOKUP, 5000,
+            "Process name lookup failed for pid %lu (OpenProcess err=%lu); "
+            "matching this flow on pid and wildcard rules only",
+            (unsigned long)pid, (unsigned long)open_err);
+        return FALSE;
+    }
     WCHAR full_path_w[MAX_PATH];
     DWORD path_len = MAX_PATH;   // in WCHARs
     BOOL ok = FALSE;

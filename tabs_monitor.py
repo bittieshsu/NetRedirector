@@ -499,7 +499,15 @@ class MonitorTabMixin:
                 # [關鍵修正] 啟動成功後，立即重刷所有規則
                 # 這會強制 DLL 重新產生 WinDivert Filter String
                 self.reapply_all_rules()
-                
+
+                # [新增] 引擎拿不到 SeDebugPrivilege 就說出來，否則症狀
+                # （RDP session 的視窗不受代理影響、主控台的正常）毫無線索。
+                # 純提示，失敗絕不能影響已經啟動成功的引擎。
+                try:
+                    self._warn_if_debug_privilege_missing()
+                except Exception:
+                    logging.exception("debug privilege warning failed")
+
             else:
                 # 啟動失敗，將按鈕彈回
                 self.btn_master_switch.setChecked(False)
@@ -510,4 +518,38 @@ class MonitorTabMixin:
             self.is_redirector_running = False
             self.update_service_status()
             logging.info("NetRedirector Stopped")
+
+    def _warn_if_debug_privilege_missing(self):
+        """引擎拿不到 SeDebugPrivilege 時說出來。
+
+        NetRedirector_Start() 會啟用 SeDebugPrivilege，OpenProcess() 才碰得到其他
+        帳號的行程。沒有它，那些行程的名稱全部查不到，針對它們的名稱規則就不會
+        生效 —— 典型症狀是「RDP session 裡的視窗不受代理影響，主控台的卻正常」，
+        而畫面上完全沒有線索（詳見 NetRedirector.c 的 enable_debug_privilege()）。
+
+        只提醒，不阻止啟動：拿不到權限時，PID 規則與萬用字元規則仍然有效，所以
+        流量並不是完全沒被處理。每次啟動只提醒一次。
+        """
+        if getattr(self, "_debug_privilege_warned", False):
+            return
+        state = self.bridge.get_debug_privilege_state()
+        if state in (None,
+                     NetRedirectorWrapper.DEBUG_PRIVILEGE_UNKNOWN,
+                     NetRedirectorWrapper.DEBUG_PRIVILEGE_ENABLED):
+            return
+
+        if state == NetRedirectorWrapper.DEBUG_PRIVILEGE_NOT_HELD:
+            detail = self.t("本程式不是以系統管理員身分執行，權杖裡沒有 "
+                            "SeDebugPrivilege。其他使用者帳戶底下的行程無法辨識，"
+                            "針對那些行程的名稱規則不會生效。")
+        else:
+            detail = self.t("取得 SeDebugPrivilege 失敗。其他使用者帳戶底下的行程"
+                            "無法辨識，針對那些行程的名稱規則不會生效。")
+
+        msg = self.t("代理只會部分生效")
+        msg += "\n\n" + detail
+        msg += "\n\n" + self.t("建議以系統管理員身分重新啟動本程式。")
+        self._debug_privilege_warned = True
+        self.append_log("⚠ " + msg.replace("\n\n", " "))
+        QMessageBox.warning(self, self.t("警告"), msg)
 

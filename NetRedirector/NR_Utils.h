@@ -33,9 +33,18 @@ BOOL connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, DW
 void base64_encode(const char* input, char* output, size_t output_size);
 
 // Process ID & Name Resolution
-DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port);
+//
+// The two TCP lookups take the flow's remote endpoint as well as its local
+// one. The table is keyed per connection, so (local_addr, local_port) alone is
+// NOT unique - a closed connection's TIME_WAIT row (dwOwningPid == 0) can sit
+// under the same key as a live one. Matching the full 4-tuple removes the
+// ambiguity; the lookup also refuses any row with dwOwningPid == 0, which is
+// what stops a dead row from being read as "no process at all".
+DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port,
+                                     UINT32 dest_ip, UINT16 dest_port);
 DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port);
-DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port);
+DWORD get_process_id_from_connection6(const UINT8 *src_ip6, UINT16 src_port,
+                                      const UINT8 *dest_ip6, UINT16 dest_port);
 DWORD get_process_id_from_udp_connection6(const UINT8 *src_ip6, UINT16 src_port);
 BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
 void clear_pid_cache(void);

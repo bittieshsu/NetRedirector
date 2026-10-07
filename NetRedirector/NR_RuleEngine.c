@@ -102,16 +102,40 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
         // answer, so the second query can only ever have repeated the first.
         pid = pid_in;
     } else if (family == AF_INET6) {
-        pid = is_udp ? get_process_id_from_udp_connection6(src_addr, src_port) : get_process_id_from_connection6(src_addr, src_port);
-        if (pid == 0 && is_udp) pid = get_process_id_from_connection6(src_addr, src_port);
+        pid = is_udp ? get_process_id_from_udp_connection6(src_addr, src_port)
+                     : get_process_id_from_connection6(src_addr, src_port, dest_addr, dest_port);
+        if (pid == 0 && is_udp) pid = get_process_id_from_connection6(src_addr, src_port, dest_addr, dest_port);
     } else {
-        UINT32 src_ip = 0;
+        UINT32 src_ip = 0, dest_ip = 0;
         memcpy(&src_ip, src_addr, 4);
-        pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port) : get_process_id_from_connection(src_ip, src_port);
-        if (pid == 0 && is_udp) pid = get_process_id_from_connection(src_ip, src_port);
+        memcpy(&dest_ip, dest_addr, 4);
+        pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port)
+                     : get_process_id_from_connection(src_ip, src_port, dest_ip, dest_port);
+        if (pid == 0 && is_udp) pid = get_process_id_from_connection(src_ip, src_port, dest_ip, dest_port);
     }
 
     if (pid == 0) {
+        // [Added] The flow could not be attributed to any process, so the
+        // configured "unknown process" action is applied - by default DIRECT.
+        // With a catch-all PROXY rule in the list this silently means "this
+        // connection bypasses the proxy", and nothing anywhere said so. It is
+        // one of the two ways a working proxy setup can appear to die on
+        // restart while the rules themselves look perfectly configured.
+        //
+        // Both endpoints are logged. The local one is what the table lookup
+        // keys on, so without it there is no way to tell an ordinary client
+        // flow apart from a packet the engine is re-classifying on its own
+        // relay port - and the relay case used to be the bulk of these lines.
+        char src_str[MAX_IP_STR];
+        char dest_str[MAX_IP_STR];
+        addr_to_string(family, src_addr, src_str, sizeof(src_str));
+        addr_to_string(family, dest_addr, dest_str, sizeof(dest_str));
+        log_message_throttled(NR_THROTTLE_UNKNOWN_PID, 5000,
+            "Flow %s:%u -> %s:%u (family %d, %s) could not be attributed to a "
+            "process; applying unknown-process action %d - process-name rules "
+            "cannot match it",
+            src_str, (unsigned)src_port, dest_str, (unsigned)dest_port,
+            family, is_udp ? "UDP" : "TCP", (int)g_unknown_process_action);
         *out_proxy_id = 0;
         return g_unknown_process_action;
     }
@@ -119,9 +143,23 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
     // Loop prevention: bypass own process
     if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
 
+    // [Changed] A pid we cannot name is no longer an automatic DIRECT.
+    //
+    // get_process_name_from_pid() fails when OpenProcess is denied - a process
+    // created by a different, non-elevated account (see enable_debug_privilege()
+    // in NetRedirector.c) or a protected one. Returning g_unknown_process_action
+    // here short-circuited match_rule() entirely, so even a catch-all
+    // "*" -> PROXY rule was bypassed and the flow went direct with no
+    // explanation: an RDP session's traffic silently ignored a working proxy.
+    //
+    // Falling through with an empty name lets the rules that CAN still be
+    // evaluated decide: PID rules match on the pid, wildcard rules match
+    // regardless of the name, and only rules that ask for a specific name miss.
+    // If nothing matches, match_rule() returns DIRECT on its own - so the worst
+    // case is exactly what it was, while the common case (a catch-all rule) now
+    // behaves the way the user configured it.
     if (!get_process_name_from_pid(pid, process_name, sizeof(process_name))) {
-        *out_proxy_id = 0;
-        return g_unknown_process_action;
+        process_name[0] = '\0';
     }
 
     RuleAction action = match_rule(pid, process_name, family, dest_addr, dest_port, is_udp, &selected_proxy_id);
@@ -149,12 +187,33 @@ RuleAction check_process_rule(int family, const UINT8 *src_addr, UINT16 src_port
             PROXY_CONFIG* cfg = get_proxy_by_id(selected_proxy_id);
             BOOL usable = (cfg != NULL && cfg->enabled);
             LeaveCriticalSection(&lock_proxies);
-            if (!usable) return RULE_ACTION_DIRECT;
+            if (!usable) {
+                // [Added] A PROXY rule whose proxy is missing or disabled is
+                // downgraded to DIRECT with no trace at all. That is the most
+                // likely way "everything is proxied" becomes "nothing is
+                // proxied" after a restart (the rule is re-added before or
+                // without its proxy), and it is invisible from the UI.
+                log_message_throttled(NR_THROTTLE_PROXY_DOWNGRADE, 5000,
+                    "Rule requested PROXY with proxy_id=%u, which is %s; "
+                    "downgrading this flow to DIRECT",
+                    selected_proxy_id, (cfg == NULL) ? "not registered" : "disabled");
+                return RULE_ACTION_DIRECT;
+            }
         } else {
             EnterCriticalSection(&lock_proxies);
             BOOL has_default = (g_proxy_ip[0] != '\0' && g_proxy_port != 0);
             LeaveCriticalSection(&lock_proxies);
-            if (!has_default) return RULE_ACTION_DIRECT;
+            if (!has_default) {
+                // [Added] No per-rule proxy and no default proxy either. Note
+                // that NetRedirector_AddProxyConfig() does NOT populate the
+                // g_proxy_* globals - only NetRedirector_SetProxyConfig() does -
+                // so a rule added with proxy_id=0 can never resolve a proxy
+                // here, whatever proxies exist in the list.
+                log_message_throttled(NR_THROTTLE_PROXY_DOWNGRADE, 5000,
+                    "Rule requested PROXY with no proxy_id and no default proxy "
+                    "configured (g_proxy_ip is empty); downgrading this flow to DIRECT");
+                return RULE_ACTION_DIRECT;
+            }
         }
     }
 
@@ -206,23 +265,29 @@ RuleAction handle_new_connection_logic(int family, const UINT8 *src_addr, const 
     }
 
     // Process Lookup
+    //
+    // The remote endpoint goes in as well: the TCP table is keyed per
+    // connection, so (local addr, local port) alone is not unique and a closed
+    // connection's TIME_WAIT row (owning pid 0) can sit under the same key as
+    // a live one. See scan_tcp_table_v4() in NR_Utils.c.
     char process_path[MAX_PROCESS_NAME];
     DWORD pid;
     if (family == AF_INET6) {
         if (is_udp) {
             pid = get_process_id_from_udp_connection6(src_addr, src_port);
-            if (pid == 0) pid = get_process_id_from_connection6(src_addr, src_port);
+            if (pid == 0) pid = get_process_id_from_connection6(src_addr, src_port, dest_addr, dest_port);
         } else {
-            pid = get_process_id_from_connection6(src_addr, src_port);
+            pid = get_process_id_from_connection6(src_addr, src_port, dest_addr, dest_port);
         }
     } else {
-        UINT32 src_ip = 0;
+        UINT32 src_ip = 0, dest_ip = 0;
         memcpy(&src_ip, src_addr, 4);
+        memcpy(&dest_ip, dest_addr, 4);
         if (is_udp) {
             pid = get_process_id_from_udp_connection(src_ip, src_port);
-            if (pid == 0) pid = get_process_id_from_connection(src_ip, src_port);
+            if (pid == 0) pid = get_process_id_from_connection(src_ip, src_port, dest_ip, dest_port);
         } else {
-            pid = get_process_id_from_connection(src_ip, src_port);
+            pid = get_process_id_from_connection(src_ip, src_port, dest_ip, dest_port);
         }
     }
 

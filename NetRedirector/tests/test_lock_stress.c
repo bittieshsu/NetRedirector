@@ -77,7 +77,7 @@ static DWORD WINAPI pid_lookup_ops(LPVOID arg)
     DWORD self = GetCurrentProcessId();
     for (int i = 0; i < 1500; i++) {
         get_process_name_from_pid(self, name, sizeof(name));
-        get_process_id_from_connection(inet_addr("127.0.0.1"), 9999);  // cache miss 路徑
+        get_process_id_from_connection(inet_addr("127.0.0.1"), 9999, 0, 0);  // cache miss 路徑
         get_process_id_from_udp_connection(inet_addr("127.0.0.1"), 9998);
         InterlockedIncrement(&g_rounds);
     }

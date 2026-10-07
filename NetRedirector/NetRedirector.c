@@ -41,16 +41,237 @@ RuleAction g_unknown_process_action = RULE_ACTION_DIRECT;
 LogCallback g_log_callback = NULL;
 ConnectionCallback g_connection_callback = NULL;
 
+// === Persistent engine log ===
+//
+// log_message() used to be a pure pass-through to the GUI callback: with no
+// callback registered the text was dropped on the floor, and NOTHING was ever
+// written to disk. That made every intermittent fault unfalsifiable - by the
+// time the user reports "everything was proxied, I restarted the app, and now
+// only DIRECT works until the main uplink comes back", the only witness is
+// already gone and the remaining evidence is a story about what they saw.
+// Every line now also lands in a file, flushed per line so it survives a crash.
+//
+// Deliberate properties:
+//  - lock_log is a LEAF lock. log_message() never acquires any other lock, and
+//    no caller holds lock_log while acquiring another, so it cannot take part
+//    in the "never hold two locks at once" ordering documented in NR_Common.h.
+//  - Opened lazily, so a host that never logs (the C test binaries compile
+//    these sources but never run DllMain, so g_log_ready stays FALSE) neither
+//    creates the file nor touches the lock.
+//  - Rotated at 1 MB, so an engine left running for weeks cannot fill a disk.
+//  - Rate limited per second. These are failure paths, and a single
+//    misconfigured rule can fail every connection on the machine: uncapped,
+//    the log becomes a second outage. Suppressed lines are counted and
+//    reported, never silently dropped.
+#define NR_LOG_FILENAME     "NetRedirector.engine.log"
+#define NR_LOG_MAX_BYTES    (1024u * 1024u)
+#define NR_LOG_MAX_PER_SEC  200u
+
+static CRITICAL_SECTION lock_log;
+static BOOL      g_log_ready = FALSE;          // TRUE only after DllMain init
+static HINSTANCE g_hinst_dll = NULL;           // to locate the DLL's own folder
+static FILE     *g_log_fp = NULL;
+static BOOL      g_log_open_failed = FALSE;    // do not retry on every line
+static char      g_log_path[MAX_PATH] = "";
+static unsigned long g_log_bytes = 0;
+static DWORD     g_log_window_start = 0;
+static UINT32    g_log_window_lines = 0;
+static UINT32    g_log_suppressed = 0;
+
+// Throttle table for log_message_throttled(). Deliberately lock-free: the only
+// thing a race can do is let one extra line through or lose a counter tick,
+// which is not worth a lock in a path that runs per connection.
+typedef struct {
+    DWORD  last_ms;
+    UINT32 suppressed;
+} NR_THROTTLE_ENTRY;
+static NR_THROTTLE_ENTRY g_throttle[NR_THROTTLE_SLOTS];
+
+static void nr_log_strip_trailing_slashes(char *p)
+{
+    size_t n = strlen(p);
+    while (n > 0 && (p[n - 1] == '\\' || p[n - 1] == '/')) p[--n] = '\0';
+}
+
+// Caller holds lock_log. Returns the open stream, or NULL when the file is
+// unavailable for this process (in which case it is never retried).
+static FILE *nr_log_stream(void)
+{
+    char dir[MAX_PATH];
+
+    if (g_log_fp != NULL) return g_log_fp;
+    if (g_log_open_failed) return NULL;
+
+    // Preferred location: next to the DLL, which is where the user looks.
+    dir[0] = '\0';
+    if (g_hinst_dll != NULL) {
+        DWORD n = GetModuleFileNameA(g_hinst_dll, dir, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) {
+            dir[0] = '\0';
+        } else {
+            char *slash = strrchr(dir, '\\');
+            if (slash != NULL) *slash = '\0'; else dir[0] = '\0';
+        }
+    }
+    if (dir[0] != '\0') {
+        snprintf(g_log_path, sizeof(g_log_path), "%s\\%s", dir, NR_LOG_FILENAME);
+        g_log_fp = fopen(g_log_path, "a");
+    }
+
+    // An installed layout can be read-only; %TEMP% always works.
+    if (g_log_fp == NULL) {
+        DWORD n = GetTempPathA(MAX_PATH, dir);
+        if (n > 0 && n < MAX_PATH) {
+            nr_log_strip_trailing_slashes(dir);
+            snprintf(g_log_path, sizeof(g_log_path), "%s\\%s", dir, NR_LOG_FILENAME);
+            g_log_fp = fopen(g_log_path, "a");
+        }
+    }
+
+    if (g_log_fp == NULL) {
+        g_log_open_failed = TRUE;
+        g_log_path[0] = '\0';
+        return NULL;
+    }
+
+    // Resume the size counter from whatever is already on disk.
+    g_log_bytes = 0;
+    if (fseek(g_log_fp, 0, SEEK_END) == 0) {
+        long sz = ftell(g_log_fp);
+        if (sz > 0) g_log_bytes = (unsigned long)sz;
+    }
+    return g_log_fp;
+}
+
+// Caller holds lock_log.
+static void nr_log_rotate_if_full(void)
+{
+    char rotated[MAX_PATH + 4];
+
+    if (g_log_fp == NULL || g_log_bytes < NR_LOG_MAX_BYTES) return;
+
+    fclose(g_log_fp);
+    g_log_fp = NULL;
+    snprintf(rotated, sizeof(rotated), "%s.1", g_log_path);
+    DeleteFileA(rotated);                 // keep exactly one previous generation
+    MoveFileA(g_log_path, rotated);
+    g_log_bytes = 0;
+    g_log_fp = fopen(g_log_path, "a");
+    if (g_log_fp == NULL) g_log_open_failed = TRUE;
+}
+
 // Helper to log messages
 void log_message(const char *msg, ...)
 {
-    if (g_log_callback == NULL) return;
     char buffer[1024];
     va_list args;
+
+    if (msg == NULL) return;
+
     va_start(args, msg);
     vsnprintf(buffer, sizeof(buffer), msg, args);
     va_end(args);
-    g_log_callback(buffer);
+
+    // The GUI callback is the pre-existing contract: keep it first and
+    // unconditional so adding the file can never change what the UI shows.
+    if (g_log_callback != NULL) g_log_callback(buffer);
+
+    if (!g_log_ready) return;
+
+    EnterCriticalSection(&lock_log);
+    {
+        DWORD now = GetTickCount();
+
+        // Roll the window, and account for anything it swallowed.
+        if (g_log_window_start == 0 || (now - g_log_window_start) >= 1000u) {
+            if (g_log_suppressed > 0) {
+                FILE *fp = nr_log_stream();
+                if (fp != NULL) {
+                    SYSTEMTIME st;
+                    char note[192];
+                    int len;
+                    GetLocalTime(&st);
+                    len = snprintf(note, sizeof(note),
+                        "[%02d:%02d:%02d.%03d] ... %lu further message(s) were "
+                        "suppressed by the log rate limit\n",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                        (unsigned long)g_log_suppressed);
+                    if (len > 0) {
+                        fwrite(note, 1, (size_t)len, fp);
+                        fflush(fp);
+                        g_log_bytes += (unsigned long)len;
+                    }
+                }
+                g_log_suppressed = 0;
+            }
+            g_log_window_start = now;
+            g_log_window_lines = 0;
+        }
+
+        if (g_log_window_lines >= NR_LOG_MAX_PER_SEC) {
+            g_log_suppressed++;
+        } else {
+            FILE *fp;
+            g_log_window_lines++;
+            fp = nr_log_stream();
+            if (fp != NULL) {
+                SYSTEMTIME st;
+                char line[1280];
+                int len;
+                GetLocalTime(&st);
+                len = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s\n",
+                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buffer);
+                if (len > 0) {
+                    fwrite(line, 1, (size_t)len, fp);
+                    fflush(fp);      // survive a crash in the middle of a session
+                    g_log_bytes += (unsigned long)len;
+                    nr_log_rotate_if_full();
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&lock_log);
+}
+
+void log_message_throttled(UINT32 slot, DWORD interval_ms, const char *msg, ...)
+{
+    char buffer[1024];
+    char line[1280];
+    va_list args;
+    DWORD now;
+    UINT32 suppressed;
+    NR_THROTTLE_ENTRY *entry;
+
+    if (msg == NULL) return;
+    if (slot >= NR_THROTTLE_SLOTS) {
+        va_start(args, msg);
+        vsnprintf(buffer, sizeof(buffer), msg, args);
+        va_end(args);
+        log_message("%s", buffer);
+        return;
+    }
+
+    entry = &g_throttle[slot];
+    now = GetTickCount();
+    if (entry->last_ms != 0 && (now - entry->last_ms) < interval_ms) {
+        entry->suppressed++;
+        return;
+    }
+    suppressed = entry->suppressed;
+    entry->last_ms = now;
+    entry->suppressed = 0;
+
+    va_start(args, msg);
+    vsnprintf(buffer, sizeof(buffer), msg, args);
+    va_end(args);
+
+    if (suppressed > 0) {
+        snprintf(line, sizeof(line), "%s (+%lu more in the last %lu ms)",
+            buffer, (unsigned long)suppressed, (unsigned long)interval_ms);
+        log_message("%s", line);
+    } else {
+        log_message("%s", buffer);
+    }
 }
 
 // === API Implementations ===
@@ -816,11 +1037,163 @@ static void log_windivert_open_failure(DWORD err)
     }
 }
 
+// [Added] Enable SeDebugPrivilege for this process.
+//
+// get_process_name_from_pid() (NR_Utils.c) opens the owning process with
+// PROCESS_QUERY_LIMITED_INFORMATION, which succeeds only if that process's
+// DACL grants this token. The DACL is the creating token's default DACL, so
+// a process created by a non-elevated (UAC-filtered) token - everything on
+// an RDP session's desktop, launched from explorer - grants only its own user
+// SID and SYSTEM. An engine running as a different account therefore gets
+// ERROR_ACCESS_DENIED (5) for all of them, the name lookup fails, and
+// check_process_rule() silently falls back to g_unknown_process_action
+// (DIRECT by default) *before* consulting match_rule() - so even a catch-all
+// PROXY rule is bypassed and the traffic goes direct with no log line.
+//
+// SeDebugPrivilege removes that restriction entirely. It is present but
+// DISABLED in an elevated administrator token, so this is a one-off
+// AdjustTokenPrivileges call. Measured on the dev machine (engine running as
+// an elevated administrator in session 1, targets on an RDP session): without
+// it, OpenProcess on every target returned err=5; with it enabled, all of
+// them succeeded.
+// Set by enable_debug_privilege() and read back through
+// NetRedirector_GetDebugPrivilegeState(), so the UI can say out loud that
+// process-name rules are not going to match other accounts' processes instead
+// of leaving the user to wonder why only some windows are proxied.
+static int g_debug_privilege_state = NR_DEBUG_PRIV_UNKNOWN;
+
+static void enable_debug_privilege(void)
+{
+    HANDLE token = NULL;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    DWORD err;
+
+    g_debug_privilege_state = NR_DEBUG_PRIV_FAILED;
+
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        log_message("SeDebugPrivilege: OpenProcessToken failed (%lu); "
+            "processes owned by other accounts will keep being classified as "
+            "the unknown-process action",
+            (unsigned long)GetLastError());
+        return;
+    }
+
+    if (!LookupPrivilegeValueA(NULL, SE_DEBUG_NAME, &luid)) {
+        log_message("SeDebugPrivilege: LookupPrivilegeValue failed (%lu)",
+            (unsigned long)GetLastError());
+        CloseHandle(token);
+        return;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    // AdjustTokenPrivileges reports partial success through GetLastError(),
+    // not through its return value, so both have to be checked.
+    SetLastError(ERROR_SUCCESS);
+    if (!AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL)) {
+        log_message("SeDebugPrivilege: AdjustTokenPrivileges failed (%lu)",
+            (unsigned long)GetLastError());
+    } else {
+        err = GetLastError();
+        if (err == ERROR_NOT_ALL_ASSIGNED) {
+            g_debug_privilege_state = NR_DEBUG_PRIV_NOT_HELD;
+            log_message("SeDebugPrivilege: NOT held by this token (%lu). The "
+                "engine is not running elevated, so process-name rules will "
+                "not match processes owned by other accounts",
+                (unsigned long)err);
+        } else {
+            g_debug_privilege_state = NR_DEBUG_PRIV_ENABLED;
+            log_message("SeDebugPrivilege: enabled");
+        }
+    }
+    CloseHandle(token);
+}
+
+// Diagnostics for the UI; see NRDebugPrivilegeState in NetRedirector.h.
+NETREDIRECTOR_API int NetRedirector_GetDebugPrivilegeState(void)
+{
+    return g_debug_privilege_state;
+}
+
 NETREDIRECTOR_API BOOL NetRedirector_Start(void)
 {
     // Room for the base filter plus one exclusion pair per proxy endpoint.
     char filter[4096];
     if (running) return FALSE;
+
+    // [Added] Do this before anything can classify a connection. Without it
+    // every process on another account's desktop resolves to no name, and the
+    // rule engine silently downgrades those flows to DIRECT.
+    enable_debug_privilege();
+
+    // [Added] Record the network context this Start ran in, and dump the
+    // classification inputs. The fault this exists for is "everything was
+    // proxied, I restarted, and now only DIRECT works until the main uplink
+    // comes back" - and the two candidate explanations are indistinguishable
+    // from the outside:
+    //   (a) the machine had no usable default route, so the OS refused to emit
+    //       packets to off-link destinations and WinDivert never saw them
+    //       (WinDivert's NETWORK layer only sees what routing already allowed),
+    //   (b) the rules came back with no usable proxy, which the engine
+    //       silently converts to DIRECT (NR_RuleEngine.c validation).
+    // Printing the route and both lists at every Start makes them tellable
+    // apart from the log alone.
+    {
+        MIB_IPFORWARDROW route;
+        DWORD rc;
+
+        memset(&route, 0, sizeof(route));
+        rc = GetBestRoute(0x08080808u /* 8.8.8.8, network byte order */, 0, &route);
+        if (rc == NO_ERROR && route.dwForwardNextHop != 0) {
+            const UCHAR *nh = (const UCHAR *)&route.dwForwardNextHop;
+            log_message("Network context: default route via %u.%u.%u.%u "
+                "(ifIndex %lu, metric %lu)",
+                nh[0], nh[1], nh[2], nh[3],
+                (unsigned long)route.dwForwardIfIndex,
+                (unsigned long)route.dwForwardMetric1);
+        } else {
+            log_message("Network context: NO usable default route (GetBestRoute rc=%lu). "
+                "The OS will not emit packets to off-link destinations, so WinDivert "
+                "cannot see them and no rule can redirect them - proxied traffic "
+                "will appear dead until a route returns.",
+                (unsigned long)rc);
+        }
+    }
+    {
+        int proxy_count = 0;
+        int rule_count = 0;
+
+        EnterCriticalSection(&lock_proxies);
+        for (PROXY_CONFIG *p = proxy_configs; p != NULL; p = p->next) {
+            log_message("Proxy config: id=%u name='%s' %s:%u type=%d enabled=%s",
+                p->proxy_id, p->name, p->proxy_ip, (unsigned)p->proxy_port,
+                (int)p->proxy_type, p->enabled ? "yes" : "NO");
+            proxy_count++;
+        }
+        LeaveCriticalSection(&lock_proxies);
+
+        EnterCriticalSection(&lock_rules);
+        for (PROCESS_RULE *r = rules_list; r != NULL; r = r->next) {
+            log_message("Rule: id=%u process='%s' hosts='%s' ports='%s' proto=%d "
+                "action=%d proxy_id=%u enabled=%s",
+                r->rule_id, r->process_name,
+                r->target_hosts ? r->target_hosts : "(null)",
+                r->target_ports ? r->target_ports : "(null)",
+                (int)r->protocol, (int)r->action, r->proxy_id,
+                r->enabled ? "yes" : "no");
+            rule_count++;
+        }
+        LeaveCriticalSection(&lock_rules);
+
+        log_message("Classification inputs: %d proxy config(s), %d rule(s); "
+            "unknown-process action=%d, dns_via_proxy=%d, relay port=%u",
+            proxy_count, rule_count, (int)g_unknown_process_action,
+            (int)g_dns_via_proxy, (unsigned)g_local_relay_port);
+    }
 
     // [Fixed] Pre-flight: verify the local relay port is bindable BEFORE
     // spawning threads. local_proxy_server binds inside its own thread and
@@ -1179,6 +1552,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
     {
         case DLL_PROCESS_ATTACH:
             g_current_process_id = GetCurrentProcessId();
+            g_hinst_dll = hinstDLL;      // used to place the engine log file
+            InitializeCriticalSection(&lock_log);
+            g_log_ready = TRUE;          // only now may log_message() touch it
             InitializeCriticalSection(&lock_rules);
             InitializeCriticalSection(&lock_connections);
             InitializeCriticalSection(&lock_logged);
@@ -1213,6 +1589,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
             DeleteCriticalSection(&lock_proxies);
             DeleteCriticalSection(&lock_udp);
             DeleteCriticalSection(&lock_pid_cache);
+
+            // [Added] Close the engine log LAST, after every other teardown:
+            // the tail of a shutdown is exactly the part worth keeping, and
+            // every line is already flushed, so nothing is lost by closing here.
+            if (g_log_ready) {
+                EnterCriticalSection(&lock_log);
+                if (g_log_fp != NULL) { fclose(g_log_fp); g_log_fp = NULL; }
+                LeaveCriticalSection(&lock_log);
+                g_log_ready = FALSE;   // stray threads now skip the file path
+                DeleteCriticalSection(&lock_log);
+            }
             break;
     }
     return TRUE;

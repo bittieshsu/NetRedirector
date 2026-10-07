@@ -820,6 +820,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
             Sleep(10);
         }
         if (!found) {
+            // Silent before. A burst of these means the NAT rewrite and the
+            // connection table have diverged - worth seeing, not worth a line
+            // per occurrence.
+            log_message_throttled(NR_THROTTLE_UNTRACKED, 2000,
+                "Relay connection dropped: no tracked flow matched the relay peer "
+                "(family %d, orig dest port %u) after 5 lookups",
+                config->family, (unsigned)config->orig_dest_port);
             closesocket(client_sock); free(config); return 0;
         }
     }
@@ -828,6 +835,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
     SOCKET proxy_sock;
     struct sockaddr_in proxy_addr;
     BOOL has_proxy = FALSE;
+    // [Added] Human-readable original destination, for the failure logs below.
+    // Every one of these paths used to close the socket and return in total
+    // silence, which is why "proxied traffic died after a restart" could never
+    // be traced to a cause.
+    char dest_str[MAX_IP_STR];
+
+    addr_to_string(family, dest_addr, dest_str, sizeof(dest_str));
 
     EnterCriticalSection(&lock_proxies);
     if (proxy_id != 0) {
@@ -853,10 +867,29 @@ DWORD WINAPI connection_handler(LPVOID arg)
     LeaveCriticalSection(&lock_proxies);
     free(config);
 
-    if (!has_proxy) { closesocket(client_sock); return 0; }
+    if (!has_proxy) {
+        // [Added] This was a total black hole: the client socket was closed and
+        // nothing anywhere said why. It is also the most plausible way for
+        // "everything is proxied" to quietly become "nothing is proxied" - the
+        // rule still says PROXY, but the proxy it points at is gone or
+        // disabled, so no relay can be built and the connection just dies.
+        log_message_throttled(NR_THROTTLE_NO_PROXY, 2000,
+            "Dropped connection to %s:%u: rule selected PROXY but no usable proxy "
+            "config exists (proxy_id=%u, default proxy='%s:%u')",
+            dest_str, (unsigned)dest_port, proxy_id,
+            g_proxy_ip, (unsigned)g_proxy_port);
+        closesocket(client_sock);
+        return 0;
+    }
 
     proxy_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (proxy_sock == INVALID_SOCKET) { closesocket(client_sock); return 0; }
+    if (proxy_sock == INVALID_SOCKET) {
+        log_message_throttled(NR_THROTTLE_CONNECT_FAIL, 5000,
+            "Dropped connection to %s:%u: socket() for the proxy tunnel failed (%d)",
+            dest_str, (unsigned)dest_port, WSAGetLastError());
+        closesocket(client_sock);
+        return 0;
+    }
 
     // Socket Opts
     // [Fixed] Handshake phase gets a bounded timeout on the proxy socket: a
@@ -901,6 +934,10 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
     // 如果解析失敗 (0)，直接返回
     if (proxy_addr.sin_addr.s_addr == 0) {
+        log_message_throttled(NR_THROTTLE_RESOLVE_FAIL, 5000,
+            "Dropped connection to %s:%u: proxy hostname '%s' (id=%u) did not resolve",
+            dest_str, (unsigned)dest_port, selected_proxy_config.proxy_ip,
+            selected_proxy_config.proxy_id);
         closesocket(client_sock);
         closesocket(proxy_sock);
         return 0;
@@ -909,6 +946,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
     // [Fixed] Bounded connect: blocking connect() burns ~21 s of SYN retries
     // on unreachable proxies while the client waits.
     if (!connect_with_timeout(proxy_sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr), PROXY_HANDSHAKE_TIMEOUT_MS)) {
+        // [Added] WSA error is the whole diagnosis here (WSAETIMEDOUT = the
+        // proxy did not answer; WSAENETUNREACH = this machine has no route to
+        // it), and it used to be discarded.
+        log_message_throttled(NR_THROTTLE_CONNECT_FAIL, 5000,
+            "Dropped connection to %s:%u: cannot reach proxy %s:%u (WSA error %d)",
+            dest_str, (unsigned)dest_port, selected_proxy_config.proxy_ip,
+            (unsigned)selected_proxy_config.proxy_port, WSAGetLastError());
         closesocket(client_sock); closesocket(proxy_sock); return 0;
     }
     EnableKeepAlive(proxy_sock);
@@ -920,6 +964,12 @@ DWORD WINAPI connection_handler(LPVOID arg)
         result = http_connect_with_config(proxy_sock, family, dest_addr, dest_port, &selected_proxy_config);
 
     if (result != 0) {
+        log_message_throttled(NR_THROTTLE_HANDSHAKE_FAIL, 5000,
+            "Dropped connection to %s:%u: %s handshake with proxy %s:%u failed (result=%d)",
+            dest_str, (unsigned)dest_port,
+            selected_proxy_config.proxy_type == PROXY_TYPE_SOCKS5 ? "SOCKS5" : "HTTP",
+            selected_proxy_config.proxy_ip,
+            (unsigned)selected_proxy_config.proxy_port, result);
         closesocket(client_sock); closesocket(proxy_sock); return 0;
     }
 

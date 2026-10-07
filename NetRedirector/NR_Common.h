@@ -221,6 +221,34 @@ extern SOCKET udp_relay_socket;
 extern SOCKET udp_relay_socket6;
 
 // Shared Helper Function for Logging
+//
+// log_message() writes to the GUI callback (if one is registered) AND to a
+// rotating log file next to the DLL, so a fault that has already passed still
+// leaves evidence behind. See the comment block above its definition in
+// NetRedirector.c.
 void log_message(const char *msg, ...);
+
+// Rate-limited variant for paths that can fire once per connection - process
+// classification, proxy dial, handshake. Those are exactly the paths whose
+// failure is invisible today, but logging them verbatim would let one
+// misconfigured rule flood the engine log with thousands of identical lines and
+// turn the log itself into a second outage.
+//
+// Each `slot` prints its first occurrence immediately, then at most one line
+// per `interval_ms`. The collapsed ones are counted and reported inside the
+// next line that does print, so the log still proves the path is being hit
+// instead of silently swallowing it. Slots are a small fixed set; an
+// out-of-range slot falls back to plain log_message().
+void log_message_throttled(UINT32 slot, DWORD interval_ms, const char *msg, ...);
+
+#define NR_THROTTLE_SLOTS           16
+#define NR_THROTTLE_UNKNOWN_PID      0  // pid unresolved -> fallback action applied
+#define NR_THROTTLE_PROXY_DOWNGRADE  1  // PROXY action silently became DIRECT
+#define NR_THROTTLE_NO_PROXY         2  // relay conn dropped: no usable proxy
+#define NR_THROTTLE_RESOLVE_FAIL     3  // proxy hostname did not resolve
+#define NR_THROTTLE_CONNECT_FAIL     4  // TCP connect to the proxy failed
+#define NR_THROTTLE_HANDSHAKE_FAIL   5  // SOCKS5 / HTTP handshake failed
+#define NR_THROTTLE_UNTRACKED        6  // relay conn with no tracked origin
+#define NR_THROTTLE_NAME_LOOKUP      7  // OpenProcess on the owning pid failed
 
 #endif // NR_COMMON_H

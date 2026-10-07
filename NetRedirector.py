@@ -123,6 +123,15 @@ class NetRedirectorWrapper:
             self.lib.NetRedirector_DeleteRule.argtypes = [c_uint32]
             self.lib.NetRedirector_DeleteRule.restype = c_bool
 
+        # --- [新增] 能力探測：引擎的 SeDebugPrivilege 狀態 ---
+        # 舊版 DLL 沒有這個匯出，所以探測一次就好；沒有時
+        # get_debug_privilege_state() 回 None，UI 就不顯示警告（而不是誤報）。
+        self._has_debug_privilege_state = hasattr(
+            self.lib, 'NetRedirector_GetDebugPrivilegeState')
+        if self._has_debug_privilege_state:
+            self.lib.NetRedirector_GetDebugPrivilegeState.argtypes = []
+            self.lib.NetRedirector_GetDebugPrivilegeState.restype = c_int
+
         # 保持對 callback 的引用，防止 Python 垃圾回收機制(GC)將其清除導致 C 端崩潰
         self._log_cb_ref = None
         self._conn_cb_ref = None
@@ -143,7 +152,23 @@ class NetRedirectorWrapper:
         # 將 Python 函數包裝成 C 函數指針
         self._log_cb_ref = LOG_CALLBACK_TYPE(c_callback)
         self.lib.NetRedirector_SetLogCallback(self._log_cb_ref)
-            # --- [新增] 添加 PID 規則的 Python 方法 ---
+    # --- [新增] 引擎的 SeDebugPrivilege 狀態 ---
+    # 引擎啟動時會啟用 SeDebugPrivilege，這樣 OpenProcess() 才碰得到其他帳號的
+    # 行程。沒有它，RDP session 桌面上的每個行程都查不到名字，名稱規則全部
+    # 失效（詳見 NetRedirector.c 的 enable_debug_privilege()）。回傳 None 表示
+    # 這顆 DLL 沒有這個匯出（舊版），呼叫端應該當作「不知道」而不是「有問題」。
+    DEBUG_PRIVILEGE_UNKNOWN = 0     # 還沒按過「啟動」
+    DEBUG_PRIVILEGE_ENABLED = 1     # 已啟用
+    DEBUG_PRIVILEGE_NOT_HELD = 2    # 權杖沒有這個權限：不是以管理員身分執行
+    DEBUG_PRIVILEGE_FAILED = 3      # 取權杖 / 查 LUID / 調整權限失敗
+
+    def get_debug_privilege_state(self):
+        """回傳 NRDebugPrivilegeState，或 None（這顆 DLL 沒有此匯出）。"""
+        if not self._has_debug_privilege_state:
+            return None
+        return int(self.lib.NetRedirector_GetDebugPrivilegeState())
+
+    # --- [新增] 添加 PID 規則的 Python 方法 ---
     def add_rule_by_pid(self, pid, target_hosts="*", target_ports="*", protocol=RuleProtocol.BOTH, action=RuleAction.PROXY, proxy_id=0):
         if not self._has_pid_support:
             print("DLL does not support AddRuleByPID")

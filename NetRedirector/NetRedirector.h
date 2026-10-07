@@ -84,6 +84,22 @@ NETREDIRECTOR_API void NetRedirector_SetUnknownProcessAction(RuleAction action);
 NETREDIRECTOR_API void NetRedirector_SetLogCallback(LogCallback callback);
 NETREDIRECTOR_API void NetRedirector_SetConnectionCallback(ConnectionCallback callback);
 
+// Diagnostics
+//
+// NetRedirector_Start() enables SeDebugPrivilege so that OpenProcess() can
+// reach processes owned by other accounts - without it, every process on an
+// RDP session's desktop is unnameable and process-name rules cannot match it.
+// This reports how that attempt ended, so the UI can say so instead of leaving
+// the user to wonder why only some windows are proxied.
+typedef enum {
+    NR_DEBUG_PRIV_UNKNOWN = 0,    // Start() has not run yet
+    NR_DEBUG_PRIV_ENABLED = 1,    // SeDebugPrivilege is now enabled
+    NR_DEBUG_PRIV_NOT_HELD = 2,   // token does not hold it: not elevated
+    NR_DEBUG_PRIV_FAILED = 3      // OpenProcessToken / Lookup / Adjust failed
+} NRDebugPrivilegeState;
+
+NETREDIRECTOR_API int NetRedirector_GetDebugPrivilegeState(void);
+
 // Lifecycle
 NETREDIRECTOR_API BOOL NetRedirector_Start(void);
 NETREDIRECTOR_API BOOL NetRedirector_Stop(void);

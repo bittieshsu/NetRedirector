@@ -104,7 +104,7 @@ static double time_lookup(UINT32 ip, UINT16 port, int iters, DWORD *pid_out)
 
     QueryPerformanceCounter(&t0);
     for (int i = 0; i < iters; i++) {
-        pid = get_process_id_from_connection(ip, port);
+        pid = get_process_id_from_connection(ip, port, 0, 0);
         sink ^= pid;
     }
     double us = us_since(t0) / (double)iters;
@@ -178,7 +178,9 @@ int main(void)
     const int probe_slots[4] = {0, 31, 63, 127};
     for (int p = 0; p < 4; p++) {
         clear_pid_cache();
-        for (int i = 0; i < n; i++) get_process_id_from_connection(ip, ports[i]);  // prime, in order
+        // dest 0,0 == "no remote known": the lookup falls to its second pass,
+        // which is the behaviour this benchmark has always measured.
+        for (int i = 0; i < n; i++) get_process_id_from_connection(ip, ports[i], 0, 0);  // prime, in order
         DWORD pid = 0;
         double us = time_lookup(ip, ports[probe_slots[p]], N_ITERS, &pid);
         if (pid == 0) { printf("     slot %3d  EXPIRED/UNCACHED (measurement invalid)\n", probe_slots[p]); }
@@ -199,7 +201,7 @@ int main(void)
     clear_pid_cache();
     double t_empty = time_lookup(ip, g_absent_port, N_ITERS, NULL);
     clear_pid_cache();
-    for (int i = 0; i < n; i++) get_process_id_from_connection(ip, ports[i]);
+    for (int i = 0; i < n; i++) get_process_id_from_connection(ip, ports[i], 0, 0);
     double t_full = time_lookup(ip, g_absent_port, N_ITERS, NULL);
     printf("     empty cache + absent port   %8.1f us\n", t_empty);
     printf("     FULL  cache + absent port   %8.1f us\n", t_full);
