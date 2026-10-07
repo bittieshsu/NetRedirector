@@ -26,6 +26,9 @@ BOOL is_connection_tracked_udp(UINT16 src_port, int family, const UINT8 *dest_ad
 BOOL get_udp_reply_endpoint(UINT16 src_port, int family, UINT8 *dest_addr, UINT16 *dest_port);  // UDP relay->app response rewrite (full endpoint)
 BOOL resolve_udp_response(int family, const UINT8 *src_addr, UINT16 src_port, UINT8 *out_app_addr, UINT16 *out_app_port, BOOL *out_exact);  // relay response -> tracked flow
 void remove_connection(UINT16 src_port, int family, const UINT8 *dest_key);
+// [Added] Record that a FIN/RST was seen for this flow, keeping the entry alive
+// for TCP_CLOSING_GRACE_MS so the packets that follow a close still match it.
+void mark_connection_closing(UINT16 src_port, int family, const UINT8 *dest_key);
 void clear_connections(); // New helper
 
 // === Logged Connections (Deduplication) ===

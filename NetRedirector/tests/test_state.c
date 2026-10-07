@@ -74,6 +74,49 @@ int main(void)
         remove_connection(port, AF_INET6, v6dst);
     }
 
+    printf("== [新增] FIN/RST 只標記 closing, 不立刻刪條目 ==\n");
+    {
+        // 舊行為: 第一個 FIN/RST 就把條目 remove_connection() 掉 -> 之後的封包
+        // (app 的最後一個 ACK、重送的 FIN、relay 自己的 FIN) 無條目可匹配,
+        // 被當成新連線重新分類。已關閉的 TCB 停在 TIME_WAIT、dwOwningPid == 0,
+        // 歸因必然失敗 -> 每次關閉都噴一行 "could not be attributed", 而且
+        // relay 的 FIN 再也改寫不回 app。
+        UINT8 src[16] = {192, 168, 1, 10};
+        UINT8 dst[16] = {175, 97, 131, 54};
+        UINT8 other[16] = {43, 129, 115, 113};
+        UINT16 port = 62937;
+
+        add_connection(port, AF_INET, src, dst, 443, 7, RULE_ACTION_PROXY, FALSE);
+        add_connection(port, AF_INET, src, other, 443, 8, RULE_ACTION_PROXY, FALSE);
+
+        mark_connection_closing(port, AF_INET, dst);
+
+        CHECK(is_connection_tracked(port, AF_INET, dst) == TRUE,
+              "entry survives a FIN/RST (used to be removed)");
+        UINT32 cpid = 0;
+        RuleAction cact = RULE_ACTION_DIRECT;
+        CHECK(get_connection(port, AF_INET, dst, NULL, NULL, NULL, &cpid, &cact) == TRUE,
+              "post-close packet still matches");
+        CHECK(cpid == 7 && cact == RULE_ACTION_PROXY, "proxy/action kept after close");
+
+        // key 必須完全相符: 別的埠 / 別的 family / NULL 都不得被誤標,
+        // 同埠的兄弟目的地條目也必須存活且不受影響。
+        mark_connection_closing(port + 1, AF_INET, dst);
+        mark_connection_closing(port, AF_INET6, dst);
+        mark_connection_closing(port, AF_INET, NULL);
+        CHECK(get_connection(port, AF_INET, other, NULL, NULL, NULL, &cpid, NULL) == TRUE && cpid == 8,
+              "sibling destination keeps its own proxy");
+
+        // 同 key 重新分類 = 新連線接管 (埠回收情境), 不得被舊條目綁架
+        add_connection(port, AF_INET, src, dst, 443, 9, RULE_ACTION_PROXY, FALSE);
+        CHECK(get_connection(port, AF_INET, dst, NULL, NULL, NULL, &cpid, NULL) == TRUE && cpid == 9,
+              "recycled port re-classifies over the closing entry");
+
+        remove_connection(port, AF_INET, dst);
+        remove_connection(port, AF_INET, other);
+        CHECK(is_connection_tracked(port, AF_INET, dst) == FALSE, "remove_connection still works");
+    }
+
     printf("== [回歸] 舊埠 stale PROXY 條目不得綁架新目的地連線 ==\n");
     {
         // Gpc/CODEX 情境: app 異常關閉 (無 FIN/RST), conntrack 殘留

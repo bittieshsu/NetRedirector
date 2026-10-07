@@ -41,6 +41,16 @@
 #define TCP_TIMEOUT_MS 3600000   // 1 hour
 #define UDP_TIMEOUT_MS 600000    // 10 minutes
 
+// How long a TCP entry survives after its close has been observed (FIN/RST).
+//
+// The entry has to outlive the last packets of the connection - the app's final
+// ACK, a retransmitted FIN, and, for a relayed flow, the relay's own FIN - or
+// those packets arrive with nothing to match and get misrouted. It must not
+// outlive them by much either: entries are reaped only by the sweep, and
+// get_connection() is a linear walk on the per-packet hot path, so every
+// closed flow kept around is paid for by every open one.
+#define TCP_CLOSING_GRACE_MS 30000
+
 // Receive/send buffer for the UDP relay sockets and every UDP association
 // socket. These carry all proxied UDP flows at once, and the Windows default
 // is small enough that a burst (game map load, QUIC ramp-up) overflows it and
@@ -130,6 +140,11 @@ typedef struct CONNECTION_INFO {
     UINT32 proxy_id;
     RuleAction action;
     BOOL is_udp;              // TRUE: UDP timeout applies, FALSE: TCP timeout
+    // [Added] Set when a FIN/RST has been seen for this flow. The entry is kept
+    // - not freed - so the packets that follow a close still match it, and is
+    // reaped TCP_CLOSING_GRACE_MS after the close instead of TCP_TIMEOUT_MS.
+    // A SYN for the same key re-classifies and clears it (see NR_Core.c).
+    BOOL closing;
     DWORD last_activity;
     struct CONNECTION_INFO *next;
 } CONNECTION_INFO;

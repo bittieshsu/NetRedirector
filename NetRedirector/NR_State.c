@@ -60,6 +60,9 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
             existing->proxy_id = proxy_id;
             existing->action = action;
             existing->is_udp = is_udp;
+            // [Added] Re-classifying a key means a fresh connection owns it now,
+            // so a close observed for the previous one no longer applies.
+            existing->closing = FALSE;
             existing->last_activity = GetTickCount();
             LeaveCriticalSection(&lock_connections);
             return;
@@ -83,6 +86,7 @@ void add_connection(UINT16 src_port, int family, const UINT8 *src_addr, const UI
     conn->proxy_id = proxy_id;
     conn->action = action;
     conn->is_udp = is_udp;
+    conn->closing = FALSE;
     conn->last_activity = GetTickCount();
     conn->next = connection_list;
     connection_list = conn;
@@ -313,6 +317,47 @@ BOOL resolve_udp_response(int family, const UINT8 *src_addr, UINT16 src_port,
     }
     LeaveCriticalSection(&lock_connections);
     return found;
+}
+
+// [Added] Observe a FIN/RST without forgetting the flow.
+//
+// The FIN/RST paths used to free the entry here. That made every packet which
+// follows a close arrive with nothing to match - the app's final ACK, a
+// retransmitted FIN, and, for a relayed flow, the relay's own FIN - so
+// process_packet() took them for brand-new connections. Two things broke:
+//
+//   * the relay's FIN could no longer be rewritten back to the app (the lookup
+//     missed, and the packet was re-injected inbound, i.e. sent out to the wire
+//     toward the real destination, which never had this connection at all);
+//   * the app's own ACK was re-classified while its socket was already gone -
+//     a closed TCB is TIME_WAIT with dwOwningPid == 0, so attribution failed
+//     and every close produced a "could not be attributed" line.
+//
+// Keeping the entry for TCP_CLOSING_GRACE_MS fixes both. It cannot swallow a
+// later connection that recycles the same port: a SYN always re-classifies and
+// clears the flag (see the new-connection branch in NR_Core.c).
+void mark_connection_closing(UINT16 src_port, int family, const UINT8 *dest_key)
+{
+    if (dest_key == NULL) return;
+    int n = (family == AF_INET) ? 4 : 16;
+
+    EnterCriticalSection(&lock_connections);
+    CONNECTION_INFO *conn = connection_list;
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port && !conn->is_udp &&
+            conn->family == family &&
+            memcmp(conn->orig_dest_addr, dest_key, n) == 0)
+        {
+            // Restart the grace from the close, and leave the node where it is:
+            // this is not a hot path, and the entry is about to be reaped.
+            conn->closing = TRUE;
+            conn->last_activity = GetTickCount();
+            break;
+        }
+        conn = conn->next;
+    }
+    LeaveCriticalSection(&lock_connections);
 }
 
 void remove_connection(UINT16 src_port, int family, const UINT8 *dest_key)

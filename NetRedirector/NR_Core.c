@@ -211,8 +211,8 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                     // Before any rewrite: dst_addr is the app-endpoint address,
                     // which equals the entry's original-destination component
                     // (the NAT swap made the relay's peer look like the original
-                    // destination). It is both the lookup key and, after FIN/RST,
-                    // the removal key.
+                    // destination). It is both the lookup key and, after
+                    // FIN/RST, the key the closing grace is recorded under.
                     UINT8 app_endpoint[16];
                     memcpy(app_endpoint, dst_addr, n);
                     UINT16 dst_port = ntohs(tcp_header->DstPort);
@@ -223,7 +223,12 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                         // DstAddr := old SrcAddr (local app IP), SrcAddr := original destination
                         memcpy(dst_addr, src_addr, n);
                         memcpy(src_addr, orig_dest_addr, n);
-                        if (tcp_header->Fin || tcp_header->Rst) remove_connection(dst_port, family, app_endpoint);
+                        // [Changed] Was remove_connection(). Freeing the entry
+                        // here left the app's own ACK and FIN with nothing to
+                        // match, so they were re-classified as a new connection -
+                        // and the relay's FIN could no longer be rewritten back
+                        // to the app. Keep it for the closing grace instead.
+                        if (tcp_header->Fin || tcp_header->Rst) mark_connection_closing(dst_port, family, app_endpoint);
                     }
                     addr->Outbound = FALSE;
                 }
@@ -237,8 +242,25 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                 else {
                     UINT16 src_port = ntohs(tcp_header->SrcPort);
                     UINT32 proxy_id = 0;
-                    if (get_connection(src_port, family, dst_addr, NULL, NULL, NULL, &proxy_id, NULL)) {
-                        if (tcp_header->Fin || tcp_header->Rst) remove_connection(src_port, family, dst_addr);
+                    RuleAction action = RULE_ACTION_DIRECT;
+                    // [Added] A SYN can only ever start a connection, so it is
+                    // never answered from the table: an entry under the same key
+                    // is a leftover whose close was never observed, or one still
+                    // inside its closing grace, and letting it win would route
+                    // the new flow through the old flow's proxy and port. A
+                    // retransmitted SYN re-classifies too, which is harmless -
+                    // add_connection() just refreshes the same key.
+                    if (!tcp_header->Syn &&
+                        get_connection(src_port, family, dst_addr, NULL, NULL, NULL, &proxy_id, &action)) {
+                        // [Changed] Was remove_connection(): the packets that
+                        // follow a close still need this entry.
+                        if (tcp_header->Fin || tcp_header->Rst) mark_connection_closing(src_port, family, dst_addr);
+
+                        // [Added] A flow already judged BLOCK stays blocked. The
+                        // verdict is remembered in the table precisely because
+                        // the SYN guard below forwards untracked non-SYN packets
+                        // instead of re-classifying them.
+                        if (action == RULE_ACTION_BLOCK) return;
 
                         if (proxy_id > 0) {
                             tcp_header->DstPort = htons(g_local_relay_port);
@@ -247,16 +269,33 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
                         }
                     }
                     // 3. New Connection
-                    else {
+                    //
+                    // [Added] Only a SYN starts one. Any other untracked outbound
+                    // packet belongs to a flow this engine never saw the SYN of -
+                    // it was started while the engine was stopped, or it has
+                    // already closed - and classifying it can only misroute it.
+                    // For an already-closed flow there is no process left to
+                    // attribute it to (a closed TCB sits in TIME_WAIT with
+                    // dwOwningPid == 0), which is exactly where the flood of
+                    // "could not be attributed" lines came from. Such packets now
+                    // fall through untouched and are re-injected below with their
+                    // original, already-valid checksum.
+                    else if (tcp_header->Syn && !tcp_header->Rst) {
                         UINT16 dest_port = ntohs(tcp_header->DstPort);
                         UINT32 selected_proxy_id = 0;
-                        RuleAction action = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
+                        RuleAction decision = handle_new_connection_logic(family, src_addr, dst_addr, src_port, dest_port, FALSE, &selected_proxy_id);
 
-                        if (action == RULE_ACTION_DIRECT) {
+                        if (decision == RULE_ACTION_DIRECT) {
                             add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_DIRECT, FALSE);
-                        } else if (action == RULE_ACTION_BLOCK) {
+                        } else if (decision == RULE_ACTION_BLOCK) {
+                            // [Added] Record the verdict so the rest of this flow
+                            // is dropped too. Without the entry its later packets
+                            // would be untracked, and the guard above forwards
+                            // untracked non-SYN packets - so a flow established
+                            // before the rule changed would survive BLOCK.
+                            add_connection(src_port, family, src_addr, dst_addr, dest_port, 0, RULE_ACTION_BLOCK, FALSE);
                             return;
-                        } else if (action == RULE_ACTION_PROXY) {
+                        } else if (decision == RULE_ACTION_PROXY) {
                             add_connection(src_port, family, src_addr, dst_addr, dest_port, selected_proxy_id, RULE_ACTION_PROXY, FALSE);
                             tcp_header->DstPort = htons(g_local_relay_port);
                             swap_addr_bytes(family, src_addr, dst_addr);
@@ -276,7 +315,8 @@ static void process_packet(unsigned char *packet, UINT packet_len, WINDIVERT_ADD
             send_packet_checked(packet, packet_len, addr, "tcp rewritten");
         } else {
             // Captured but untouched: a DIRECT flow (case 2 with proxy_id == 0,
-            // or case 3 DIRECT), or an inbound packet addressed to the relay
+            // or case 3 DIRECT), an untracked packet that is not a SYN (the new
+            // guard in case 3), or an inbound packet addressed to the relay
             // port. Its checksum is already valid, so leave it alone - this is
             // the hot path for every DIRECT connection, which previously paid a
             // full checksum recomputation per packet for nothing.
@@ -657,7 +697,14 @@ DWORD WINAPI cleanup_thread(LPVOID arg)
             CONNECTION_INFO *curr = *conn_ptr;
             BOOL remove = FALSE;
             DWORD elapsed = current_time - curr->last_activity;
-            DWORD timeout = curr->is_udp ? UDP_TIMEOUT_MS : TCP_TIMEOUT_MS;
+            // [Added] A flow whose close was observed is reaped on the short
+            // grace instead of the idle timeout - see
+            // mark_connection_closing(). Flows that never saw a FIN/RST keep the
+            // idle timeout, exactly as before.
+            DWORD timeout;
+            if (curr->is_udp) timeout = UDP_TIMEOUT_MS;
+            else if (curr->closing) timeout = TCP_CLOSING_GRACE_MS;
+            else timeout = TCP_TIMEOUT_MS;
             if (elapsed > timeout) remove = TRUE;
 
             if (remove) {
