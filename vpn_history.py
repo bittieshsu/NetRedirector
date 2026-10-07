@@ -32,9 +32,25 @@ def save_history(path, history):
 
 # ---------------------------------------------------------------- 節點記錄
 
+# 由「本程式實際觀測」累積出來的欄位。reset_stability() 只歸零這些；
+# 節點快照欄位 (port/hostname/國家/last_score/last_ping/last_speed) 與
+# first_seen/last_seen 一律保留 —— 特別是 last_seen 是 prune() 判斷過期的
+# 唯一依據，清掉會讓整個節點池在下一輪被當成陳舊資料淘汰掉。
+_STAT_FIELDS = (
+    "connect_attempts",
+    "connect_successes",
+    "tunnel_checks",
+    "tunnel_ok",
+    "session_count",
+    "total_connected_seconds",
+    "disconnect_count",
+    "consecutive_failures",
+)
+
+
 def _empty_record(ip):
     now = int(time.time())
-    return {
+    rec = {
         "ip": ip,
         "port": 0,
         "hostname": "",
@@ -45,15 +61,9 @@ def _empty_record(ip):
         "last_score": 0,
         "last_ping": 0,
         "last_speed": 0,
-        "connect_attempts": 0,
-        "connect_successes": 0,
-        "tunnel_checks": 0,
-        "tunnel_ok": 0,
-        "session_count": 0,
-        "total_connected_seconds": 0,
-        "disconnect_count": 0,
-        "consecutive_failures": 0,
     }
+    rec.update(dict.fromkeys(_STAT_FIELDS, 0))
+    return rec
 
 
 def upsert_node(history, node):
@@ -124,6 +134,58 @@ def record_disconnect(history, ip):
         return None
     rec["disconnect_count"] += 1
     return rec
+
+
+def reset_stability(history, ips=None):
+    """歸零累積統計，讓節點回到「冷啟動中性 0.5」。
+
+    用途：主網路中斷 (例如 PPPoE 被停用) 期間，所有節點都會連線失敗，
+    這些失敗不是節點的問題，卻會把 connect_rate 這個「終身比率」永久打爛
+    (consecutive_failures 只要 5 次，失敗懲罰就吃滿 1.00，而加分項上限只有
+    0.90 ⇒ 穩定度數學上直接歸零)。此時需要一個把污染清掉的出口。
+
+    只清 _STAT_FIELDS；節點池本身、快照欄位與 first_seen/last_seen 保留。
+    ips=None 表示重置池中全部節點。回傳實際被重置的節點數。
+    """
+    nodes = history.get("nodes")
+    if not isinstance(nodes, dict):
+        return 0
+    if ips is None:
+        targets = list(nodes.values())
+    else:
+        targets = [nodes[ip] for ip in ips if ip in nodes]
+    count = 0
+    for rec in targets:
+        if not isinstance(rec, dict):
+            continue
+        for field in _STAT_FIELDS:
+            rec[field] = 0
+        count += 1
+    return count
+
+
+def forgive_failures(history, ips=None):
+    """只把 consecutive_failures 歸零 (其餘統計保留)。
+
+    主網路恢復後呼叫：中斷期間的連續失敗是環境造成的，不該繼續壓著節點；
+    但 connect_attempts / successes 這些歷史比率仍保留，避免把真實的
+    節點品質也一併洗掉。回傳實際被更動的節點數。
+    """
+    nodes = history.get("nodes")
+    if not isinstance(nodes, dict):
+        return 0
+    if ips is None:
+        targets = list(nodes.values())
+    else:
+        targets = [nodes[ip] for ip in ips if ip in nodes]
+    count = 0
+    for rec in targets:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("consecutive_failures", 0):
+            rec["consecutive_failures"] = 0
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------- 穩定度

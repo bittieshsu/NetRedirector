@@ -98,6 +98,92 @@ def test_record_disconnect_increments():
     assert h["nodes"]["1.2.3.4"]["disconnect_count"] == 2
 
 
+# --------------------------------------------------- 主網路污染的復原機制
+
+def test_reset_stability_zeroes_stats_but_keeps_snapshot():
+    """重置只清「本程式量到的統計」，節點池與快照資料必須留下。"""
+    h = empty_history()
+    rec = vpn_history.upsert_node(h, make_node("1.2.3.4", score=123))
+    rec["last_ping"] = 42
+    rec["last_speed"] = 99
+    first_seen, last_seen = rec["first_seen"], rec["last_seen"]
+    for _ in range(6):                       # 連續失敗吃滿失敗懲罰
+        vpn_history.record_connect(h, "1.2.3.4", ok=False)
+    vpn_history.record_session(h, "1.2.3.4", 100)
+    vpn_history.record_disconnect(h, "1.2.3.4")
+    assert vpn_history.stability(rec) == 0.0
+
+    assert vpn_history.reset_stability(h) == 1
+
+    for field in vpn_history._STAT_FIELDS:
+        assert rec[field] == 0, field
+    assert vpn_history.stability(rec) == 0.5   # 回到冷啟動中性值
+    # 快照欄位與時間戳保留 (last_seen 是 prune 的依據)
+    assert rec["last_score"] == 123
+    assert rec["last_ping"] == 42
+    assert rec["last_speed"] == 99
+    assert rec["first_seen"] == first_seen
+    assert rec["last_seen"] == last_seen
+
+
+def test_reset_stability_specific_ips_only():
+    h = empty_history()
+    for ip in ("1.1.1.1", "2.2.2.2"):
+        vpn_history.upsert_node(h, make_node(ip))
+        vpn_history.record_connect(h, ip, ok=False)
+    assert vpn_history.reset_stability(h, ips=["1.1.1.1"]) == 1
+    assert h["nodes"]["1.1.1.1"]["connect_attempts"] == 0
+    assert h["nodes"]["2.2.2.2"]["connect_attempts"] == 1
+
+
+def test_reset_stability_ignores_unknown_ip():
+    h = empty_history()
+    vpn_history.upsert_node(h, make_node("1.1.1.1"))
+    assert vpn_history.reset_stability(h, ips=["9.9.9.9"]) == 0
+
+
+def test_reset_stability_tolerates_bad_history():
+    assert vpn_history.reset_stability({}) == 0
+    assert vpn_history.reset_stability({"nodes": []}) == 0
+    assert vpn_history.reset_stability({"nodes": {"1.1.1.1": None}}) == 0
+
+
+def test_reset_stability_keeps_nodes_prunable():
+    """重置不能把 last_seen 清成 0，否則 prune 會把整個池子淘汰掉。"""
+    h = empty_history()
+    vpn_history.upsert_node(h, make_node("1.2.3.4"))
+    vpn_history.reset_stability(h)
+    vpn_history.prune(h, max_nodes=100, max_age_days=30)
+    assert set(h["nodes"]) == {"1.2.3.4"}
+
+
+def test_forgive_failures_only_clears_counter():
+    h = empty_history()
+    rec = vpn_history.upsert_node(h, make_node("1.2.3.4"))
+    for _ in range(3):
+        vpn_history.record_connect(h, "1.2.3.4", ok=False)
+    assert rec["consecutive_failures"] == 3
+
+    assert vpn_history.forgive_failures(h) == 1
+
+    assert rec["consecutive_failures"] == 0
+    # 歷史比率保留：不能把真實的節點品質也一起洗掉
+    assert rec["connect_attempts"] == 3
+    assert rec["connect_successes"] == 0
+
+
+def test_forgive_failures_returns_zero_when_clean():
+    h = empty_history()
+    vpn_history.upsert_node(h, make_node("1.2.3.4"))
+    vpn_history.record_connect(h, "1.2.3.4", ok=True)
+    assert vpn_history.forgive_failures(h) == 0
+
+
+def test_forgive_failures_tolerates_bad_history():
+    assert vpn_history.forgive_failures({}) == 0
+    assert vpn_history.forgive_failures({"nodes": []}) == 0
+
+
 def test_stability_cold_start_neutral():
     assert vpn_history.stability({}) == 0.5
     assert vpn_history.stability({"connect_attempts": 0}) == 0.5

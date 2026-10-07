@@ -77,3 +77,19 @@ STABILITY_FAIL_CAP = 5              # 連續失敗懲罰上限
 SESSION_POLL_INTERVAL = 10   # 每輪檢查間隔 (秒)
 MONITOR_TUNNEL_TIMEOUT = 3   # 監視器 tunnel 探測的短 timeout (秒)
 TUNNEL_DEAD_THRESHOLD = 3    # 連續 N 次 tunnel 不可達才判定假死
+
+# 主網路健康檢查 (net_health.py)：用來區分「自己的網路斷了」與「VPN 節點
+# 不好」。主網路中斷時所有節點都會失敗，那些失敗不是節點的問題，卻會把
+# connect_rate 這個終身比率永久打爛 (連續失敗 5 次失敗懲罰就吃滿，穩定度
+# 數學上直接歸零)。探針走 ICMP —— 引擎的 WinDivert 過濾條件只有 tcp/udp，
+# 不含 icmp，所以探針不會被 catch-all 的 PROXY 規則轉走。
+NET_HEALTH_CACHE_SEC = 15          # 健康狀態快取秒數，避免密集探測
+NET_HEALTH_TIMEOUT_MS = 1000       # 單一 ICMP echo 的等待毫秒數
+
+# 探針判定「主網路中斷」時，自動連線仍每隔這麼久硬試一次。目的是自我校正：
+# 若探針誤判 (例如上游擋 ICMP)，一次成功的連線就能推翻它，而不會永久卡住。
+NET_HEALTH_DOWN_RETRY_SEC = 120
+
+# 結構啟發式：一輪派發至少嘗試這麼多個節點且全數失敗時，視為「環境事件」
+# (主網路問題) 而不是節點問題，因此不把失敗記到節點頭上。
+ENV_FAILURE_MIN_ATTEMPTS = 2

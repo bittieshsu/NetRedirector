@@ -29,6 +29,7 @@ from PySide6.QtGui import QColor, QBrush
 
 from i18n import i18n as tr
 import vpngate_config as config
+import net_health
 import vpngate
 import vpn_history
 import softether
@@ -208,9 +209,29 @@ class VpnGateTabMixin:
         btn_apply = QPushButton("")
         self._reg("text", btn_apply, "套用篩選")
         btn_apply.clicked.connect(self.vpn_apply_filters)
+        self.btn_vpn_reset_stability = QPushButton("")
+        self._reg("text", self.btn_vpn_reset_stability, "重置穩定度")
+        self.btn_vpn_reset_stability.setToolTip("")
+        self._reg("tooltip", self.btn_vpn_reset_stability,
+                  "清空所有節點的連線統計，讓穩定度回到中性的 0.5。\n"
+                  "用於主網路中斷（例如 PPPoE 被停用）期間，所有節點被誤記為\n"
+                  "失敗、穩定度全部被壓到 0 之後。節點清單與各節點的 Score、\n"
+                  "Ping、速度等快照資料不受影響。")
+        self.btn_vpn_reset_stability.clicked.connect(self.vpn_reset_stability)
+        self.lbl_vpn_net_health = QLabel("")
+        self.lbl_vpn_net_health.setToolTip("")
+        self._reg("tooltip", self.lbl_vpn_net_health,
+                  "主網路健康狀態，用來區分「自己的網路斷了」與「VPN 節點不好」。\n"
+                  "探針走 ICMP：引擎的 WinDivert 過濾條件只有 tcp/udp、不含 icmp，\n"
+                  "所以探針不會被 catch-all 的 PROXY 規則轉走（TCP/UDP 探針會被\n"
+                  "轉去代理，主網路斷了也照樣成功，正好在最需要時騙人）。\n"
+                  "另外還有一條完全不碰網路的結構啟發式：一整輪派發全數失敗、\n"
+                  "或所有網卡同時離線，就視為環境事件。")
         node_btns.addWidget(btn_fetch)
         node_btns.addWidget(btn_apply)
+        node_btns.addWidget(self.btn_vpn_reset_stability)
         node_btns.addStretch()
+        node_btns.addWidget(self.lbl_vpn_net_health)
         right_layout.addLayout(node_btns)
 
         self.table_vpn_nodes = QTableWidget()
@@ -253,6 +274,11 @@ class VpnGateTabMixin:
         self.vpn_assigning = False    # 指派進行中旗標 (避免重疊指派)
         self.vpn_configured_nics = set()   # 已套用 SoftEther 進階設定的網卡
         self.vpn_config_lock = threading.Lock()
+        self.vpn_net_health = None         # 最近一次主網路健康檢查結果
+        self.vpn_net_health_at = 0.0       # 上句的時間戳 (供快取)
+        self.vpn_net_health_down_at = 0.0  # 最近一次判定為中斷的時間
+        self.vpn_net_probe_unreliable = False  # 探針被實際連線結果推翻過
+        self.vpn_env_outage = False        # 目前是否處於「環境中斷」狀態
         self.vpn_timer = QTimer()
         self.vpn_timer.timeout.connect(self._vpn_poll_queue)
         self.vpn_timer.start(100)
@@ -305,6 +331,97 @@ class VpnGateTabMixin:
 
     def _vpn_stability(self, node):
         return vpn_history.stability(self._vpn_rec(node))
+
+    # --------------------------------------------------------- 主網路健康
+    def _vpn_net_health(self, force=False):
+        """取得主網路健康狀態（帶快取）。
+
+        這個呼叫會送 ICMP，可能阻塞約一秒，**只可以在背景執行緒呼叫**；
+        UI 執行緒請用 _vpn_net_health_cached()。回傳的 alive 可能是 None
+        （無法判定），呼叫端必須把 None 當成「不知道」而不是「壞消息」。
+        """
+        now = time.time()
+        ttl = getattr(config, "NET_HEALTH_CACHE_SEC", 15)
+        if (not force and self.vpn_net_health is not None
+                and now - self.vpn_net_health_at < ttl):
+            return self.vpn_net_health
+        health = net_health.check_primary_network(
+            timeout_ms=getattr(config, "NET_HEALTH_TIMEOUT_MS", 1000),
+            primary=getattr(self, "ping_target", None),
+        )
+        self.vpn_net_health = health
+        self.vpn_net_health_at = now
+        if health.alive is False:
+            self.vpn_net_health_down_at = now
+        self._vpn_post(self._vpn_apply_net_health_label, health)
+        return health
+
+    def _vpn_note_net_probe_agrees(self, connected):
+        """實際連線結果比探針更可信：連得上就代表探針的 DOWN 判定是錯的。
+
+        沒有這個校正，一個誤判的探針（例如上游擋 ICMP）會讓自動連線永久停在
+        「等待網路恢復」，而且完全靜默 —— 正是這個專案最不想再犯的錯。
+        """
+        if not connected or self.vpn_net_probe_unreliable:
+            return
+        health = self.vpn_net_health
+        if health is not None and health.alive is False:
+            self.vpn_net_probe_unreliable = True
+            self._vpn_log("探針判定主網路中斷，但實際連線成功；"
+                          "改以實際連線結果為準，不再用探針阻擋派發")
+
+    def _vpn_net_health_cached(self):
+        """只讀快取，絕不連網 —— 給 UI 執行緒用。"""
+        return self.vpn_net_health
+
+    def _vpn_apply_net_health_label(self, health):
+        """在 UI 執行緒更新狀態列。"""
+        label = getattr(self, "lbl_vpn_net_health", None)
+        if label is None or health is None:
+            return
+        if health.alive is True:
+            color = ui_theme.COLOR_SUCCESS
+        elif health.alive is False:
+            color = ui_theme.COLOR_DANGER
+        else:
+            color = ui_theme.COLOR_WARN
+        label.setText(self.t("主網路") + ": " + health.reason)
+        label.setStyleSheet("color: %s;" % color)
+
+    def _vpn_is_env_outage(self, outcomes):
+        """這一輪派發是不是「環境事件」（主網路問題）而非節點問題。
+
+        判斷邏輯本身在 net_health.classify_round()，這裡只負責餵入
+        本程式的狀態（快取的探針結果、探針是否已被推翻）。
+        """
+        return net_health.classify_round(
+            outcomes, self.vpn_net_health,
+            probe_reliable=not self.vpn_net_probe_unreliable,
+            min_attempts=getattr(config, "ENV_FAILURE_MIN_ATTEMPTS", 2),
+        )
+
+    def vpn_reset_stability(self):
+        """清空所有節點的連線統計，讓穩定度回到中性 0.5。"""
+        nodes = self.vpn_history.get("nodes", {})
+        if not nodes:
+            QMessageBox.information(
+                self, self.t("提示"), self.t("節點池是空的，沒有需要重置的資料"))
+            return
+        text = self.t(
+            "將清空 {n} 個節點的連線統計（成功率、平均時長、被踢次數、"
+            "連續失敗），穩定度會全部回到中性的 0.5。\n\n"
+            "節點清單與 Score / Ping / 速度等資料不受影響。\n\n"
+            "適用於主網路中斷期間，所有節點被誤記為失敗的情況。"
+        ).format(n=len(nodes))
+        answer = QMessageBox.question(self, self.t("確認"), text)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        count = vpn_history.reset_stability(self.vpn_history)
+        vpn_history.save_history(config.VPN_HISTORY_FILE, self.vpn_history)
+        self.vpn_fail_count.clear()
+        self.vpn_env_outage = False
+        self._vpn_render_nodes(self.vpn_candidates)
+        self._vpn_log("已重置 %d 個節點的穩定度統計" % count)
 
     # --------------------------------------------------------- NIC 面板
     def vpn_refresh_nics(self):
@@ -406,6 +523,16 @@ class VpnGateTabMixin:
         if not hasattr(self, 'vpn_nic_names'):
             self.vpn_refresh_nics()
             return
+        # 主網路已知中斷時先不派發，避免白白製造一批假失敗；但仍每隔
+        # NET_HEALTH_DOWN_RETRY_SEC 硬試一次。探針若誤判（例如上游擋 ICMP），
+        # 一次成功的連線就足以推翻它，不會永久卡住。
+        health = self._vpn_net_health_cached()
+        if (health is not None and health.alive is False
+                and not self.vpn_net_probe_unreliable):
+            retry = getattr(config, "NET_HEALTH_DOWN_RETRY_SEC", 120)
+            if time.time() - self.vpn_net_health_down_at < retry:
+                return
+            self._vpn_log("主網路仍判定為中斷，進行一次確認性派發")
         self._vpn_auto_connect_once()
 
     def vpn_connect_all(self):
@@ -435,7 +562,10 @@ class VpnGateTabMixin:
                 self._vpn_log("尚未抓取節點或篩選後無節點，請先抓取/套用篩選")
             return
         self.vpn_assigning = True
-        self._vpn_run_bg(lambda: self._vpn_assign_nics(offline), done=self._vpn_after_assign)
+        self._vpn_run_bg(
+            lambda: self._vpn_assign_round(offline),
+            done=self._vpn_after_assign,
+        )
 
     def vpn_connect_selected(self):
         """手動指定單一網卡連多個選取節點，依序嘗試直到 tunnel 可通。"""
@@ -495,6 +625,15 @@ class VpnGateTabMixin:
         if not results:
             self._vpn_post(self._vpn_log, f"  X {nic} 所有選取節點皆連線失敗")
         return {"results": results, "outcomes": outcomes}
+
+    def _vpn_assign_round(self, nics, exclude_ips=None):
+        """派發外殼：先更新主網路健康狀態，再派發。
+
+        健康檢查會走網路（問路由器），所以放在背景執行緒；這樣 _vpn_after_assign
+        在 UI 執行緒讀到的快取一定是本輪的新資料。
+        """
+        self._vpn_net_health(force=True)
+        return self._vpn_assign_nics(nics, exclude_ips=exclude_ips)
 
     def _vpn_assign_nics(self, nics, exclude_ips=None):
         exclude_ips = set(exclude_ips or [])
@@ -695,9 +834,28 @@ class VpnGateTabMixin:
         results = result.get("results", {})
         outcomes = result.get("outcomes", [])
         now = time.time()
-        # 記錄連線結果 (成功/失敗、tunnel 是否可達)
-        for node_ip, ok, tunnel_ok in outcomes:
-            vpn_history.record_connect(self.vpn_history, node_ip, ok, tunnel_ok)
+        # 主網路中斷時，所有節點都會失敗。那些失敗不是節點的問題，記下去只會
+        # 把節點的 connect_rate 這個「終身比率」永久打爛 —— 連續失敗 5 次失敗
+        # 懲罰就吃滿 1.00，而加分項上限只有 0.90，穩定度數學上直接歸零。
+        env_outage, env_reason = self._vpn_is_env_outage(outcomes)
+        if env_outage:
+            self.vpn_env_outage = True
+            self._vpn_log(
+                "判定為主網路問題（%s），本輪 %d 次失敗不計入節點評價"
+                % (env_reason, len(outcomes)))
+        else:
+            # 實際連線成功就代表探針的 DOWN 是錯的，立刻停止信任它。
+            self._vpn_note_net_probe_agrees(bool(results))
+            # 記錄連線結果 (成功/失敗、tunnel 是否可達)
+            for node_ip, ok, tunnel_ok in outcomes:
+                vpn_history.record_connect(
+                    self.vpn_history, node_ip, ok, tunnel_ok)
+            # 從環境中斷恢復：中斷期間累積的連續失敗是環境造成的，原諒它們，
+            # 但保留 connect_attempts / successes 這些真實歷史比率。
+            if self.vpn_env_outage and results:
+                self.vpn_env_outage = False
+                forgiven = vpn_history.forgive_failures(self.vpn_history)
+                self._vpn_log("主網路已恢復，清除 %d 個節點的連續失敗計數" % forgiven)
         # 成功的網卡註冊 session state，供監視器追蹤
         for nic, info in results.items():
             node = info["node"]
@@ -722,6 +880,7 @@ class VpnGateTabMixin:
             return
 
         def work():
+            self._vpn_net_health(force=True)
             results = {}
             for nic in nics:
                 st = self.vpn_session_state.get(nic)
@@ -746,14 +905,24 @@ class VpnGateTabMixin:
 
     def _vpn_monitor_on_results(self, results):
         now = time.time()
+        results = results or {}
+        # 先數「離線」的網卡：若受監控的網卡全部在同一輪離線，幾乎一定是自己的
+        # 網路斷了，而不是這些節點剛好同時被踢。這種中斷不該記到節點頭上
+        # （disconnect_count 直接扣穩定度，KICK_FULL=10 次就扣滿）。
+        monitored = [n for n in results if n in self.vpn_session_state]
+        offline = [n for n in monitored if not results[n][0]]
+        env_outage = net_health.classify_monitor_tick(
+            len(offline), len(monitored))
+
         kicked = []  # (nic, node_ip)
-        for nic, (connected, reachable) in (results or {}).items():
+        for nic, (connected, reachable) in results.items():
             st = self.vpn_session_state.get(nic)
             if not st:
                 continue
             if not connected:
                 self._vpn_log(f"  ! {nic} 已離線，判定中斷")
-                self._vpn_record_session_end(st, now)
+                self._vpn_record_session_end(
+                    st, now, count_disconnect=not env_outage)
                 kicked.append((nic, st["node_ip"]))
             elif reachable is False:
                 st["unhealthy_streak"] += 1
@@ -765,6 +934,11 @@ class VpnGateTabMixin:
                     kicked.append((nic, st["node_ip"]))
             else:
                 st["unhealthy_streak"] = 0
+        if env_outage:
+            self.vpn_env_outage = True
+            self._vpn_log(
+                "受監控的 %d 張網卡同時離線，判定為主網路問題，不計入節點被踢次數"
+                % len(offline))
         if kicked:
             vpn_history.save_history(config.VPN_HISTORY_FILE, self.vpn_history)
             if self._vpn_auto_connect_enabled():
@@ -775,20 +949,29 @@ class VpnGateTabMixin:
                     self.vpn_session_state.pop(nic, None)
                 self._vpn_log("自動連線未開啟，僅記錄中斷")
 
-    def _vpn_record_session_end(self, st, now):
+    def _vpn_record_session_end(self, st, now, count_disconnect=True):
         duration = max(0, int(now - st["started_at"]))
         vpn_history.record_session(self.vpn_history, st["node_ip"], duration)
-        vpn_history.record_disconnect(self.vpn_history, st["node_ip"])
+        if count_disconnect:
+            vpn_history.record_disconnect(self.vpn_history, st["node_ip"])
 
     def _vpn_auto_reconnect(self, kicked):
         nics = [nic for nic, _ in kicked]
         exclude_ips = {ip for _, ip in kicked}
         for nic in nics:
             self.vpn_session_state.pop(nic, None)
+        # 主網路斷了就先不要換線：換哪一台都會失敗，只會再製造一批假失敗。
+        # 這些網卡已移出監視清單，恢復後由自動連線的定期掃描接手。
+        health = self._vpn_net_health_cached()
+        if (health is not None and health.alive is False
+                and not self.vpn_net_probe_unreliable):
+            self._vpn_log(
+                "主網路中斷（%s），暫停自動換線，待網路恢復後再派發" % health.reason)
+            return
         self._vpn_log(f"自動換線: {', '.join(nics)}")
         self.vpn_assigning = True
         self._vpn_run_bg(
-            lambda: self._vpn_assign_nics(nics, exclude_ips=exclude_ips),
+            lambda: self._vpn_assign_round(nics, exclude_ips=exclude_ips),
             done=self._vpn_after_assign,
         )
 
