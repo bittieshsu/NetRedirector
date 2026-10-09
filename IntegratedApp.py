@@ -28,6 +28,7 @@ import proxy_core
 import secure_config  # [新增] 密碼 DPAPI 加密儲存
 import rule_utils  # [模組化] 規則欄位處理 (全形星號正規化等)
 import config_store  # [模組化] 設定序列化與檔案 I/O
+from autosave import SaveScheduler  # [自動存檔] 變更即存 + 關機前強制落地
 import interface_metrics  # [介面計量] SoftEther 虛擬網卡 vs 實體網卡計量校正
 from app_helpers import (  # [模組化] GUI 輔助元件 (自本檔抽出)
     check_proxy_connection, SignalLogHandler, NetworkMonitorWorker, RedirectorSignals,
@@ -114,6 +115,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self._tray_notified = False    # 是否已顯示過「縮到匣」提示
         self._tray_icon = None         # QSystemTrayIcon 實例 (延後於 setup_ui 後建立)
 
+        # [自動存檔] 設定變更後延遲寫檔。scheduler 於 setup_ui 之後才建立，
+        # 因此 UI 初始化期間 (勾選框預設值) 的訊號不會提前寫入設定檔。
+        self._save_scheduler = None
+        self._loading_config = False   # True 時不排程存檔 (見 load_config)
+        self._shutdown_done = False    # 關閉流程已開始，不再排程新的存檔
+
         # 自動更新狀態
         self.check_updates_on_start = True
         self.update_worker = None
@@ -163,6 +170,15 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
 
         # UI 初始化
         self.setup_ui()
+
+        # [自動存檔] 設定變更後延遲寫入 config.json；關機/登出時強制落地。
+        # Windows 關機時 Qt 會在 WM_QUERYENDSESSION 發出 commitDataRequest，
+        # 程序隨後就被終止 —— 沒有接這個訊號，最後的變更一定會消失。
+        self._save_scheduler = SaveScheduler(self._auto_save, parent=self)
+        app = QApplication.instance()
+        if app is not None:
+            app.commitDataRequest.connect(self._on_commit_data_request)
+            app.aboutToQuit.connect(self._on_about_to_quit)
 
         # 右上角「⚙」溢出選單 (設定 + 檢查更新 / 關於；不再使用獨立選單列)
         self._setup_overflow_menu()
@@ -267,6 +283,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             tr.load(code)
             self.retranslate_ui()
             self.append_log(f"語言已切換: {tr.lang_name(code)}")
+            self._request_save()
 
     # [新增] Ping 目標變更 (即時套用至監控執行緒，並於下次存檔時寫入 config.json)
     def on_ping_target_changed(self):
@@ -278,6 +295,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.ping_target = target
             self.monitor_thread.set_ping_target(target)
             self.append_log(f"Ping 目標已更新: {target}")
+            self._request_save()
 
     def on_tab_changed(self, index):
         # 只有 Hub 分頁需要即時介面延遲顯示；其餘分頁停用延遲 ping，
@@ -326,8 +344,46 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         else:
             self.lbl_hub_status.setText(self.t("未選擇端口"))
 
+    # --------------------------------------------------------- 設定自動存檔
+    def _request_save(self, delay_ms=None):
+        """請求延遲存檔 (覆寫 AutoSaveMixin 版本以避開設定載入期)。"""
+        if self._loading_config or self._shutdown_done:
+            return
+        super()._request_save(delay_ms)
+
+    def _auto_save(self):
+        """延遲存檔計時器到期：安靜寫入 (不洗日誌)。"""
+        self.save_config(quiet=True)
+
+    def _on_commit_data_request(self, manager=None):
+        """Windows 關機/登出：強制把設定寫進磁碟。
+
+        Qt 在 WM_QUERYENDSESSION 會發出 commitDataRequest (見
+        qwindowscontext.cpp / QGuiApplicationPrivate::commitData)，程序隨後
+        就被終止，所以這裡必須「同步」寫檔，不能只排程。
+        """
+        self._flush_save(force=True)
+
+    def _on_about_to_quit(self):
+        """事件迴圈結束前，補寫尚未落地的變更。"""
+        self._flush_save()
+
+    def _flush_save(self, force=False):
+        """立刻寫檔；force=True 時即使沒有待寫變更也寫一次。"""
+        if self._save_scheduler is not None:
+            self._save_scheduler.flush(force=force)
+
+    def on_pref_toggled(self, _checked=False):
+        """偏好勾選項變更：排程寫入設定 (autostart 另有即時存檔)。"""
+        self._request_save()
+
     # [模組化] 儲存設定 (序列化/檔案 I/O 移至 config_store)
-    def save_config(self):
+    def save_config(self, quiet=False):
+        """把目前狀態寫入 config.json。
+
+        quiet=True 用於自動存檔 (變更即存)，不寫「設定已儲存」日誌以免洗版；
+        寫入失敗一律記錄，因為那代表使用者的設定沒有落地。
+        """
         data = config_store.build_config_data(
             tr.lang, self.ping_target,
             self.chk_minimize_to_tray.isChecked() if hasattr(self, 'chk_minimize_to_tray') else False,
@@ -337,12 +393,25 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
             self.chk_manage_metric.isChecked() if hasattr(self, 'chk_manage_metric') else True)
         err = config_store.save_config_file(self.CONFIG_FILE, data)
         if err is None:
-            self.append_log("設定已儲存至 config.json")
+            if not quiet:
+                self.append_log("設定已儲存至 config.json")
         else:
             self.append_log(f"儲存設定失敗: {err}")
 
     # [模組化] 讀取設定 (檔案 I/O 移至 config_store)
     def load_config(self):
+        """載入設定檔；載入期間暫停自動存檔排程。
+
+        還原勾選框會發出 toggled 訊號，若不暫停，剛讀到的設定會被立刻再寫
+        回去；還原中途失敗時更會把「半套」狀態覆寫成正式設定檔。
+        """
+        self._loading_config = True
+        try:
+            self._apply_loaded_config()
+        finally:
+            self._loading_config = False
+
+    def _apply_loaded_config(self):
         # [Fixed] 先記錄檔案是否存在: 讀取前存在但解析失敗 → 這次真的氈損
         # (已被改名為 .bak);檔案本來就不存在但殘留舊 .bak → 不誤發警告
         had_file = os.path.exists(self.CONFIG_FILE)
@@ -529,6 +598,7 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         """勾選後立即校正一次介面計量 (取消勾選則不還原既有設定)。"""
         if checked:
             self._sync_interface_metrics(force=True)
+        self._request_save()
 
     def _sync_interface_metrics(self, force=False):
         """依設定在背景校正介面計量 (SoftEther 虛擬網卡 vs 實體網卡)。
@@ -639,10 +709,12 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         self.chk_minimize_to_tray.setChecked(False)
         self._reg("tooltip", self.chk_minimize_to_tray,
                   "勾選後，按關閉會直接縮到系統匣，不詢問")
+        self.chk_minimize_to_tray.toggled.connect(self.on_pref_toggled)
 
         self.chk_check_updates = QCheckBox("")
         self._reg("text", self.chk_check_updates, "啟動時自動檢查更新")
         self.chk_check_updates.setChecked(self.check_updates_on_start)
+        self.chk_check_updates.toggled.connect(self.on_pref_toggled)
 
         # [新增] 開機自動啟動 (預設開啟)；實際狀態存於工作排程器，
         # 於 load_config → _apply_autostart 時同步為真實狀態
@@ -958,6 +1030,9 @@ class MainWindow(QMainWindow, HubTabMixin, RulesTabMixin, ProxiesTabMixin, Monit
         marks = []
         t0 = time.perf_counter()
 
+        # 已有待寫變更時不需再等自動存檔計時器，由這次的 save_config 落地
+        if self._save_scheduler is not None:
+            self._save_scheduler.cancel()
         self.save_config()
         marks.append(("save_config", time.perf_counter() - t0))
 

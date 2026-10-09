@@ -17,6 +17,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QBrush, QAction
 
 from i18n import i18n as tr
+from autosave import AutoSaveMixin
 import proxy_core  # noqa: F401 — 模組化測試要求 mixin 模組可解析此名稱
 import rule_utils
 import ui_theme
@@ -304,7 +305,7 @@ class RuleDialog(QDialog):
         }
 
 
-class RulesTabMixin:
+class RulesTabMixin(AutoSaveMixin):
     def setup_rules_tab(self):
         layout = QVBoxLayout(self.tab_rules)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -513,6 +514,7 @@ class RulesTabMixin:
             self.rules.append(new_rule)
         self.refresh_rules_table()
         self.append_log(f"規則已{'更新' if was_edit else '新增'} (ID: {rid})")
+        self._request_save()
 
     # ----------------------------------------------------------- 啟用/停用
     def toggle_rule_enabled(self, rule_data, checked):
@@ -522,6 +524,7 @@ class RulesTabMixin:
             self._disable_rule(rule_data)
         # 重建表格 (延後執行，避免在勾選框自身的信號處理中刪除發送者)
         QTimer.singleShot(0, self.refresh_rules_table)
+        self._request_save()
 
     def _enable_rule(self, rule_data):
         proxy_id, _display = self._resolve_proxy(rule_data)
@@ -592,6 +595,7 @@ class RulesTabMixin:
             self.bridge.delete_rule(int(rule_data['id']))
         self.rules = [r for r in self.rules if r is not rule_data]
         self.refresh_rules_table()
+        self._request_save()
 
     def refresh_rules_table(self):
         scroll = self.table_rules.verticalScrollBar().value()

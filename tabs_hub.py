@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QAction
 
 from i18n import i18n as tr, SUPPORTED_LANGS
+from autosave import AutoSaveMixin
 import network_utils
 import proxy_core
 import secure_config
@@ -27,7 +28,7 @@ import ui_theme
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 
-class HubTabMixin:
+class HubTabMixin(AutoSaveMixin):
     def setup_hub_tab(self):
         layout = QHBoxLayout(self.tab_hub)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -113,6 +114,7 @@ class HubTabMixin:
         self.list_hub_ports.addItem(f"{port}")
         self.spin_hub_port.setValue(port + 1)
         self.sync_hub_proxy(port)
+        self._request_save()
 
     def del_hub_port(self):
         items = self.list_hub_ports.selectedItems()
@@ -143,6 +145,7 @@ class HubTabMixin:
         self.selected_hub_port = None
         self.refresh_hub_table()
         self.refresh_proxy_combobox()
+        self._request_save()
 
     def on_hub_port_selected(self, item):
         if not item: return
@@ -250,6 +253,7 @@ class HubTabMixin:
             self.port_config[self.selected_hub_port] = current_bound
             proxy_core.route_manager.update_port_binding(self.selected_hub_port, current_bound)
             self.append_log(f"已批次更新端口 {self.selected_hub_port} 的綁定介面")
+            self._request_save()
 
     def on_hub_table_click(self, row, col):
         """點整列都能切換綁定，包含點在勾選框外的空白處。
@@ -280,4 +284,5 @@ class HubTabMixin:
             curr.remove(name)
         self.port_config[port] = curr
         proxy_core.route_manager.update_port_binding(port, curr)
+        self._request_save()
 

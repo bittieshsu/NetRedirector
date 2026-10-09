@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QAction
 
 from i18n import i18n as tr, SUPPORTED_LANGS
+from autosave import AutoSaveMixin
 import network_utils
 import proxy_core
 import secure_config
@@ -27,7 +28,7 @@ import ui_theme  # [即時監控] 深色主題徽章 / 顏色常數
 from NetRedirector import NetRedirectorWrapper, RuleAction, ProxyType, RuleProtocol
 
 
-class MonitorTabMixin:
+class MonitorTabMixin(AutoSaveMixin):
     MONITOR_ROW_CAP = 500              # 監控緩衝上限 (與原行為一致)
     MONITOR_SCROLL_INTERVAL_MS = 250   # 自動捲動節流 (4 Hz)
     MONITOR_INFO_COL = 4               # 資訊 (徽章) 欄
@@ -484,6 +485,8 @@ class MonitorTabMixin:
         # 更新介面上的 ID 顯示
         self.refresh_rules_table()
         self.append_log(f"已重新套用 {len(self.rules)} 條規則。")
+        # 重刷可能改寫規則的動作/代理參照 (引用的代理已不存在時轉為直連)
+        self._request_save()
 
     def toggle_redirector_service(self):
         # 檢查按鈕目前的狀態 (因為是 checkable，點擊後狀態已經改變)

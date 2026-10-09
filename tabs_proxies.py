@@ -17,6 +17,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QBrush
 
 from i18n import i18n as tr
+from autosave import AutoSaveMixin
 import proxy_core  # noqa: F401 — 模組化測試要求 mixin 模組可解析此名稱
 import ui_theme
 from app_helpers import check_proxy_connection  # [Fixed] test_all_proxies 需要
@@ -125,7 +126,7 @@ class ProxyDialog(QDialog):
         return data
 
 
-class ProxiesTabMixin:
+class ProxiesTabMixin(AutoSaveMixin):
     def setup_custom_proxy_tab(self):
         layout = QVBoxLayout(self.tab_proxies)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -282,6 +283,7 @@ class ProxiesTabMixin:
                     self.refresh_custom_proxy_table()
                     self.refresh_proxy_combobox()
                     self.append_log(f"自訂代理已更新 (ID 不變，立即生效): {name}")
+                    self._request_save()
                     return
                 QMessageBox.warning(self, self.t("失敗"), self.t("DLL 無法更新代理配置"))
                 return
@@ -314,6 +316,7 @@ class ProxiesTabMixin:
                 self.append_log(
                     f"代理 ID 已變更 ({old_proxy_id} -> {pid})，重刷引用該代理的規則...")
                 self.reapply_all_rules(only_proxy_id=old_proxy_id)
+            self._request_save()
         else:
             QMessageBox.warning(self, self.t("失敗"), self.t("DLL 無法添加代理配置"))
 
@@ -364,6 +367,7 @@ class ProxiesTabMixin:
         self.refresh_proxy_combobox()
         # [修正] 代理被刪除後，引用它的規則若不重刷會殘留失效的 proxy ID
         self.reapply_all_rules(only_proxy_id=pid)
+        self._request_save()
 
     # ----------------------------------------------------------- 表格
     def refresh_custom_proxy_table(self):
